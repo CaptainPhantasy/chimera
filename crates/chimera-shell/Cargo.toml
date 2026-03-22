@@ -1,16 +1,9 @@
 [package]
-name = "chimera-core"
+name = "chimera-shell"
 version.workspace = true
 edition.workspace = true
 
 [dependencies]
-chimera-session.workspace = true
-chimera-creatures.workspace = true
-chimera-tools.workspace = true
-chimera-trace.workspace = true
-chimera-shell.workspace = true
-chimera-sandbox.workspace = true
-chimera-browser.workspace = true
 tokio.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
@@ -18,5 +11,5 @@ tracing.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 async-trait.workspace = true
-chrono.workspace = true
 uuid.workspace = true
+chrono.workspace = true

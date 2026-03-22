@@ -6,8 +6,11 @@ use serde::{Deserialize, Serialize};
 use tracing::{info, info_span, Instrument};
 use uuid::Uuid;
 
+use chimera_browser::BrowserController;
 use chimera_creatures::{AutonomyLevel, CreatureRegistry, CreatureSpec, Temperament, WorldKind};
+use chimera_sandbox::WorldManager;
 use chimera_session::SessionStore;
+use chimera_shell::ShellManager;
 use chimera_tools::ToolRouter;
 use chimera_trace::TraceSink;
 
@@ -209,6 +212,9 @@ pub struct Harness {
     pub creatures: Arc<dyn CreatureRegistry>,
     pub tools: Arc<dyn ToolRouter>,
     pub trace: Arc<dyn TraceSink>,
+    pub shells: Arc<dyn ShellManager>,
+    pub worlds: Arc<dyn WorldManager>,
+    pub browser: Arc<dyn BrowserController>,
 }
 
 impl Harness {
@@ -572,5 +578,140 @@ impl ToolRouter for StubToolRouter {
     async fn healthcheck(&self, tool: &str) -> anyhow::Result<bool> {
         info!(tool = %tool, "healthcheck (stub)");
         Ok(true)
+    }
+}
+
+/// A stub ShellManager for one-shot execution.
+pub struct StubShellManager;
+
+#[async_trait::async_trait]
+impl ShellManager for StubShellManager {
+    async fn spawn_shell(&self, spec: chimera_shell::ShellSpec) -> anyhow::Result<chimera_shell::ShellId> {
+        info!(label = ?spec.label, "shell spawned (stub)");
+        Ok(Uuid::new_v4())
+    }
+
+    async fn exec(&self, _shell: chimera_shell::ShellId, cmd: chimera_shell::ShellCommand) -> anyhow::Result<chimera_shell::ShellOutput> {
+        info!(command = %cmd.command, "shell exec (stub)");
+        Ok(chimera_shell::ShellOutput {
+            exit_code: 0,
+            stdout: String::new(),
+            stderr: String::new(),
+            duration_ms: 0,
+        })
+    }
+
+    async fn transcript(&self, _shell: chimera_shell::ShellId) -> anyhow::Result<Vec<chimera_shell::ShellEvent>> {
+        Ok(vec![])
+    }
+
+    async fn close(&self, _shell: chimera_shell::ShellId) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn create_worktree(&self, spec: chimera_shell::WorktreeSpec) -> anyhow::Result<chimera_shell::WorktreeHandle> {
+        info!(repo = %spec.repo_root.display(), "worktree created (stub)");
+        Ok(chimera_shell::WorktreeHandle {
+            path: spec.repo_root.join(".chimera-wt-stub"),
+            shell_id: Uuid::new_v4(),
+            read_only: spec.read_only,
+        })
+    }
+
+    async fn destroy_worktree(&self, _path: PathBuf) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn list_shells(&self) -> anyhow::Result<Vec<chimera_shell::ShellId>> {
+        Ok(vec![])
+    }
+}
+
+/// A stub WorldManager for one-shot execution.
+pub struct StubWorldManager;
+
+#[async_trait::async_trait]
+impl WorldManager for StubWorldManager {
+    async fn allocate(&self, spec: chimera_sandbox::WorldSpec) -> anyhow::Result<chimera_sandbox::WorldId> {
+        info!(kind = ?spec.kind, "world allocated (stub)");
+        Ok(Uuid::new_v4())
+    }
+
+    async fn inspect(&self, id: chimera_sandbox::WorldId) -> anyhow::Result<chimera_sandbox::WorldState> {
+        Ok(chimera_sandbox::WorldState {
+            id,
+            spec: chimera_sandbox::WorldSpec {
+                kind: chimera_sandbox::WorldKind::LocalShell,
+                image: None,
+                root: None,
+                env: Default::default(),
+                network: false,
+                writable: false,
+                label: None,
+                limits: Default::default(),
+            },
+            status: chimera_sandbox::WorldStatus::Running,
+            created_at: Utc::now(),
+            root_path: None,
+        })
+    }
+
+    async fn pause(&self, _id: chimera_sandbox::WorldId) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn resume(&self, _id: chimera_sandbox::WorldId) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn destroy(&self, _id: chimera_sandbox::WorldId) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn list(&self) -> anyhow::Result<Vec<chimera_sandbox::WorldId>> {
+        Ok(vec![])
+    }
+}
+
+/// A stub BrowserController for one-shot execution.
+pub struct StubBrowserController;
+
+#[async_trait::async_trait]
+impl BrowserController for StubBrowserController {
+    async fn open(&self, target: chimera_browser::BrowserTarget) -> anyhow::Result<chimera_browser::BrowserSessionId> {
+        info!(target = ?target, "browser opened (stub)");
+        Ok(Uuid::new_v4())
+    }
+
+    async fn act(&self, _session: chimera_browser::BrowserSessionId, action: chimera_browser::BrowserAction) -> anyhow::Result<chimera_browser::BrowserArtifact> {
+        info!(action = ?action, "browser action (stub)");
+        Ok(chimera_browser::BrowserArtifact::Ack)
+    }
+
+    async fn screenshot(&self, _session: chimera_browser::BrowserSessionId) -> anyhow::Result<chimera_browser::BrowserEvidence> {
+        Ok(chimera_browser::BrowserEvidence {
+            kind: "screenshot".into(),
+            uri: "stub://screenshot.png".into(),
+            label: "stub screenshot".into(),
+            captured_at: Utc::now(),
+        })
+    }
+
+    async fn state(&self, session: chimera_browser::BrowserSessionId) -> anyhow::Result<chimera_browser::BrowserState> {
+        Ok(chimera_browser::BrowserState {
+            id: session,
+            current_url: "about:blank".into(),
+            title: "Stub".into(),
+            active: true,
+            opened_at: Utc::now(),
+        })
+    }
+
+    async fn close(&self, _session: chimera_browser::BrowserSessionId) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn list_sessions(&self) -> anyhow::Result<Vec<chimera_browser::BrowserSessionId>> {
+        Ok(vec![])
     }
 }

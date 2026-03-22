@@ -244,4 +244,9 @@ mod tests {
         let receipt = bridge.receipt(Uuid::new_v4()).await.unwrap();
         assert!(receipt.is_none());
     }
+
+    #[test]
+    fn mock_comms_bridge_default() {
+        let _ = MockCommsBridge::default();
+    }
 }

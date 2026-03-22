@@ -873,3 +873,521 @@ impl McpClient for StubMcpClient {
         Ok(true)
     }
 }
+
+// ---------------------------------------------------------------------------
+// Helper: build a fully-wired harness from stubs
+// ---------------------------------------------------------------------------
+
+/// Build a Harness with all stub/mock backends for testing.
+pub fn build_stub_harness() -> Harness {
+    Harness {
+        sessions: Arc::new(StubSessionStore),
+        creatures: Arc::new(BuiltinCreatureRegistry),
+        tools: Arc::new(StubToolRouter),
+        trace: Arc::new(StubTraceSink),
+        shells: Arc::new(StubShellManager),
+        worlds: Arc::new(StubWorldManager),
+        browser: Arc::new(StubBrowserController),
+        mobile: Arc::new(StubMobileController),
+        comms: Arc::new(StubCommsBridge),
+        memory: Arc::new(StubMemoryStore),
+        eval: Arc::new(StubEvaluator),
+        mcp: Arc::new(StubMcpClient),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── Harness tests ────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn harness_run_objective_completes() {
+        let harness = build_stub_harness();
+        let req = ObjectiveRequest {
+            objective: "test objective".into(),
+            mode: ExecutionMode::Run,
+            repo_root: None,
+            policy_profile: None,
+            evidence_level: EvidenceLevel::Standard,
+        };
+        let report = harness.run_objective(req).await.unwrap();
+        assert_eq!(report.status, RunStatus::Completed);
+        assert_eq!(report.tasks.len(), 4);
+        assert!(report.tasks.iter().all(|t| t.success));
+        assert_eq!(report.checkpoints.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn harness_run_plan_mode() {
+        let harness = build_stub_harness();
+        let req = ObjectiveRequest {
+            objective: "plan something".into(),
+            mode: ExecutionMode::Plan,
+            repo_root: None,
+            policy_profile: None,
+            evidence_level: EvidenceLevel::Minimal,
+        };
+        let report = harness.run_objective(req).await.unwrap();
+        assert_eq!(report.status, RunStatus::Completed);
+    }
+
+    #[tokio::test]
+    async fn harness_run_swarm_mode() {
+        let harness = build_stub_harness();
+        let req = ObjectiveRequest {
+            objective: "swarm something".into(),
+            mode: ExecutionMode::Swarm,
+            repo_root: Some(PathBuf::from("/tmp")),
+            policy_profile: Some("strict".into()),
+            evidence_level: EvidenceLevel::Full,
+        };
+        let report = harness.run_objective(req).await.unwrap();
+        assert_eq!(report.status, RunStatus::Completed);
+    }
+
+    // ── StubTraceSink ────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn stub_trace_sink_emit_and_query() {
+        let sink = StubTraceSink;
+        let event = chimera_trace::TraceEvent {
+            timestamp: Utc::now(),
+            level: chimera_trace::TraceLevel::Info,
+            session_id: Uuid::new_v4(),
+            creature_id: None,
+            span: "test".into(),
+            message: "test msg".into(),
+            fields: serde_json::json!({}),
+        };
+        sink.emit(event).await.unwrap();
+
+        let results = sink.query(Uuid::new_v4()).await.unwrap();
+        assert!(results.is_empty());
+
+        let results = sink.query_creature(Uuid::new_v4(), Uuid::new_v4()).await.unwrap();
+        assert!(results.is_empty());
+    }
+
+    // ── StubSessionStore ─────────────────────────────────────────
+
+    #[tokio::test]
+    async fn stub_session_store_full_lifecycle() {
+        let store = StubSessionStore;
+        let meta = chimera_session::SessionMeta {
+            label: "test".into(),
+            objective: "test obj".into(),
+            created_at: Utc::now(),
+        };
+        let id = store.create(meta).await.unwrap();
+
+        store
+            .append_event(id, chimera_session::SessionEvent::Created {
+                meta: chimera_session::SessionMeta {
+                    label: "test".into(),
+                    objective: "test".into(),
+                    created_at: Utc::now(),
+                },
+            })
+            .await
+            .unwrap();
+
+        let _cp = store.snapshot(id).await.unwrap();
+        let _fork = store.fork(id).await.unwrap();
+
+        let state = store.load(id).await.unwrap();
+        assert_eq!(state.meta.label, "stub");
+
+        let list = store.list().await.unwrap();
+        assert!(list.is_empty());
+    }
+
+    // ── BuiltinCreatureRegistry ──────────────────────────────────
+
+    #[test]
+    fn builtin_creature_registry_has_four() {
+        let reg = BuiltinCreatureRegistry;
+        let builtins = reg.builtin();
+        assert_eq!(builtins.len(), 4);
+        let names: Vec<&str> = builtins.iter().map(|c| c.name.as_str()).collect();
+        assert!(names.contains(&"raven"));
+        assert!(names.contains(&"mantis"));
+        assert!(names.contains(&"hound"));
+        assert!(names.contains(&"owl"));
+    }
+
+    #[test]
+    fn builtin_creature_registry_resolve() {
+        let reg = BuiltinCreatureRegistry;
+        let raven = reg.resolve("raven").unwrap();
+        assert_eq!(raven.role, "reconnaissance and evidence gathering");
+        assert!(reg.resolve("nonexistent").is_err());
+    }
+
+    // ── StubToolRouter ───────────────────────────────────────────
+
+    #[tokio::test]
+    async fn stub_tool_router_call_and_list() {
+        let router = StubToolRouter;
+        let call = chimera_tools::ToolCall {
+            tool: "bash".into(),
+            args: serde_json::json!({"cmd": "ls"}),
+            world: None,
+            requested_by: Uuid::new_v4(),
+        };
+        let result = router.call(call).await.unwrap();
+        assert!(result.ok);
+
+        let tools = router.list().await.unwrap();
+        assert!(tools.is_empty());
+
+        assert!(router.healthcheck("bash").await.unwrap());
+    }
+
+    // ── StubShellManager ─────────────────────────────────────────
+
+    #[tokio::test]
+    async fn stub_shell_manager_lifecycle() {
+        let mgr = StubShellManager;
+        let spec = chimera_shell::ShellSpec {
+            cwd: PathBuf::from("/tmp"),
+            env: Default::default(),
+            read_only: false,
+            label: Some("test".into()),
+        };
+        let id = mgr.spawn_shell(spec).await.unwrap();
+
+        let output = mgr
+            .exec(id, chimera_shell::ShellCommand {
+                command: "echo hello".into(),
+                timeout_secs: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(output.exit_code, 0);
+
+        let transcript = mgr.transcript(id).await.unwrap();
+        assert!(transcript.is_empty());
+
+        mgr.close(id).await.unwrap();
+
+        let shells = mgr.list_shells().await.unwrap();
+        assert!(shells.is_empty());
+    }
+
+    #[tokio::test]
+    async fn stub_shell_manager_worktree() {
+        let mgr = StubShellManager;
+        let spec = chimera_shell::WorktreeSpec {
+            repo_root: PathBuf::from("/tmp/repo"),
+            branch: Some("main".into()),
+            read_only: true,
+            label: None,
+        };
+        let handle = mgr.create_worktree(spec).await.unwrap();
+        assert!(handle.read_only);
+
+        mgr.destroy_worktree(handle.path).await.unwrap();
+    }
+
+    // ── StubWorldManager ─────────────────────────────────────────
+
+    #[tokio::test]
+    async fn stub_world_manager_lifecycle() {
+        let mgr = StubWorldManager;
+        let spec = chimera_sandbox::WorldSpec {
+            kind: chimera_sandbox::WorldKind::Container,
+            image: Some("alpine".into()),
+            root: None,
+            env: Default::default(),
+            network: false,
+            writable: true,
+            label: Some("test".into()),
+            limits: Default::default(),
+        };
+        let id = mgr.allocate(spec).await.unwrap();
+
+        let state = mgr.inspect(id).await.unwrap();
+        assert_eq!(state.status, chimera_sandbox::WorldStatus::Running);
+
+        mgr.pause(id).await.unwrap();
+        mgr.resume(id).await.unwrap();
+        mgr.destroy(id).await.unwrap();
+
+        let worlds = mgr.list().await.unwrap();
+        assert!(worlds.is_empty());
+    }
+
+    // ── StubBrowserController ────────────────────────────────────
+
+    #[tokio::test]
+    async fn stub_browser_controller_lifecycle() {
+        let ctrl = StubBrowserController;
+        let id = ctrl
+            .open(chimera_browser::BrowserTarget::Url("http://test.com".into()))
+            .await
+            .unwrap();
+
+        let artifact = ctrl
+            .act(id, chimera_browser::BrowserAction::Screenshot)
+            .await
+            .unwrap();
+        assert!(matches!(artifact, chimera_browser::BrowserArtifact::Ack));
+
+        let evidence = ctrl.screenshot(id).await.unwrap();
+        assert_eq!(evidence.kind, "screenshot");
+
+        let state = ctrl.state(id).await.unwrap();
+        assert!(state.active);
+        assert_eq!(state.current_url, "about:blank");
+
+        ctrl.close(id).await.unwrap();
+
+        let sessions = ctrl.list_sessions().await.unwrap();
+        assert!(sessions.is_empty());
+    }
+
+    // ── StubMobileController ─────────────────────────────────────
+
+    #[tokio::test]
+    async fn stub_mobile_controller_lifecycle() {
+        let ctrl = StubMobileController;
+        let spec = chimera_mobile::DeviceSpec {
+            profile: "pixel8".into(),
+            os_version: None,
+            network: false,
+            label: None,
+        };
+        let id = ctrl.boot(spec).await.unwrap();
+
+        let artifact = ctrl
+            .perform(id, chimera_mobile::DeviceAction::Screenshot)
+            .await
+            .unwrap();
+        assert!(matches!(artifact, chimera_mobile::DeviceArtifact::Ack));
+
+        let state = ctrl.state(id).await.unwrap();
+        assert_eq!(state.status, chimera_mobile::DeviceStatus::Running);
+
+        ctrl.shutdown(id).await.unwrap();
+
+        let devices = ctrl.list_devices().await.unwrap();
+        assert!(devices.is_empty());
+    }
+
+    // ── StubCommsBridge ──────────────────────────────────────────
+
+    #[tokio::test]
+    async fn stub_comms_bridge_lifecycle() {
+        let bridge = StubCommsBridge;
+        let msg = chimera_comms::Notification {
+            channel: chimera_comms::Channel::Terminal,
+            priority: chimera_comms::Priority::Normal,
+            subject: "test".into(),
+            body: "body".into(),
+            metadata: None,
+        };
+        let _mid = bridge.notify(msg).await.unwrap();
+
+        let prompt = chimera_comms::CommsApprovalPrompt {
+            channel: chimera_comms::Channel::Terminal,
+            actor: "test".into(),
+            class: "green".into(),
+            action: "read".into(),
+            reason: "testing".into(),
+            touched_resources: vec![],
+        };
+        let aid = bridge.request_approval(prompt).await.unwrap();
+        let result = bridge.check_approval(aid).await.unwrap();
+        assert_eq!(result, Some(true));
+
+        let receipt = bridge.receipt(Uuid::new_v4()).await.unwrap();
+        assert!(receipt.is_none());
+    }
+
+    // ── StubMemoryStore ──────────────────────────────────────────
+
+    #[tokio::test]
+    async fn stub_memory_store_operations() {
+        let store = StubMemoryStore;
+        let item = chimera_memory::MemoryItem {
+            id: Uuid::new_v4(),
+            layer: chimera_memory::MemoryLayer::Episodic,
+            key: "test".into(),
+            content: "content".into(),
+            metadata: serde_json::json!({}),
+            created_at: Utc::now(),
+            last_accessed: Utc::now(),
+            session_id: None,
+            creature_id: None,
+            relevance: 0.9,
+        };
+        let id = store.remember(item).await.unwrap();
+        assert_ne!(id, Uuid::nil());
+
+        let results = store.retrieve(chimera_memory::MemoryQuery::default()).await.unwrap();
+        assert!(results.is_empty());
+
+        store.forget(Uuid::new_v4()).await.unwrap();
+
+        let removed = store.compact(chimera_memory::MemoryLayer::Scratch).await.unwrap();
+        assert_eq!(removed, 0);
+    }
+
+    // ── StubEvaluator ────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn stub_evaluator_operations() {
+        let eval = StubEvaluator;
+        let req = chimera_eval::EvalRequest {
+            name: "test".into(),
+            target: chimera_eval::EvalTarget::Artifact { path: "x".into() },
+            graders: vec![],
+        };
+        let report = eval.grade(req).await.unwrap();
+        assert!(report.passed);
+        assert_eq!(report.score, 1.0);
+
+        let diff = eval.compare(Uuid::new_v4(), Uuid::new_v4()).await.unwrap();
+        assert!(!diff.regression_detected);
+    }
+
+    // ── StubMcpClient ────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn stub_mcp_client_operations() {
+        let client = StubMcpClient;
+        let tools = client.list_tools("test").await.unwrap();
+        assert!(tools.is_empty());
+
+        let result = client.invoke("test", "tool", serde_json::json!({})).await.unwrap();
+        assert!(!result.is_error);
+
+        let resources = client.list_resources("test").await.unwrap();
+        assert!(resources.is_empty());
+
+        let content = client.read_resource("test", "uri").await.unwrap();
+        assert!(matches!(content, chimera_mcp::McpContent::Text { .. }));
+
+        assert!(client.ping("test").await.unwrap());
+    }
+
+    // ── Domain type coverage ─────────────────────────────────────
+
+    #[test]
+    fn evidence_level_variants() {
+        let levels = [EvidenceLevel::Minimal, EvidenceLevel::Standard, EvidenceLevel::Full];
+        for level in &levels {
+            let json = serde_json::to_string(level).unwrap();
+            let _: EvidenceLevel = serde_json::from_str(&json).unwrap();
+        }
+    }
+
+    #[test]
+    fn execution_mode_variants() {
+        let modes = [ExecutionMode::Run, ExecutionMode::Plan, ExecutionMode::Swarm, ExecutionMode::Pack];
+        for mode in &modes {
+            let json = serde_json::to_string(mode).unwrap();
+            let _: ExecutionMode = serde_json::from_str(&json).unwrap();
+        }
+    }
+
+    #[test]
+    fn run_status_variants() {
+        let statuses = [
+            RunStatus::Running, RunStatus::Completed, RunStatus::Failed,
+            RunStatus::Cancelled, RunStatus::AwaitingApproval, RunStatus::RolledBack,
+        ];
+        for s in &statuses {
+            let json = serde_json::to_string(s).unwrap();
+            let _: RunStatus = serde_json::from_str(&json).unwrap();
+        }
+    }
+
+    #[test]
+    fn approval_class_variants() {
+        let classes = [ApprovalClass::Green, ApprovalClass::Yellow, ApprovalClass::Orange, ApprovalClass::Red];
+        for c in &classes {
+            let json = serde_json::to_string(c).unwrap();
+            let _: ApprovalClass = serde_json::from_str(&json).unwrap();
+        }
+    }
+
+    #[test]
+    fn evidence_kind_variants() {
+        let kinds = [
+            EvidenceKind::CommandTranscript, EvidenceKind::FileDiff, EvidenceKind::TraceSpan,
+            EvidenceKind::Screenshot, EvidenceKind::TestResult, EvidenceKind::BrowserReplay,
+            EvidenceKind::ApprovalDecision,
+        ];
+        for k in &kinds {
+            let json = serde_json::to_string(k).unwrap();
+            let _: EvidenceKind = serde_json::from_str(&json).unwrap();
+        }
+    }
+
+    #[test]
+    fn evidence_ref_serialization() {
+        let er = EvidenceRef {
+            kind: EvidenceKind::FileDiff,
+            uri: "file:///test.diff".into(),
+            label: "test diff".into(),
+            created_at: Utc::now(),
+        };
+        let json = serde_json::to_string(&er).unwrap();
+        let _: EvidenceRef = serde_json::from_str(&json).unwrap();
+    }
+
+    #[test]
+    fn approval_record_serialization() {
+        let ar = ApprovalRecord {
+            creature_id: Uuid::new_v4(),
+            class: ApprovalClass::Yellow,
+            action: "patch files".into(),
+            approved: true,
+            decided_at: Utc::now(),
+        };
+        let json = serde_json::to_string(&ar).unwrap();
+        let _: ApprovalRecord = serde_json::from_str(&json).unwrap();
+    }
+
+    #[test]
+    fn task_report_serialization() {
+        let tr = TaskReport {
+            description: "analyze code".into(),
+            creature_id: Uuid::new_v4(),
+            success: true,
+            evidence: vec![],
+        };
+        let json = serde_json::to_string(&tr).unwrap();
+        let _: TaskReport = serde_json::from_str(&json).unwrap();
+    }
+
+    #[test]
+    fn objective_request_serialization() {
+        let req = ObjectiveRequest {
+            objective: "fix auth".into(),
+            mode: ExecutionMode::Run,
+            repo_root: Some(PathBuf::from("/tmp")),
+            policy_profile: Some("strict".into()),
+            evidence_level: EvidenceLevel::Full,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let _: ObjectiveRequest = serde_json::from_str(&json).unwrap();
+    }
+
+    #[test]
+    fn run_report_serialization() {
+        let report = RunReport {
+            session_id: Uuid::new_v4(),
+            status: RunStatus::Completed,
+            tasks: vec![],
+            approvals: vec![],
+            evidence: vec![],
+            checkpoints: vec![],
+        };
+        let json = serde_json::to_string(&report).unwrap();
+        let _: RunReport = serde_json::from_str(&json).unwrap();
+    }
+}

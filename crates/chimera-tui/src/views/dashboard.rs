@@ -175,3 +175,37 @@ fn render_keys(f: &mut Frame, area: Rect) {
     ]);
     f.render_widget(Paragraph::new(keys), area);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::views::test_helpers::{sample_app, test_terminal};
+
+    #[test]
+    fn dashboard_renders_without_panic() {
+        let app = sample_app();
+        let mut terminal = test_terminal(120, 40);
+        terminal
+            .draw(|f| render(f, &app))
+            .unwrap();
+    }
+
+    #[test]
+    fn dashboard_renders_empty_app() {
+        let app = App::new("empty".into(), "nothing".into());
+        let mut terminal = test_terminal(80, 24);
+        terminal
+            .draw(|f| render(f, &app))
+            .unwrap();
+    }
+
+    #[test]
+    fn dashboard_renders_with_long_feed() {
+        let mut app = sample_app();
+        for i in 0..10 {
+            app.push_feed("C", &format!("msg {}", i));
+        }
+        let mut terminal = test_terminal(120, 40);
+        terminal.draw(|f| render(f, &app)).unwrap();
+    }
+}

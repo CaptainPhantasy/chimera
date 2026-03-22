@@ -261,4 +261,27 @@ mod tests {
         assert!(json.contains("watch"));
         assert!(json.contains("*.log"));
     }
+
+    #[test]
+    fn mock_scheduler_default() {
+        let _ = MockScheduler::default();
+    }
+
+    #[tokio::test]
+    async fn pause_unknown_fails() {
+        let sched = MockScheduler::new();
+        assert!(sched.pause(Uuid::new_v4()).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn resume_unknown_fails() {
+        let sched = MockScheduler::new();
+        assert!(sched.resume(Uuid::new_v4()).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn cancel_unknown_fails() {
+        let sched = MockScheduler::new();
+        assert!(sched.cancel(Uuid::new_v4()).await.is_err());
+    }
 }

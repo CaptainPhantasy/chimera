@@ -101,3 +101,23 @@ pub fn render(f: &mut Frame, app: &App) {
     ]);
     f.render_widget(Paragraph::new(keys), chunks[5]);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::views::test_helpers::{app_with_approval, test_terminal};
+
+    #[test]
+    fn approval_renders_with_prompt() {
+        let app = app_with_approval();
+        let mut terminal = test_terminal(80, 30);
+        terminal.draw(|f| render(f, &app)).unwrap();
+    }
+
+    #[test]
+    fn approval_renders_no_prompt() {
+        let app = App::new("s".into(), "o".into());
+        let mut terminal = test_terminal(80, 30);
+        terminal.draw(|f| render(f, &app)).unwrap();
+    }
+}

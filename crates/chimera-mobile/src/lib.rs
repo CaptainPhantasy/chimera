@@ -283,4 +283,15 @@ mod tests {
         assert!(devices.contains(&id1));
         assert!(devices.contains(&id2));
     }
+
+    #[test]
+    fn mock_mobile_controller_default() {
+        let _ = MockMobileController::default();
+    }
+
+    #[tokio::test]
+    async fn shutdown_unknown_device_fails() {
+        let ctrl = MockMobileController::new();
+        assert!(ctrl.shutdown(Uuid::new_v4()).await.is_err());
+    }
 }

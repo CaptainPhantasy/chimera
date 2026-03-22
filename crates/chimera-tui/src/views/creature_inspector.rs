@@ -85,3 +85,23 @@ pub fn render(f: &mut Frame, app: &App) {
     ]);
     f.render_widget(Paragraph::new(keys), chunks[3]);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::views::test_helpers::{sample_app, test_terminal};
+
+    #[test]
+    fn inspector_renders_with_creature() {
+        let app = sample_app();
+        let mut terminal = test_terminal(80, 30);
+        terminal.draw(|f| render(f, &app)).unwrap();
+    }
+
+    #[test]
+    fn inspector_renders_no_creatures() {
+        let app = App::new("s".into(), "o".into());
+        let mut terminal = test_terminal(80, 30);
+        terminal.draw(|f| render(f, &app)).unwrap();
+    }
+}

@@ -141,3 +141,88 @@ pub trait WorldManager: Send + Sync {
     /// List all active world IDs.
     async fn list(&self) -> anyhow::Result<Vec<WorldId>>;
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn world_kind_serialization() {
+        let kinds = [
+            WorldKind::LocalShell, WorldKind::WorktreeReadOnly, WorldKind::WorktreeReadWrite,
+            WorldKind::Container, WorldKind::MicroVm, WorldKind::BrowserSandbox,
+            WorldKind::MobileEmulator, WorldKind::RemoteRunner,
+        ];
+        for k in &kinds {
+            let json = serde_json::to_string(k).unwrap();
+            let _: WorldKind = serde_json::from_str(&json).unwrap();
+        }
+    }
+
+    #[test]
+    fn world_status_serialization() {
+        let statuses = [
+            WorldStatus::Provisioning, WorldStatus::Running, WorldStatus::Paused,
+            WorldStatus::Destroying, WorldStatus::Destroyed, WorldStatus::Failed,
+        ];
+        for s in &statuses {
+            let json = serde_json::to_string(s).unwrap();
+            let _: WorldStatus = serde_json::from_str(&json).unwrap();
+        }
+    }
+
+    #[test]
+    fn resource_limits_default() {
+        let limits = ResourceLimits::default();
+        assert!(limits.cpu_cores.is_none());
+        assert!(limits.memory_mb.is_none());
+        assert!(limits.disk_mb.is_none());
+        assert!(limits.timeout_secs.is_none());
+    }
+
+    #[test]
+    fn world_spec_serialization() {
+        let spec = WorldSpec {
+            kind: WorldKind::Container,
+            image: Some("alpine:latest".into()),
+            root: Some(std::path::PathBuf::from("/tmp")),
+            env: [("FOO".to_string(), "bar".to_string())].into_iter().collect(),
+            network: true,
+            writable: true,
+            label: Some("test-world".into()),
+            limits: ResourceLimits {
+                cpu_cores: Some(2.0),
+                memory_mb: Some(512),
+                disk_mb: Some(1024),
+                timeout_secs: Some(3600),
+            },
+        };
+        let json = serde_json::to_string(&spec).unwrap();
+        let deserialized: WorldSpec = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.kind, WorldKind::Container);
+        assert_eq!(deserialized.image, Some("alpine:latest".into()));
+        assert!(deserialized.network);
+    }
+
+    #[test]
+    fn world_state_serialization() {
+        let state = WorldState {
+            id: Uuid::new_v4(),
+            spec: WorldSpec {
+                kind: WorldKind::LocalShell,
+                image: None,
+                root: None,
+                env: Default::default(),
+                network: false,
+                writable: false,
+                label: None,
+                limits: Default::default(),
+            },
+            status: WorldStatus::Running,
+            created_at: Utc::now(),
+            root_path: None,
+        };
+        let json = serde_json::to_string(&state).unwrap();
+        let _: WorldState = serde_json::from_str(&json).unwrap();
+    }
+}

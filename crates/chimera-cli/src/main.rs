@@ -638,3 +638,333 @@ async fn main() -> Result<()> {
 
     dispatch(cli.command).await
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    // ── Parsing tests ────────────────────────────────────────────
+
+    fn parse(args: &[&str]) -> Cli {
+        Cli::parse_from(std::iter::once("chimera").chain(args.iter().copied()))
+    }
+
+    #[test]
+    fn parse_init() {
+        let cli = parse(&["init"]);
+        assert!(matches!(cli.command, Command::Init));
+    }
+
+    #[test]
+    fn parse_up_down_doctor_status() {
+        assert!(matches!(parse(&["up"]).command, Command::Up));
+        assert!(matches!(parse(&["down"]).command, Command::Down));
+        assert!(matches!(parse(&["doctor"]).command, Command::Doctor));
+        assert!(matches!(parse(&["status"]).command, Command::Status));
+    }
+
+    #[test]
+    fn parse_daemon() {
+        let cli = parse(&["daemon", "start"]);
+        assert!(matches!(cli.command, Command::Daemon { cmd: DaemonCmd::Start }));
+        let cli = parse(&["daemon", "stop"]);
+        assert!(matches!(cli.command, Command::Daemon { cmd: DaemonCmd::Stop }));
+    }
+
+    #[test]
+    fn parse_run_plan_swarm() {
+        let cli = parse(&["run", "fix auth"]);
+        match cli.command {
+            Command::Run { objective } => assert_eq!(objective, "fix auth"),
+            _ => panic!("expected run"),
+        }
+        let cli = parse(&["plan", "migrate db"]);
+        match cli.command {
+            Command::Plan { objective } => assert_eq!(objective, "migrate db"),
+            _ => panic!("expected plan"),
+        }
+        let cli = parse(&["swarm", "audit tests"]);
+        match cli.command {
+            Command::Swarm { objective } => assert_eq!(objective, "audit tests"),
+            _ => panic!("expected swarm"),
+        }
+    }
+
+    #[test]
+    fn parse_pack() {
+        let cli = parse(&["pack", "ship-hotfix"]);
+        match cli.command {
+            Command::Pack { name } => assert_eq!(name, "ship-hotfix"),
+            _ => panic!("expected pack"),
+        }
+    }
+
+    #[test]
+    fn parse_session_commands() {
+        assert!(matches!(parse(&["session", "list"]).command, Command::Session { cmd: SessionCmd::List }));
+        match parse(&["session", "resume", "abc"]).command {
+            Command::Session { cmd: SessionCmd::Resume { session_id } } => assert_eq!(session_id, "abc"),
+            _ => panic!("expected resume"),
+        }
+        match parse(&["session", "fork", "xyz"]).command {
+            Command::Session { cmd: SessionCmd::Fork { session_id } } => assert_eq!(session_id, "xyz"),
+            _ => panic!("expected fork"),
+        }
+    }
+
+    #[test]
+    fn parse_checkpoint_rollback_replay() {
+        assert!(matches!(parse(&["checkpoint", "create"]).command, Command::Checkpoint { cmd: CheckpointCmd::Create }));
+        assert!(matches!(parse(&["checkpoint", "list"]).command, Command::Checkpoint { cmd: CheckpointCmd::List }));
+        match parse(&["rollback", "cp-1"]).command {
+            Command::Rollback { checkpoint_id } => assert_eq!(checkpoint_id, "cp-1"),
+            _ => panic!("expected rollback"),
+        }
+        match parse(&["replay", "s-1"]).command {
+            Command::Replay { session_id } => assert_eq!(session_id, "s-1"),
+            _ => panic!("expected replay"),
+        }
+    }
+
+    #[test]
+    fn parse_creature_commands() {
+        assert!(matches!(parse(&["creature", "list"]).command, Command::Creature { cmd: CreatureCmd::List }));
+        match parse(&["creature", "spawn", "raven", "--count", "3"]).command {
+            Command::Creature { cmd: CreatureCmd::Spawn { name, count } } => {
+                assert_eq!(name, "raven");
+                assert_eq!(count, 3);
+            }
+            _ => panic!("expected spawn"),
+        }
+        match parse(&["creature", "inspect", "mantis-1"]).command {
+            Command::Creature { cmd: CreatureCmd::Inspect { instance } } => assert_eq!(instance, "mantis-1"),
+            _ => panic!("expected inspect"),
+        }
+        match parse(&["creature", "stop", "hound-2"]).command {
+            Command::Creature { cmd: CreatureCmd::Stop { instance } } => assert_eq!(instance, "hound-2"),
+            _ => panic!("expected stop"),
+        }
+        match parse(&["creature", "promote", "owl-1"]).command {
+            Command::Creature { cmd: CreatureCmd::Promote { instance } } => assert_eq!(instance, "owl-1"),
+            _ => panic!("expected promote"),
+        }
+        match parse(&["creature", "leash", "hydra-1"]).command {
+            Command::Creature { cmd: CreatureCmd::Leash { instance } } => assert_eq!(instance, "hydra-1"),
+            _ => panic!("expected leash"),
+        }
+    }
+
+    #[test]
+    fn parse_tool_commands() {
+        assert!(matches!(parse(&["tool", "list"]).command, Command::Tool { cmd: ToolCmd::List }));
+        match parse(&["tool", "inspect", "bash"]).command {
+            Command::Tool { cmd: ToolCmd::Inspect { name } } => assert_eq!(name, "bash"),
+            _ => panic!("expected inspect"),
+        }
+        match parse(&["tool", "healthcheck", "mcp"]).command {
+            Command::Tool { cmd: ToolCmd::Healthcheck { name } } => assert_eq!(name, "mcp"),
+            _ => panic!("expected healthcheck"),
+        }
+        match parse(&["tool", "test", "browser"]).command {
+            Command::Tool { cmd: ToolCmd::Test { name } } => assert_eq!(name, "browser"),
+            _ => panic!("expected test"),
+        }
+        match parse(&["tool", "disable", "comms"]).command {
+            Command::Tool { cmd: ToolCmd::Disable { name } } => assert_eq!(name, "comms"),
+            _ => panic!("expected disable"),
+        }
+    }
+
+    #[test]
+    fn parse_world_browser_phone() {
+        assert!(matches!(parse(&["world", "list"]).command, Command::World { cmd: WorldCmd::List }));
+        match parse(&["world", "spawn", "vm"]).command {
+            Command::World { cmd: WorldCmd::Spawn { kind } } => assert_eq!(kind, "vm"),
+            _ => panic!("expected spawn"),
+        }
+        match parse(&["browser", "open", "staging"]).command {
+            Command::Browser { cmd: BrowserCmd::Open { target } } => assert_eq!(target, "staging"),
+            _ => panic!("expected open"),
+        }
+        match parse(&["phone", "boot", "pixel8"]).command {
+            Command::Phone { cmd: PhoneCmd::Boot { device } } => assert_eq!(device, "pixel8"),
+            _ => panic!("expected boot"),
+        }
+    }
+
+    #[test]
+    fn parse_policy_approval_commands() {
+        assert!(matches!(parse(&["approve", "next"]).command, Command::Approve { cmd: ApproveCmd::Next }));
+        assert!(matches!(parse(&["approve", "plan"]).command, Command::Approve { cmd: ApproveCmd::Plan }));
+        match parse(&["deny", "call-4"]).command {
+            Command::Deny { call_id } => assert_eq!(call_id, "call-4"),
+            _ => panic!("expected deny"),
+        }
+        assert!(matches!(parse(&["policy", "show"]).command, Command::Policy { cmd: PolicyCmd::Show }));
+        assert!(matches!(parse(&["policy", "edit"]).command, Command::Policy { cmd: PolicyCmd::Edit }));
+        match parse(&["autonomy", "set", "low"]).command {
+            Command::Autonomy { cmd: AutonomyCmd::Set { level } } => assert_eq!(level, "low"),
+            _ => panic!("expected set"),
+        }
+        match parse(&["leash", "all"]).command {
+            Command::Leash { target } => assert_eq!(target, "all"),
+            _ => panic!("expected leash"),
+        }
+    }
+
+    #[test]
+    fn parse_trace_eval_commands() {
+        assert!(matches!(parse(&["trace", "live"]).command, Command::Trace { cmd: TraceCmd::Live }));
+        match parse(&["trace", "show", "t-1"]).command {
+            Command::Trace { cmd: TraceCmd::Show { task_id } } => assert_eq!(task_id, "t-1"),
+            _ => panic!("expected show"),
+        }
+        match parse(&["trace", "export", "s-1"]).command {
+            Command::Trace { cmd: TraceCmd::Export { session_id } } => assert_eq!(session_id, "s-1"),
+            _ => panic!("expected export"),
+        }
+        match parse(&["eval", "run", "auth-refactor"]).command {
+            Command::Eval { cmd: EvalCmd::Run { name } } => assert_eq!(name, "auth-refactor"),
+            _ => panic!("expected run"),
+        }
+        match parse(&["eval", "compare", "a", "b"]).command {
+            Command::Eval { cmd: EvalCmd::Compare { checkpoint_a, checkpoint_b } } => {
+                assert_eq!(checkpoint_a, "a");
+                assert_eq!(checkpoint_b, "b");
+            }
+            _ => panic!("expected compare"),
+        }
+    }
+
+    #[test]
+    fn parse_memory_skill_commands() {
+        assert!(matches!(parse(&["memory", "list"]).command, Command::Memory { cmd: MemoryCmd::List }));
+        match parse(&["memory", "show", "ep-44"]).command {
+            Command::Memory { cmd: MemoryCmd::Show { episode_id } } => assert_eq!(episode_id, "ep-44"),
+            _ => panic!("expected show"),
+        }
+        assert!(matches!(parse(&["skill", "list"]).command, Command::Skill { cmd: SkillCmd::List }));
+        match parse(&["skill", "inspect", "hotfix"]).command {
+            Command::Skill { cmd: SkillCmd::Inspect { name } } => assert_eq!(name, "hotfix"),
+            _ => panic!("expected inspect"),
+        }
+        match parse(&["skill", "run", "dep-upgrade"]).command {
+            Command::Skill { cmd: SkillCmd::Run { name } } => assert_eq!(name, "dep-upgrade"),
+            _ => panic!("expected run"),
+        }
+    }
+
+    #[test]
+    fn parse_schedule_watch() {
+        match parse(&["schedule", "daily", "check deps"]).command {
+            Command::Schedule { frequency, objective } => {
+                assert_eq!(frequency, "daily");
+                assert_eq!(objective, "check deps");
+            }
+            _ => panic!("expected schedule"),
+        }
+        match parse(&["watch", "monitor logs"]).command {
+            Command::Watch { objective } => assert_eq!(objective, "monitor logs"),
+            _ => panic!("expected watch"),
+        }
+    }
+
+    #[test]
+    fn parse_global_flags() {
+        let cli = parse(&["--verbose", "--format", "json", "--profile", "strict", "status"]);
+        assert!(cli.verbose);
+        assert!(matches!(cli.format, OutputFormat::Json));
+        assert_eq!(cli.profile, Some("strict".into()));
+    }
+
+    // ── Dispatch tests ───────────────────────────────────────────
+
+    #[tokio::test]
+    async fn dispatch_stub_commands() {
+        // Test a representative sample of stub-dispatched commands
+        dispatch(Command::Init).await.unwrap();
+        dispatch(Command::Up).await.unwrap();
+        dispatch(Command::Down).await.unwrap();
+        dispatch(Command::Doctor).await.unwrap();
+        dispatch(Command::Status).await.unwrap();
+        dispatch(Command::Daemon { cmd: DaemonCmd::Start }).await.unwrap();
+        dispatch(Command::Daemon { cmd: DaemonCmd::Stop }).await.unwrap();
+        dispatch(Command::Pack { name: "test".into() }).await.unwrap();
+        dispatch(Command::Session { cmd: SessionCmd::List }).await.unwrap();
+        dispatch(Command::Session { cmd: SessionCmd::Resume { session_id: "s1".into() } }).await.unwrap();
+        dispatch(Command::Session { cmd: SessionCmd::Fork { session_id: "s1".into() } }).await.unwrap();
+        dispatch(Command::Checkpoint { cmd: CheckpointCmd::Create }).await.unwrap();
+        dispatch(Command::Checkpoint { cmd: CheckpointCmd::List }).await.unwrap();
+        dispatch(Command::Rollback { checkpoint_id: "cp1".into() }).await.unwrap();
+        dispatch(Command::Replay { session_id: "s1".into() }).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn dispatch_creature_commands() {
+        dispatch(Command::Creature { cmd: CreatureCmd::List }).await.unwrap();
+        dispatch(Command::Creature { cmd: CreatureCmd::Spawn { name: "raven".into(), count: 2 } }).await.unwrap();
+        dispatch(Command::Creature { cmd: CreatureCmd::Inspect { instance: "m-1".into() } }).await.unwrap();
+        dispatch(Command::Creature { cmd: CreatureCmd::Stop { instance: "m-1".into() } }).await.unwrap();
+        dispatch(Command::Creature { cmd: CreatureCmd::Promote { instance: "m-1".into() } }).await.unwrap();
+        dispatch(Command::Creature { cmd: CreatureCmd::Leash { instance: "m-1".into() } }).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn dispatch_tool_world_browser_phone() {
+        dispatch(Command::Tool { cmd: ToolCmd::List }).await.unwrap();
+        dispatch(Command::Tool { cmd: ToolCmd::Inspect { name: "bash".into() } }).await.unwrap();
+        dispatch(Command::Tool { cmd: ToolCmd::Healthcheck { name: "mcp".into() } }).await.unwrap();
+        dispatch(Command::Tool { cmd: ToolCmd::Test { name: "git".into() } }).await.unwrap();
+        dispatch(Command::Tool { cmd: ToolCmd::Disable { name: "comms".into() } }).await.unwrap();
+        dispatch(Command::World { cmd: WorldCmd::List }).await.unwrap();
+        dispatch(Command::World { cmd: WorldCmd::Spawn { kind: "vm".into() } }).await.unwrap();
+        dispatch(Command::Browser { cmd: BrowserCmd::Open { target: "staging".into() } }).await.unwrap();
+        dispatch(Command::Phone { cmd: PhoneCmd::Boot { device: "pixel8".into() } }).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn dispatch_policy_trace_eval_memory_skill() {
+        dispatch(Command::Approve { cmd: ApproveCmd::Next }).await.unwrap();
+        dispatch(Command::Approve { cmd: ApproveCmd::Plan }).await.unwrap();
+        dispatch(Command::Deny { call_id: "4".into() }).await.unwrap();
+        dispatch(Command::Policy { cmd: PolicyCmd::Show }).await.unwrap();
+        dispatch(Command::Policy { cmd: PolicyCmd::Edit }).await.unwrap();
+        dispatch(Command::Autonomy { cmd: AutonomyCmd::Set { level: "low".into() } }).await.unwrap();
+        dispatch(Command::Leash { target: "all".into() }).await.unwrap();
+        dispatch(Command::Trace { cmd: TraceCmd::Live }).await.unwrap();
+        dispatch(Command::Trace { cmd: TraceCmd::Show { task_id: "t1".into() } }).await.unwrap();
+        dispatch(Command::Trace { cmd: TraceCmd::Export { session_id: "s1".into() } }).await.unwrap();
+        dispatch(Command::Eval { cmd: EvalCmd::Run { name: "auth".into() } }).await.unwrap();
+        dispatch(Command::Eval { cmd: EvalCmd::Compare { checkpoint_a: "a".into(), checkpoint_b: "b".into() } }).await.unwrap();
+        dispatch(Command::Memory { cmd: MemoryCmd::List }).await.unwrap();
+        dispatch(Command::Memory { cmd: MemoryCmd::Show { episode_id: "e1".into() } }).await.unwrap();
+        dispatch(Command::Skill { cmd: SkillCmd::List }).await.unwrap();
+        dispatch(Command::Skill { cmd: SkillCmd::Inspect { name: "hotfix".into() } }).await.unwrap();
+        dispatch(Command::Skill { cmd: SkillCmd::Run { name: "hotfix".into() } }).await.unwrap();
+        dispatch(Command::Schedule { frequency: "daily".into(), objective: "check".into() }).await.unwrap();
+        dispatch(Command::Watch { objective: "monitor".into() }).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn dispatch_run_objective() {
+        dispatch(Command::Run { objective: "test run".into() }).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn dispatch_plan_objective() {
+        dispatch(Command::Plan { objective: "test plan".into() }).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn dispatch_swarm_objective() {
+        dispatch(Command::Swarm { objective: "test swarm".into() }).await.unwrap();
+    }
+
+    // ── build_harness ────────────────────────────────────────────
+
+    #[test]
+    fn build_harness_succeeds() {
+        let _harness = build_harness();
+    }
+}

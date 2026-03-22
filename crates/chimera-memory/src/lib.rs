@@ -311,4 +311,51 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].key, "c");
     }
+
+    #[tokio::test]
+    async fn retrieve_filters_by_session_id() {
+        let store = InMemoryStore::new();
+        let sid = Uuid::new_v4();
+        let mut item_a = make_item("a", MemoryLayer::Session, 0.8);
+        item_a.session_id = Some(sid);
+        store.remember(item_a).await.unwrap();
+        store.remember(make_item("b", MemoryLayer::Session, 0.8)).await.unwrap();
+
+        let results = store
+            .retrieve(MemoryQuery {
+                session_id: Some(sid),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].key, "a");
+    }
+
+    #[tokio::test]
+    async fn retrieve_filters_by_creature_id() {
+        let store = InMemoryStore::new();
+        let cid = Uuid::new_v4();
+        let mut item_a = make_item("a", MemoryLayer::Scratch, 0.8);
+        item_a.creature_id = Some(cid);
+        store.remember(item_a).await.unwrap();
+        store.remember(make_item("b", MemoryLayer::Scratch, 0.8)).await.unwrap();
+
+        let results = store
+            .retrieve(MemoryQuery {
+                creature_id: Some(cid),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].key, "a");
+    }
+
+    #[test]
+    fn in_memory_store_default() {
+        let store = InMemoryStore::default();
+        // Just verify it constructs without panic
+        let _ = store;
+    }
 }

@@ -242,4 +242,10 @@ mod tests {
         let client = MockMcpClient::new();
         assert!(client.ping("test-server").await.unwrap());
     }
+
+    #[test]
+    fn mock_mcp_client_default() {
+        let client = MockMcpClient::default();
+        assert_eq!(client.tools.len(), 2);
+    }
 }

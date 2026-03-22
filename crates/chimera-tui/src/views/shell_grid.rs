@@ -51,3 +51,40 @@ pub fn render(f: &mut Frame, app: &App) {
     let p = Paragraph::new(lines).block(block);
     f.render_widget(p, f.area());
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::views::test_helpers::{sample_app, test_terminal};
+
+    #[test]
+    fn shell_grid_renders_with_creatures() {
+        let app = sample_app();
+        let mut terminal = test_terminal(100, 20);
+        terminal.draw(|f| render(f, &app)).unwrap();
+    }
+
+    #[test]
+    fn shell_grid_renders_empty() {
+        let app = App::new("s".into(), "o".into());
+        let mut terminal = test_terminal(80, 20);
+        terminal.draw(|f| render(f, &app)).unwrap();
+    }
+
+    #[test]
+    fn shell_grid_renders_idle_status() {
+        use crate::app::CreatureRow;
+        let mut app = App::new("s".into(), "o".into());
+        app.creatures = vec![CreatureRow {
+            id: "OWL-1".into(),
+            role: "evaluator".into(),
+            state: "idle".into(),
+            world: "local".into(),
+            confidence: 0.93,
+            tokens_used: 7000,
+            last_action: "ready".into(),
+        }];
+        let mut terminal = test_terminal(100, 20);
+        terminal.draw(|f| render(f, &app)).unwrap();
+    }
+}

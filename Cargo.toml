@@ -1,0 +1,35 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/chimera-cli",
+    "crates/chimera-core",
+    "crates/chimera-session",
+    "crates/chimera-creatures",
+    "crates/chimera-tools",
+    "crates/chimera-trace",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+async-trait = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+
+# Internal crates
+chimera-core = { path = "crates/chimera-core" }
+chimera-session = { path = "crates/chimera-session" }
+chimera-creatures = { path = "crates/chimera-creatures" }
+chimera-tools = { path = "crates/chimera-tools" }
+chimera-trace = { path = "crates/chimera-trace" }

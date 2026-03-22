@@ -117,3 +117,129 @@ pub trait McpClient: Send + Sync {
     /// Check connectivity to an MCP server.
     async fn ping(&self, server: &str) -> anyhow::Result<bool>;
 }
+
+// ---------------------------------------------------------------------------
+// Mock MCP client
+// ---------------------------------------------------------------------------
+
+/// A mock MCP client that returns canned responses.
+pub struct MockMcpClient {
+    tools: Vec<McpToolDescriptor>,
+    resources: Vec<McpResource>,
+}
+
+impl MockMcpClient {
+    pub fn new() -> Self {
+        Self {
+            tools: vec![
+                McpToolDescriptor {
+                    name: "search".into(),
+                    description: "Search the codebase".into(),
+                    input_schema: serde_json::json!({"type": "object", "properties": {"query": {"type": "string"}}}),
+                    server: "test-server".into(),
+                },
+                McpToolDescriptor {
+                    name: "read_file".into(),
+                    description: "Read a file".into(),
+                    input_schema: serde_json::json!({"type": "object", "properties": {"path": {"type": "string"}}}),
+                    server: "test-server".into(),
+                },
+            ],
+            resources: vec![McpResource {
+                uri: "file:///README.md".into(),
+                name: "README".into(),
+                mime_type: Some("text/markdown".into()),
+                description: Some("Project readme".into()),
+            }],
+        }
+    }
+}
+
+impl Default for MockMcpClient {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait::async_trait]
+impl McpClient for MockMcpClient {
+    async fn list_tools(&self, _server: &str) -> anyhow::Result<Vec<McpToolDescriptor>> {
+        Ok(self.tools.clone())
+    }
+
+    async fn invoke(&self, _server: &str, tool: &str, args: serde_json::Value) -> anyhow::Result<McpToolResult> {
+        Ok(McpToolResult {
+            is_error: false,
+            content: vec![McpContent::Text {
+                text: format!("result of {}({})", tool, args),
+            }],
+        })
+    }
+
+    async fn list_resources(&self, _server: &str) -> anyhow::Result<Vec<McpResource>> {
+        Ok(self.resources.clone())
+    }
+
+    async fn read_resource(&self, _server: &str, uri: &str) -> anyhow::Result<McpContent> {
+        Ok(McpContent::Text {
+            text: format!("content of {}", uri),
+        })
+    }
+
+    async fn ping(&self, _server: &str) -> anyhow::Result<bool> {
+        Ok(true)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn list_tools_returns_registered() {
+        let client = MockMcpClient::new();
+        let tools = client.list_tools("test-server").await.unwrap();
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0].name, "search");
+        assert_eq!(tools[1].name, "read_file");
+    }
+
+    #[tokio::test]
+    async fn invoke_returns_result() {
+        let client = MockMcpClient::new();
+        let result = client
+            .invoke("test-server", "search", serde_json::json!({"query": "auth"}))
+            .await
+            .unwrap();
+        assert!(!result.is_error);
+        assert_eq!(result.content.len(), 1);
+        match &result.content[0] {
+            McpContent::Text { text } => assert!(text.contains("search")),
+            _ => panic!("expected text content"),
+        }
+    }
+
+    #[tokio::test]
+    async fn list_resources_returns_registered() {
+        let client = MockMcpClient::new();
+        let resources = client.list_resources("test-server").await.unwrap();
+        assert_eq!(resources.len(), 1);
+        assert_eq!(resources[0].uri, "file:///README.md");
+    }
+
+    #[tokio::test]
+    async fn read_resource_returns_content() {
+        let client = MockMcpClient::new();
+        let content = client.read_resource("test-server", "file:///README.md").await.unwrap();
+        match content {
+            McpContent::Text { text } => assert!(text.contains("README.md")),
+            _ => panic!("expected text content"),
+        }
+    }
+
+    #[tokio::test]
+    async fn ping_returns_true() {
+        let client = MockMcpClient::new();
+        assert!(client.ping("test-server").await.unwrap());
+    }
+}

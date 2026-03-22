@@ -128,3 +128,135 @@ pub trait Evaluator: Send + Sync {
     /// Compare two checkpoints and return a diff report.
     async fn compare(&self, a: CheckpointId, b: CheckpointId) -> anyhow::Result<DiffReport>;
 }
+
+// ---------------------------------------------------------------------------
+// Mock evaluator for testing
+// ---------------------------------------------------------------------------
+
+/// A mock evaluator that runs graders as simple pass/fail checks.
+pub struct MockEvaluator;
+
+#[async_trait::async_trait]
+impl Evaluator for MockEvaluator {
+    async fn grade(&self, req: EvalRequest) -> anyhow::Result<EvalReport> {
+        let grades: Vec<GradeResult> = req
+            .graders
+            .iter()
+            .map(|g| {
+                let passed = g.config.get("pass").and_then(|v| v.as_bool()).unwrap_or(true);
+                let score = if passed { 1.0 } else { 0.0 };
+                GradeResult {
+                    grader: g.name.clone(),
+                    passed,
+                    score,
+                    details: if passed {
+                        "all checks passed".into()
+                    } else {
+                        "check failed".into()
+                    },
+                    evidence: serde_json::json!({}),
+                }
+            })
+            .collect();
+
+        let all_passed = grades.iter().all(|g| g.passed);
+        let avg_score = if grades.is_empty() {
+            1.0
+        } else {
+            grades.iter().map(|g| g.score).sum::<f64>() / grades.len() as f64
+        };
+
+        Ok(EvalReport {
+            name: req.name,
+            passed: all_passed,
+            score: avg_score,
+            grades,
+            completed_at: Utc::now(),
+        })
+    }
+
+    async fn compare(&self, a: CheckpointId, b: CheckpointId) -> anyhow::Result<DiffReport> {
+        Ok(DiffReport {
+            checkpoint_a: a,
+            checkpoint_b: b,
+            files_changed: vec![FileChange {
+                path: "src/mock.rs".into(),
+                change_type: ChangeType::Modified,
+                lines_added: 10,
+                lines_removed: 3,
+            }],
+            summary: "mock diff comparison".into(),
+            regression_detected: false,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn grade_all_pass() {
+        let eval = MockEvaluator;
+        let req = EvalRequest {
+            name: "test-eval".into(),
+            target: EvalTarget::Artifact { path: "src/lib.rs".into() },
+            graders: vec![
+                GraderSpec { name: "lint".into(), config: serde_json::json!({"pass": true}) },
+                GraderSpec { name: "tests".into(), config: serde_json::json!({"pass": true}) },
+            ],
+        };
+
+        let report = eval.grade(req).await.unwrap();
+        assert!(report.passed);
+        assert_eq!(report.score, 1.0);
+        assert_eq!(report.grades.len(), 2);
+        assert!(report.grades.iter().all(|g| g.passed));
+    }
+
+    #[tokio::test]
+    async fn grade_with_failure() {
+        let eval = MockEvaluator;
+        let req = EvalRequest {
+            name: "failing-eval".into(),
+            target: EvalTarget::Artifact { path: "src/bad.rs".into() },
+            graders: vec![
+                GraderSpec { name: "lint".into(), config: serde_json::json!({"pass": true}) },
+                GraderSpec { name: "security".into(), config: serde_json::json!({"pass": false}) },
+            ],
+        };
+
+        let report = eval.grade(req).await.unwrap();
+        assert!(!report.passed);
+        assert_eq!(report.score, 0.5);
+        assert!(!report.grades[1].passed);
+    }
+
+    #[tokio::test]
+    async fn grade_empty_graders() {
+        let eval = MockEvaluator;
+        let req = EvalRequest {
+            name: "empty".into(),
+            target: EvalTarget::Session { session_id: Uuid::new_v4() },
+            graders: vec![],
+        };
+
+        let report = eval.grade(req).await.unwrap();
+        assert!(report.passed);
+        assert_eq!(report.score, 1.0);
+    }
+
+    #[tokio::test]
+    async fn compare_checkpoints() {
+        let eval = MockEvaluator;
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+
+        let diff = eval.compare(a, b).await.unwrap();
+        assert_eq!(diff.checkpoint_a, a);
+        assert_eq!(diff.checkpoint_b, b);
+        assert_eq!(diff.files_changed.len(), 1);
+        assert_eq!(diff.files_changed[0].path, "src/mock.rs");
+        assert!(!diff.regression_detected);
+    }
+}

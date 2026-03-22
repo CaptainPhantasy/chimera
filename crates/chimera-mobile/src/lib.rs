@@ -117,3 +117,170 @@ pub trait MobileController: Send + Sync {
     /// List all active device IDs.
     async fn list_devices(&self) -> anyhow::Result<Vec<DeviceId>>;
 }
+
+// ---------------------------------------------------------------------------
+// Mock mobile controller
+// ---------------------------------------------------------------------------
+
+/// A mock MobileController that tracks device lifecycle in memory.
+pub struct MockMobileController {
+    devices: tokio::sync::RwLock<std::collections::HashMap<DeviceId, DeviceState>>,
+}
+
+impl MockMobileController {
+    pub fn new() -> Self {
+        Self {
+            devices: tokio::sync::RwLock::new(std::collections::HashMap::new()),
+        }
+    }
+}
+
+impl Default for MockMobileController {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait::async_trait]
+impl MobileController for MockMobileController {
+    async fn boot(&self, spec: DeviceSpec) -> anyhow::Result<DeviceId> {
+        let id = Uuid::new_v4();
+        let state = DeviceState {
+            id,
+            spec,
+            status: DeviceStatus::Running,
+            booted_at: Some(Utc::now()),
+        };
+        self.devices.write().await.insert(id, state);
+        Ok(id)
+    }
+
+    async fn perform(&self, id: DeviceId, action: DeviceAction) -> anyhow::Result<DeviceArtifact> {
+        let devices = self.devices.read().await;
+        if !devices.contains_key(&id) {
+            anyhow::bail!("device not found: {}", id);
+        }
+        match action {
+            DeviceAction::Screenshot => Ok(DeviceArtifact::Screenshot {
+                uri: format!("mock://screenshot-{}.png", id),
+                captured_at: Utc::now(),
+            }),
+            DeviceAction::ShellCommand { command } => Ok(DeviceArtifact::ShellOutput {
+                stdout: format!("mock output of: {}", command),
+                stderr: String::new(),
+                exit_code: 0,
+            }),
+            _ => Ok(DeviceArtifact::Ack),
+        }
+    }
+
+    async fn state(&self, id: DeviceId) -> anyhow::Result<DeviceState> {
+        self.devices
+            .read()
+            .await
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("device not found: {}", id))
+    }
+
+    async fn shutdown(&self, id: DeviceId) -> anyhow::Result<()> {
+        let mut devices = self.devices.write().await;
+        match devices.get_mut(&id) {
+            Some(state) => {
+                state.status = DeviceStatus::Off;
+                Ok(())
+            }
+            None => anyhow::bail!("device not found: {}", id),
+        }
+    }
+
+    async fn list_devices(&self) -> anyhow::Result<Vec<DeviceId>> {
+        Ok(self.devices.read().await.keys().copied().collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pixel_spec() -> DeviceSpec {
+        DeviceSpec {
+            profile: "pixel8".into(),
+            os_version: Some("34".into()),
+            network: true,
+            label: Some("test-device".into()),
+        }
+    }
+
+    #[tokio::test]
+    async fn boot_creates_running_device() {
+        let ctrl = MockMobileController::new();
+        let id = ctrl.boot(pixel_spec()).await.unwrap();
+
+        let state = ctrl.state(id).await.unwrap();
+        assert_eq!(state.status, DeviceStatus::Running);
+        assert_eq!(state.spec.profile, "pixel8");
+        assert!(state.booted_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn perform_screenshot() {
+        let ctrl = MockMobileController::new();
+        let id = ctrl.boot(pixel_spec()).await.unwrap();
+
+        let artifact = ctrl.perform(id, DeviceAction::Screenshot).await.unwrap();
+        match artifact {
+            DeviceArtifact::Screenshot { uri, .. } => assert!(uri.contains("screenshot")),
+            _ => panic!("expected screenshot artifact"),
+        }
+    }
+
+    #[tokio::test]
+    async fn perform_shell_command() {
+        let ctrl = MockMobileController::new();
+        let id = ctrl.boot(pixel_spec()).await.unwrap();
+
+        let artifact = ctrl
+            .perform(id, DeviceAction::ShellCommand { command: "ls /".into() })
+            .await
+            .unwrap();
+        match artifact {
+            DeviceArtifact::ShellOutput { stdout, exit_code, .. } => {
+                assert!(stdout.contains("ls /"));
+                assert_eq!(exit_code, 0);
+            }
+            _ => panic!("expected shell output"),
+        }
+    }
+
+    #[tokio::test]
+    async fn perform_on_unknown_device_fails() {
+        let ctrl = MockMobileController::new();
+        let result = ctrl.perform(Uuid::new_v4(), DeviceAction::Screenshot).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn shutdown_sets_off() {
+        let ctrl = MockMobileController::new();
+        let id = ctrl.boot(pixel_spec()).await.unwrap();
+
+        ctrl.shutdown(id).await.unwrap();
+        let state = ctrl.state(id).await.unwrap();
+        assert_eq!(state.status, DeviceStatus::Off);
+    }
+
+    #[tokio::test]
+    async fn list_devices_tracks_booted() {
+        let ctrl = MockMobileController::new();
+        assert!(ctrl.list_devices().await.unwrap().is_empty());
+
+        let id1 = ctrl.boot(pixel_spec()).await.unwrap();
+        let id2 = ctrl.boot(pixel_spec()).await.unwrap();
+
+        let devices = ctrl.list_devices().await.unwrap();
+        assert_eq!(devices.len(), 2);
+        assert!(devices.contains(&id1));
+        assert!(devices.contains(&id2));
+    }
+}

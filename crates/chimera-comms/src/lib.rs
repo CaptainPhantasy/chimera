@@ -116,3 +116,132 @@ pub trait CommsBridge: Send + Sync {
     /// Get the delivery receipt for a sent message.
     async fn receipt(&self, id: MessageId) -> anyhow::Result<Option<DeliveryReceipt>>;
 }
+
+// ---------------------------------------------------------------------------
+// Mock comms bridge
+// ---------------------------------------------------------------------------
+
+/// A mock CommsBridge that records messages in memory.
+pub struct MockCommsBridge {
+    messages: tokio::sync::RwLock<Vec<(MessageId, Notification)>>,
+    approvals: tokio::sync::RwLock<std::collections::HashMap<PendingApprovalId, Option<bool>>>,
+}
+
+impl MockCommsBridge {
+    pub fn new() -> Self {
+        Self {
+            messages: tokio::sync::RwLock::new(Vec::new()),
+            approvals: tokio::sync::RwLock::new(std::collections::HashMap::new()),
+        }
+    }
+
+    /// Simulate answering a pending approval.
+    pub async fn answer_approval(&self, id: PendingApprovalId, approved: bool) {
+        self.approvals.write().await.insert(id, Some(approved));
+    }
+}
+
+impl Default for MockCommsBridge {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait::async_trait]
+impl CommsBridge for MockCommsBridge {
+    async fn notify(&self, msg: Notification) -> anyhow::Result<MessageId> {
+        let id = Uuid::new_v4();
+        self.messages.write().await.push((id, msg));
+        Ok(id)
+    }
+
+    async fn request_approval(&self, _prompt: CommsApprovalPrompt) -> anyhow::Result<PendingApprovalId> {
+        let id = Uuid::new_v4();
+        self.approvals.write().await.insert(id, None);
+        Ok(id)
+    }
+
+    async fn check_approval(&self, id: PendingApprovalId) -> anyhow::Result<Option<bool>> {
+        Ok(self.approvals.read().await.get(&id).copied().flatten())
+    }
+
+    async fn receipt(&self, id: MessageId) -> anyhow::Result<Option<DeliveryReceipt>> {
+        let msgs = self.messages.read().await;
+        Ok(msgs.iter().find(|(mid, _)| *mid == id).map(|(mid, msg)| {
+            DeliveryReceipt {
+                message_id: *mid,
+                channel: msg.channel.clone(),
+                delivered_at: Utc::now(),
+                acknowledged: true,
+            }
+        }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_notification(subject: &str) -> Notification {
+        Notification {
+            channel: Channel::Terminal,
+            priority: Priority::Normal,
+            subject: subject.into(),
+            body: format!("body of {}", subject),
+            metadata: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn notify_stores_message() {
+        let bridge = MockCommsBridge::new();
+        let id = bridge.notify(make_notification("test alert")).await.unwrap();
+
+        let receipt = bridge.receipt(id).await.unwrap();
+        assert!(receipt.is_some());
+        assert!(receipt.unwrap().acknowledged);
+    }
+
+    #[tokio::test]
+    async fn request_approval_starts_pending() {
+        let bridge = MockCommsBridge::new();
+        let prompt = CommsApprovalPrompt {
+            channel: Channel::Slack { channel: "#ops".into() },
+            actor: "MANTIS-1".into(),
+            class: "yellow".into(),
+            action: "modify 6 files".into(),
+            reason: "extract auth kernel".into(),
+            touched_resources: vec!["src/auth.rs".into()],
+        };
+
+        let id = bridge.request_approval(prompt).await.unwrap();
+        let status = bridge.check_approval(id).await.unwrap();
+        assert_eq!(status, None); // still pending
+    }
+
+    #[tokio::test]
+    async fn approval_can_be_answered() {
+        let bridge = MockCommsBridge::new();
+        let prompt = CommsApprovalPrompt {
+            channel: Channel::Terminal,
+            actor: "OWL-1".into(),
+            class: "green".into(),
+            action: "analyze".into(),
+            reason: "evaluation".into(),
+            touched_resources: vec![],
+        };
+
+        let id = bridge.request_approval(prompt).await.unwrap();
+        bridge.answer_approval(id, true).await;
+
+        let status = bridge.check_approval(id).await.unwrap();
+        assert_eq!(status, Some(true));
+    }
+
+    #[tokio::test]
+    async fn receipt_returns_none_for_unknown() {
+        let bridge = MockCommsBridge::new();
+        let receipt = bridge.receipt(Uuid::new_v4()).await.unwrap();
+        assert!(receipt.is_none());
+    }
+}

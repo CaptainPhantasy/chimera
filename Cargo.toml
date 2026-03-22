@@ -16,6 +16,7 @@ members = [
     "crates/chimera-memory",
     "crates/chimera-eval",
     "crates/chimera-mcp",
+    "crates/chimera-api",
 ]
 
 [workspace.package]
@@ -53,3 +54,4 @@ chimera-comms = { path = "crates/chimera-comms" }
 chimera-memory = { path = "crates/chimera-memory" }
 chimera-eval = { path = "crates/chimera-eval" }
 chimera-mcp = { path = "crates/chimera-mcp" }
+chimera-api = { path = "crates/chimera-api" }

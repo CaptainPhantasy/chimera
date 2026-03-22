@@ -1390,4 +1390,68 @@ mod tests {
         let json = serde_json::to_string(&report).unwrap();
         let _: RunReport = serde_json::from_str(&json).unwrap();
     }
+
+    // ── Creature wrapping fallback ───────────────────────────────
+
+    /// A single-creature registry to force the wrapping fallback
+    /// in Harness::run_objective when tasks outnumber creatures.
+    struct SingleCreatureRegistry;
+
+    impl CreatureRegistry for SingleCreatureRegistry {
+        fn builtin(&self) -> Vec<CreatureSpec> {
+            vec![CreatureSpec {
+                name: "solo".into(),
+                role: "does everything".into(),
+                temperament: Temperament::Balanced,
+                toolbelt: vec![],
+                preferred_worlds: vec![WorldKind::LocalShell],
+                autonomy: AutonomyLevel::Medium,
+                stop_conditions: vec![],
+                escalation_rules: vec![],
+                token_budget: None,
+                deadline_secs: None,
+            }]
+        }
+
+        fn resolve(&self, name: &str) -> anyhow::Result<CreatureSpec> {
+            self.builtin()
+                .into_iter()
+                .find(|c| c.name == name)
+                .ok_or_else(|| anyhow::anyhow!("unknown: {}", name))
+        }
+    }
+
+    #[tokio::test]
+    async fn harness_wraps_creatures_when_tasks_exceed_count() {
+        // With only 1 creature but 4 tasks, the harness must wrap
+        // around to available[0] for tasks 1..3 (the else branch).
+        let harness = Harness {
+            sessions: Arc::new(StubSessionStore),
+            creatures: Arc::new(SingleCreatureRegistry),
+            tools: Arc::new(StubToolRouter),
+            trace: Arc::new(StubTraceSink),
+            shells: Arc::new(StubShellManager),
+            worlds: Arc::new(StubWorldManager),
+            browser: Arc::new(StubBrowserController),
+            mobile: Arc::new(StubMobileController),
+            comms: Arc::new(StubCommsBridge),
+            memory: Arc::new(StubMemoryStore),
+            eval: Arc::new(StubEvaluator),
+            mcp: Arc::new(StubMcpClient),
+        };
+
+        let req = ObjectiveRequest {
+            objective: "test wrapping".into(),
+            mode: ExecutionMode::Run,
+            repo_root: None,
+            policy_profile: None,
+            evidence_level: EvidenceLevel::Standard,
+        };
+
+        let report = harness.run_objective(req).await.unwrap();
+        assert_eq!(report.status, RunStatus::Completed);
+        // All 4 tasks should complete even with only 1 creature
+        assert_eq!(report.tasks.len(), 4);
+        assert!(report.tasks.iter().all(|t| t.success));
+    }
 }

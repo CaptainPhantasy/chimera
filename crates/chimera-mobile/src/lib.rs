@@ -294,4 +294,10 @@ mod tests {
         let ctrl = MockMobileController::new();
         assert!(ctrl.shutdown(Uuid::new_v4()).await.is_err());
     }
+
+    #[tokio::test]
+    async fn state_unknown_device_fails() {
+        let ctrl = MockMobileController::new();
+        assert!(ctrl.state(Uuid::new_v4()).await.is_err());
+    }
 }

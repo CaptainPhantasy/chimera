@@ -5,7 +5,8 @@ use clap::{Parser, Subcommand, ValueEnum};
 
 use chimera_core::{
     BuiltinCreatureRegistry, EvidenceLevel, ExecutionMode, Harness, ObjectiveRequest,
-    StubBrowserController, StubSessionStore, StubShellManager, StubToolRouter, StubTraceSink,
+    StubBrowserController, StubCommsBridge, StubEvaluator, StubMcpClient, StubMemoryStore,
+    StubMobileController, StubSessionStore, StubShellManager, StubToolRouter, StubTraceSink,
     StubWorldManager,
 };
 
@@ -456,6 +457,11 @@ fn build_harness() -> Harness {
         shells: Arc::new(StubShellManager),
         worlds: Arc::new(StubWorldManager),
         browser: Arc::new(StubBrowserController),
+        mobile: Arc::new(StubMobileController),
+        comms: Arc::new(StubCommsBridge),
+        memory: Arc::new(StubMemoryStore),
+        eval: Arc::new(StubEvaluator),
+        mcp: Arc::new(StubMcpClient),
     }
 }
 

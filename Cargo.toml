@@ -11,6 +11,11 @@ members = [
     "crates/chimera-sandbox",
     "crates/chimera-browser",
     "crates/chimera-tui",
+    "crates/chimera-mobile",
+    "crates/chimera-comms",
+    "crates/chimera-memory",
+    "crates/chimera-eval",
+    "crates/chimera-mcp",
 ]
 
 [workspace.package]
@@ -43,3 +48,8 @@ chimera-shell = { path = "crates/chimera-shell" }
 chimera-sandbox = { path = "crates/chimera-sandbox" }
 chimera-browser = { path = "crates/chimera-browser" }
 chimera-tui = { path = "crates/chimera-tui" }
+chimera-mobile = { path = "crates/chimera-mobile" }
+chimera-comms = { path = "crates/chimera-comms" }
+chimera-memory = { path = "crates/chimera-memory" }
+chimera-eval = { path = "crates/chimera-eval" }
+chimera-mcp = { path = "crates/chimera-mcp" }

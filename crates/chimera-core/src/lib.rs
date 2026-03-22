@@ -7,7 +7,12 @@ use tracing::{info, info_span, Instrument};
 use uuid::Uuid;
 
 use chimera_browser::BrowserController;
+use chimera_comms::CommsBridge;
 use chimera_creatures::{AutonomyLevel, CreatureRegistry, CreatureSpec, Temperament, WorldKind};
+use chimera_eval::Evaluator;
+use chimera_mcp::McpClient;
+use chimera_memory::MemoryStore;
+use chimera_mobile::MobileController;
 use chimera_sandbox::WorldManager;
 use chimera_session::SessionStore;
 use chimera_shell::ShellManager;
@@ -215,6 +220,11 @@ pub struct Harness {
     pub shells: Arc<dyn ShellManager>,
     pub worlds: Arc<dyn WorldManager>,
     pub browser: Arc<dyn BrowserController>,
+    pub mobile: Arc<dyn MobileController>,
+    pub comms: Arc<dyn CommsBridge>,
+    pub memory: Arc<dyn MemoryStore>,
+    pub eval: Arc<dyn Evaluator>,
+    pub mcp: Arc<dyn McpClient>,
 }
 
 impl Harness {
@@ -713,5 +723,149 @@ impl BrowserController for StubBrowserController {
 
     async fn list_sessions(&self) -> anyhow::Result<Vec<chimera_browser::BrowserSessionId>> {
         Ok(vec![])
+    }
+}
+
+/// A stub MobileController.
+pub struct StubMobileController;
+
+#[async_trait::async_trait]
+impl MobileController for StubMobileController {
+    async fn boot(&self, spec: chimera_mobile::DeviceSpec) -> anyhow::Result<chimera_mobile::DeviceId> {
+        info!(profile = %spec.profile, "device booted (stub)");
+        Ok(Uuid::new_v4())
+    }
+
+    async fn perform(&self, _id: chimera_mobile::DeviceId, action: chimera_mobile::DeviceAction) -> anyhow::Result<chimera_mobile::DeviceArtifact> {
+        info!(action = ?action, "device action (stub)");
+        Ok(chimera_mobile::DeviceArtifact::Ack)
+    }
+
+    async fn state(&self, id: chimera_mobile::DeviceId) -> anyhow::Result<chimera_mobile::DeviceState> {
+        Ok(chimera_mobile::DeviceState {
+            id,
+            spec: chimera_mobile::DeviceSpec {
+                profile: "stub".into(),
+                os_version: None,
+                network: false,
+                label: None,
+            },
+            status: chimera_mobile::DeviceStatus::Running,
+            booted_at: Some(Utc::now()),
+        })
+    }
+
+    async fn shutdown(&self, _id: chimera_mobile::DeviceId) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn list_devices(&self) -> anyhow::Result<Vec<chimera_mobile::DeviceId>> {
+        Ok(vec![])
+    }
+}
+
+/// A stub CommsBridge.
+pub struct StubCommsBridge;
+
+#[async_trait::async_trait]
+impl CommsBridge for StubCommsBridge {
+    async fn notify(&self, msg: chimera_comms::Notification) -> anyhow::Result<chimera_comms::MessageId> {
+        info!(subject = %msg.subject, "notification sent (stub)");
+        Ok(Uuid::new_v4())
+    }
+
+    async fn request_approval(&self, prompt: chimera_comms::CommsApprovalPrompt) -> anyhow::Result<chimera_comms::PendingApprovalId> {
+        info!(actor = %prompt.actor, action = %prompt.action, "approval requested (stub)");
+        Ok(Uuid::new_v4())
+    }
+
+    async fn check_approval(&self, _id: chimera_comms::PendingApprovalId) -> anyhow::Result<Option<bool>> {
+        Ok(Some(true))
+    }
+
+    async fn receipt(&self, _id: chimera_comms::MessageId) -> anyhow::Result<Option<chimera_comms::DeliveryReceipt>> {
+        Ok(None)
+    }
+}
+
+/// A stub MemoryStore.
+pub struct StubMemoryStore;
+
+#[async_trait::async_trait]
+impl MemoryStore for StubMemoryStore {
+    async fn remember(&self, item: chimera_memory::MemoryItem) -> anyhow::Result<chimera_memory::MemoryId> {
+        info!(key = %item.key, layer = ?item.layer, "memory stored (stub)");
+        Ok(item.id)
+    }
+
+    async fn retrieve(&self, _query: chimera_memory::MemoryQuery) -> anyhow::Result<Vec<chimera_memory::MemoryItem>> {
+        Ok(vec![])
+    }
+
+    async fn forget(&self, _id: chimera_memory::MemoryId) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn compact(&self, _layer: chimera_memory::MemoryLayer) -> anyhow::Result<u64> {
+        Ok(0)
+    }
+}
+
+/// A stub Evaluator.
+pub struct StubEvaluator;
+
+#[async_trait::async_trait]
+impl Evaluator for StubEvaluator {
+    async fn grade(&self, req: chimera_eval::EvalRequest) -> anyhow::Result<chimera_eval::EvalReport> {
+        info!(name = %req.name, "evaluation run (stub)");
+        Ok(chimera_eval::EvalReport {
+            name: req.name,
+            passed: true,
+            score: 1.0,
+            grades: vec![],
+            completed_at: Utc::now(),
+        })
+    }
+
+    async fn compare(&self, a: chimera_eval::CheckpointId, b: chimera_eval::CheckpointId) -> anyhow::Result<chimera_eval::DiffReport> {
+        Ok(chimera_eval::DiffReport {
+            checkpoint_a: a,
+            checkpoint_b: b,
+            files_changed: vec![],
+            summary: "no changes (stub)".into(),
+            regression_detected: false,
+        })
+    }
+}
+
+/// A stub McpClient.
+pub struct StubMcpClient;
+
+#[async_trait::async_trait]
+impl McpClient for StubMcpClient {
+    async fn list_tools(&self, server: &str) -> anyhow::Result<Vec<chimera_mcp::McpToolDescriptor>> {
+        info!(server = %server, "list MCP tools (stub)");
+        Ok(vec![])
+    }
+
+    async fn invoke(&self, server: &str, tool: &str, _args: serde_json::Value) -> anyhow::Result<chimera_mcp::McpToolResult> {
+        info!(server = %server, tool = %tool, "MCP invoke (stub)");
+        Ok(chimera_mcp::McpToolResult {
+            is_error: false,
+            content: vec![chimera_mcp::McpContent::Text { text: "stub result".into() }],
+        })
+    }
+
+    async fn list_resources(&self, _server: &str) -> anyhow::Result<Vec<chimera_mcp::McpResource>> {
+        Ok(vec![])
+    }
+
+    async fn read_resource(&self, _server: &str, _uri: &str) -> anyhow::Result<chimera_mcp::McpContent> {
+        Ok(chimera_mcp::McpContent::Text { text: String::new() })
+    }
+
+    async fn ping(&self, server: &str) -> anyhow::Result<bool> {
+        info!(server = %server, "MCP ping (stub)");
+        Ok(true)
     }
 }

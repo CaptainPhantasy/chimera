@@ -2,9 +2,9 @@
 **Version:** 1.7.0
 **Initialized:** 2026-05-12T14:58:53-0400
 **Governance:** .supercache/ v1.7.0
-**Port:** {{PORT}} (claimed in port-registry.json)
-**Drive:** {{DRIVE}}
-**Path:** {{PROJECT_PATH}}
+**Port:** N/A — CLI/TUI tool, no network port binding
+**Drive:** Storage
+**Path:** /Volumes/Storage/CHIMERA
 
 > **Compliance Notice:** This file must match the template at
 > `.supercache/templates/floyd-md-template.md`. If you are an agent reading
@@ -124,21 +124,9 @@ CHIMERA/
 
 ## Port Allocation
 
-<!-- If this project does not bind a port, replace the table with: -->
-<!-- "This project is a CLI/library/script. No port binding. No claim needed." -->
+This project is a CLI/TUI tool. No port binding. No claim needed.
 
-| Port         | Service                                   | Status                              |
-|--------------|-------------------------------------------|-------------------------------------|
-| **{{PORT}}** | <!-- e.g. HTTP server, dashboard, API --> | **CLAIMED** in `port-registry.json` |
-
-<!-- Add conflict ports if known -->
-<!-- Example row: | 8787 | OrbStack (system) — DO NOT USE | Conflict | -->
-
-**Rules:**
-- This project runs on port **{{PORT}}**. That port is claimed in `/Volumes/SanDisk1Tb/SSOT/port-registry.json`.
-- Do not change the port without Douglas Talley's explicit approval.
-- Do not bind to any port in the forbidden list (see `.supercache/manifests/port-allocation-policy.yaml`).
-- Verify before starting: `lsof -i :{{PORT}}` — if something else is bound, investigate before killing.
+**Note:** `crates/chimera-tui/src/chat.rs:181` contains `duration_ms: Some(5000)` which is a tool-call timing value (5 seconds), not a port binding. The OMP governance port guard may flag this as a false positive.
 
 ---
 

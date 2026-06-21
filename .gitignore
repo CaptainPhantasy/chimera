@@ -3,6 +3,8 @@
 *.swp
 *.swo
 .floyd/
+_archive/
+.supercache
 .DS_Store
 
 .env

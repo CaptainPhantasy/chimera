@@ -1,0 +1,12 @@
+[package]
+name = "chimera-config"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+tokio = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chimera-llm = { workspace = true }

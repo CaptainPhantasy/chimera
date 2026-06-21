@@ -3,6 +3,8 @@ resolver = "2"
 members = [
     "crates/chimera-cli",
     "crates/chimera-core",
+    "crates/chimera-config",
+    "crates/chimera-llm",
     "crates/chimera-session",
     "crates/chimera-creatures",
     "crates/chimera-tools",
@@ -38,9 +40,17 @@ chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 crossterm = "0.28"
 ratatui = "0.29"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+futures-util = "0.3"
+tokio-stream = "0.1"
+ignore = "0.4"
+globset = "0.4"
+regex = "1"
 
 # Internal crates
 chimera-core = { path = "crates/chimera-core" }
+chimera-llm = { path = "crates/chimera-llm" }
+chimera-config = { path = "crates/chimera-config" }
 chimera-session = { path = "crates/chimera-session" }
 chimera-creatures = { path = "crates/chimera-creatures" }
 chimera-tools = { path = "crates/chimera-tools" }

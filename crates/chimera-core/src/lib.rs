@@ -1,6 +1,7 @@
 pub mod pack;
 pub mod scheduler;
 pub mod skill;
+pub mod agent;
 
 use std::path::PathBuf;
 use std::sync::Arc;

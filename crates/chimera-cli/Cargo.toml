@@ -8,10 +8,12 @@ name = "chimera"
 path = "src/main.rs"
 
 [dependencies]
+chimera-llm.workspace = true
 chimera-core.workspace = true
-chimera-session.workspace = true
+chimera-config.workspace = true
 chimera-creatures.workspace = true
 chimera-tools.workspace = true
+chimera-session.workspace = true
 chimera-trace.workspace = true
 chimera-shell.workspace = true
 chimera-sandbox.workspace = true
@@ -23,5 +25,5 @@ anyhow.workspace = true
 clap.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
-serde.workspace = true
 serde_json.workspace = true
+uuid.workspace = true

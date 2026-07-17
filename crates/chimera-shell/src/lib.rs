@@ -137,3 +137,275 @@ pub trait ShellManager: Send + Sync {
     /// List all active shell IDs.
     async fn list_shells(&self) -> anyhow::Result<Vec<ShellId>>;
 }
+
+// ---------------------------------------------------------------------------
+// Process-backed ShellManager
+// ---------------------------------------------------------------------------
+
+use std::path::Path;
+use std::process::Stdio;
+use std::time::Instant;
+use tokio::process::Command;
+
+/// A `ShellManager` that spawns real subprocesses via `sh -c` and tracks
+/// worktrees with `git worktree`.
+pub struct ProcessShellManager {
+    shells: tokio::sync::RwLock<HashMap<ShellId, (ShellSpec, Vec<ShellEvent>)>>,
+}
+
+impl Default for ProcessShellManager {
+    fn default() -> Self {
+        Self {
+            shells: tokio::sync::RwLock::new(HashMap::new()),
+        }
+    }
+}
+
+impl ProcessShellManager {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+#[async_trait::async_trait]
+impl ShellManager for ProcessShellManager {
+    async fn spawn_shell(&self, spec: ShellSpec) -> anyhow::Result<ShellId> {
+        let id = Uuid::new_v4();
+        let event = ShellEvent::Spawned {
+            shell_id: id,
+            spec: spec.clone(),
+            at: Utc::now(),
+        };
+        let mut guard = self.shells.write().await;
+        guard.insert(id, (spec, vec![event]));
+        Ok(id)
+    }
+
+    async fn exec(&self, shell: ShellId, cmd: ShellCommand) -> anyhow::Result<ShellOutput> {
+        let (cwd, env, read_only) = {
+            let guard = self.shells.read().await;
+            let (spec, _) = guard
+                .get(&shell)
+                .ok_or_else(|| anyhow::anyhow!("unknown shell {shell}"))?;
+            (spec.cwd.clone(), spec.env.clone(), spec.read_only)
+        };
+
+        if read_only {
+            return Err(anyhow::anyhow!(
+                "shell {shell} is read-only; command rejected"
+            ));
+        }
+
+        let mut command = Command::new("sh");
+        command.arg("-c").arg(&cmd.command);
+        command.current_dir(&cwd);
+        for (k, v) in env {
+            command.env(k, v);
+        }
+        command.stdout(Stdio::piped());
+        command.stderr(Stdio::piped());
+        command.stdin(Stdio::null());
+
+        let start = Instant::now();
+        let timeout = std::time::Duration::from_secs(cmd.timeout_secs.unwrap_or(120));
+
+        let child = command.spawn()?;
+        let output = tokio::time::timeout(timeout, child.wait_with_output()).await;
+        let duration_ms = start.elapsed().as_millis() as u64;
+
+        let output = match output {
+            Ok(Ok(o)) => o,
+            Ok(Err(e)) => {
+                return Err(anyhow::anyhow!("command failed: {e}"));
+            }
+            Err(_) => {
+                return Ok(ShellOutput {
+                    exit_code: 124,
+                    stdout: String::new(),
+                    stderr: format!("command timed out after {timeout:?}"),
+                    duration_ms,
+                });
+            }
+        };
+
+        let result = ShellOutput {
+            exit_code: output.status.code().unwrap_or(-1),
+            stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+            duration_ms,
+        };
+
+        // Record in transcript.
+        let mut guard = self.shells.write().await;
+        if let Some((_, events)) = guard.get_mut(&shell) {
+            events.push(ShellEvent::CommandExecuted {
+                command: cmd,
+                output: result.clone(),
+                at: Utc::now(),
+            });
+        }
+
+        Ok(result)
+    }
+
+    async fn transcript(&self, shell: ShellId) -> anyhow::Result<Vec<ShellEvent>> {
+        let guard = self.shells.read().await;
+        let (_, events) = guard
+            .get(&shell)
+            .ok_or_else(|| anyhow::anyhow!("unknown shell {shell}"))?;
+        Ok(events.clone())
+    }
+
+    async fn close(&self, shell: ShellId) -> anyhow::Result<()> {
+        let mut guard = self.shells.write().await;
+        if let Some((_, events)) = guard.get_mut(&shell) {
+            events.push(ShellEvent::Closed { at: Utc::now() });
+        }
+        Ok(())
+    }
+
+    async fn create_worktree(&self, spec: WorktreeSpec) -> anyhow::Result<WorktreeHandle> {
+        let branch = spec.branch.as_deref().unwrap_or("HEAD");
+        let path = spec.repo_root.join(format!(
+            ".chimera/worktrees/{}",
+            Uuid::new_v4().as_simple()
+        ));
+        std::fs::create_dir_all(path.parent().unwrap())?;
+
+        let output = tokio::process::Command::new("git")
+            .arg("worktree")
+            .arg("add")
+            .arg("-b")
+            .arg(format!("chimera-{}", Uuid::new_v4().as_simple()))
+            .arg(&path)
+            .arg(branch)
+            .current_dir(&spec.repo_root)
+            .output()
+            .await?;
+
+        if !output.status.success() {
+            return Err(anyhow::anyhow!(
+                "git worktree add failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+
+        // Spawn a shell bound to the worktree path.
+        let shell_spec = ShellSpec {
+            cwd: path.clone(),
+            env: HashMap::new(),
+            read_only: spec.read_only,
+            label: spec.label.clone(),
+        };
+        let shell_id = self.spawn_shell(shell_spec).await?;
+
+        Ok(WorktreeHandle {
+            path,
+            shell_id,
+            read_only: spec.read_only,
+        })
+    }
+
+    async fn destroy_worktree(&self, path: PathBuf) -> anyhow::Result<()> {
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        let output = tokio::process::Command::new("git")
+            .arg("worktree")
+            .arg("remove")
+            .arg(&path)
+            .current_dir(parent)
+            .output()
+            .await?;
+        if !output.status.success() {
+            // Non-fatal: the worktree may already be gone.
+            tracing::warn!(
+                "git worktree remove failed (non-fatal): {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        Ok(())
+    }
+
+    async fn list_shells(&self) -> anyhow::Result<Vec<ShellId>> {
+        let guard = self.shells.read().await;
+        Ok(guard.keys().copied().collect())
+    }
+}
+
+#[cfg(test)]
+mod process_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn spawn_exec_and_list() {
+        let mgr = ProcessShellManager::new();
+        let spec = ShellSpec {
+            cwd: std::env::current_dir().unwrap(),
+            env: HashMap::new(),
+            read_only: false,
+            label: None,
+        };
+        let id = mgr.spawn_shell(spec).await.unwrap();
+        let out = mgr
+            .exec(
+                id,
+                ShellCommand {
+                    command: "echo hello-chimera".to_string(),
+                    timeout_secs: Some(10),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.exit_code, 0);
+        assert!(out.stdout.contains("hello-chimera"));
+        let ids = mgr.list_shells().await.unwrap();
+        assert!(ids.contains(&id));
+    }
+
+    #[tokio::test]
+    async fn read_only_shell_rejects_exec() {
+        let mgr = ProcessShellManager::new();
+        let spec = ShellSpec {
+            cwd: std::env::current_dir().unwrap(),
+            env: HashMap::new(),
+            read_only: true,
+            label: None,
+        };
+        let id = mgr.spawn_shell(spec).await.unwrap();
+        let res = mgr
+            .exec(
+                id,
+                ShellCommand {
+                    command: "echo x".to_string(),
+                    timeout_secs: Some(5),
+                },
+            )
+            .await;
+        assert!(res.is_err());
+    }
+
+    #[tokio::test]
+    async fn transcript_records_events() {
+        let mgr = ProcessShellManager::new();
+        let spec = ShellSpec {
+            cwd: std::env::current_dir().unwrap(),
+            env: HashMap::new(),
+            read_only: false,
+            label: Some("t".to_string()),
+        };
+        let id = mgr.spawn_shell(spec).await.unwrap();
+        mgr.exec(
+            id,
+            ShellCommand {
+                command: "true".to_string(),
+                timeout_secs: Some(5),
+            },
+        )
+        .await
+        .unwrap();
+        let events = mgr.transcript(id).await.unwrap();
+        // Spawned + CommandExecuted
+        assert_eq!(events.len(), 2);
+        assert!(matches!(events[0], ShellEvent::Spawned { .. }));
+        assert!(matches!(events[1], ShellEvent::CommandExecuted { .. }));
+    }
+}

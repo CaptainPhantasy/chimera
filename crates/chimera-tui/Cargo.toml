@@ -5,8 +5,12 @@ edition.workspace = true
 
 [dependencies]
 chimera-core.workspace = true
+chimera-config.workspace = true
+chimera-llm.workspace = true
+chimera-tools.workspace = true
 chimera-creatures.workspace = true
 chimera-trace.workspace = true
+chimera-session.workspace = true
 tokio.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
@@ -16,3 +20,5 @@ crossterm.workspace = true
 ratatui.workspace = true
 chrono.workspace = true
 uuid.workspace = true
+async-trait.workspace = true
+unicode-width = "0.2"

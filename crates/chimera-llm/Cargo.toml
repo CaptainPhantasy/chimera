@@ -1,17 +1,18 @@
 [package]
-name = "chimera-tools"
+name = "chimera-llm"
 version.workspace = true
 edition.workspace = true
 
 [dependencies]
 tokio = { workspace = true }
+anyhow = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 async-trait = { workspace = true }
-anyhow = { workspace = true }
+chrono = { workspace = true }
 uuid = { workspace = true }
-regex = { workspace = true }
-ignore = { workspace = true }
-globset = { workspace = true }
+reqwest = { workspace = true }
+futures-util = { workspace = true }
+tokio-stream = { workspace = true }

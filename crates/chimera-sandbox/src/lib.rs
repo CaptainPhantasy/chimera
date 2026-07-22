@@ -56,7 +56,7 @@ pub struct WorldSpec {
 }
 
 /// Resource constraints for a world.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ResourceLimits {
     /// Max CPU cores (fractional).
     pub cpu_cores: Option<f64>,
@@ -66,17 +66,6 @@ pub struct ResourceLimits {
     pub disk_mb: Option<u64>,
     /// Max wall-clock lifetime in seconds.
     pub timeout_secs: Option<u64>,
-}
-
-impl Default for ResourceLimits {
-    fn default() -> Self {
-        Self {
-            cpu_cores: None,
-            memory_mb: None,
-            disk_mb: None,
-            timeout_secs: None,
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------

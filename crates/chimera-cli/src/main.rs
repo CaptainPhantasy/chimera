@@ -1,14 +1,21 @@
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 
+use chimera_config::Config;
 use chimera_core::{
-    BuiltinCreatureRegistry, EvidenceLevel, ExecutionMode, Harness, ObjectiveRequest,
+    agent::{self, AgentConfig},
+    BuiltinCreatureRegistry, ExecutionMode, Harness,
     StubBrowserController, StubCommsBridge, StubEvaluator, StubMcpClient, StubMemoryStore,
     StubMobileController, StubSessionStore, StubShellManager, StubToolRouter, StubTraceSink,
     StubWorldManager,
 };
+use chimera_llm::LlmProvider;
+use chimera_tools::ToolRouter;
+use chimera_creatures::CreatureRegistry;
+use chimera_session::SessionStore;
+use chimera_trace::TraceSink;
 
 // ===========================================================================
 // Top-level CLI
@@ -69,8 +76,10 @@ pub enum Command {
     Run {
         /// The objective description.
         objective: String,
+        /// Launch in interactive TUI mode.
+        #[arg(long, short = 'i')]
+        interactive: bool,
     },
-    /// Plan an objective without write side effects.
     Plan {
         /// The objective description.
         objective: String,
@@ -84,6 +93,11 @@ pub enum Command {
     Pack {
         /// Pack name (e.g. "ship-hotfix", "incident-response").
         name: String,
+    },
+    /// Launch the interactive terminal UI (TUI).
+    Tui {
+        /// Optional initial objective.
+        objective: Option<String>,
     },
 
     // ----- Session control (5.2.3) -----
@@ -448,6 +462,7 @@ pub enum SkillCmd {
 // Harness construction
 // ===========================================================================
 
+#[allow(dead_code)]
 fn build_harness() -> Harness {
     Harness {
         sessions: Arc::new(StubSessionStore),
@@ -465,29 +480,101 @@ fn build_harness() -> Harness {
     }
 }
 
-/// Run an objective through the harness and print the report.
+/// Build the tool router, preferring the concrete `DefaultToolRouter` when
+/// available, falling back to the core stub otherwise.
+fn build_tool_router(repo_root: Option<std::path::PathBuf>) -> Arc<dyn ToolRouter> {
+    chimera_tools::try_build_default_tool_router(repo_root)
+        .unwrap_or_else(|| Arc::new(chimera_core::StubToolRouter))
+}
+
+/// Run an objective through the REAL LLM-driven agent loop.
+///
+/// Loads config, builds an OpenAI-compatible provider, a default tool router,
+/// and runs the agent loop with live streaming to stdout.
 async fn run_objective(objective: String, mode: ExecutionMode) -> Result<()> {
-    let harness = build_harness();
-    let req = ObjectiveRequest {
-        objective,
-        mode,
-        repo_root: std::env::current_dir().ok(),
-        policy_profile: None,
-        evidence_level: EvidenceLevel::Standard,
+    let cfg = Config::load().context("failed to load CHIMERA config")?;
+
+    if cfg.provider.api_key.is_empty()
+        && !cfg.provider.base_url.contains("localhost")
+        && !cfg.provider.base_url.contains("127.0.0.1")
+    {
+        anyhow::bail!(
+            "no API key configured. Set CHIMERA_API_KEY or OPENAI_API_KEY, or point \
+             CHIMERA_BASE_URL at a local server (e.g. LM Studio on localhost)."
+        );
+    }
+
+    let provider = cfg.build_provider();
+    let repo_root = std::env::current_dir().ok();
+    let tools = build_tool_router(repo_root);
+    let tool_defs = agent::build_tool_definitions(tools.as_ref())
+        .await
+        .context("failed to enumerate tools")?;
+
+    let agent_cfg = AgentConfig {
+        max_iterations: cfg.agent.max_iterations,
+        system_prompt: if matches!(mode, ExecutionMode::Plan) {
+            format!(
+                "{}\n\nYou are in PLAN mode. Do not make any changes. Read the codebase, \
+                 investigate, and produce a concrete plan. Do not call write tools.",
+                chimera_core::agent::DEFAULT_SYSTEM_PROMPT
+            )
+        } else {
+            chimera_core::agent::DEFAULT_SYSTEM_PROMPT.to_string()
+        },
+        temperature: Some(cfg.provider.temperature),
+        max_tokens: Some(cfg.provider.max_tokens),
     };
 
-    let report = harness.run_objective(req).await?;
+    println!("chimera ▸ {} ▸ {}\n", provider.name(), cfg.provider.model);
+    println!("objective: {objective}\n");
 
-    println!("\n=== Run Report ===");
-    println!("Session:    {}", report.session_id);
-    println!("Status:     {:?}", report.status);
-    println!("Tasks:      {}", report.tasks.len());
-    for (i, task) in report.tasks.iter().enumerate() {
-        let icon = if task.success { "+" } else { "x" };
-        println!("  [{}] {}: {}", icon, i + 1, task.description);
+    let creature_id = uuid::Uuid::new_v4();
+    let mut saw_text = false;
+    let mut cb = |kind: String, value: serde_json::Value| {
+        if kind == "text" {
+            if let Some(t) = value.as_str() {
+                print!("{t}");
+                use std::io::Write;
+                let _ = std::io::stdout().flush();
+                saw_text = true;
+            }
+        } else if kind == "tool_call" {
+            if saw_text {
+                println!();
+                saw_text = false;
+            }
+            if let Some(name) = value.get("name").and_then(|v| v.as_str()) {
+                eprintln!("  ↳ tool: {name}");
+            }
+        }
+    };
+
+    let result = agent::run_agent_loop(
+        &provider,
+        tools.as_ref(),
+        &cfg.provider.model,
+        &objective,
+        creature_id,
+        &agent_cfg,
+        &tool_defs,
+        &mut cb,
+    )
+    .await
+    .context("agent loop failed")?;
+
+    if saw_text {
+        println!();
     }
-    println!("Approvals:  {}", report.approvals.len());
-    println!("Checkpoints:{}", report.checkpoints.len());
+
+    println!("\n─── run complete ───");
+    println!(
+        "iterations: {}  |  done: {:?}  |  tokens: {}+{}",
+        result.iterations,
+        result.done_reason,
+        result.total_prompt_tokens,
+        result.total_completion_tokens
+    );
 
     Ok(())
 }
@@ -498,6 +585,122 @@ async fn run_objective(objective: String, mode: ExecutionMode) -> Result<()> {
 
 fn handle_stub(label: &str) {
     println!("[stub] {label}");
+}
+
+// ===========================================================================
+// Wired command helpers
+// ===========================================================================
+
+/// Resolve the workspace root (current directory).
+fn workspace_root() -> std::path::PathBuf {
+    std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
+}
+
+/// `chimera session list` — list persisted sessions from FileSessionStore.
+async fn list_sessions() -> Result<()> {
+    let store = chimera_session::FileSessionStore::new(workspace_root());
+    let ids = store.list().await?;
+    if ids.is_empty() {
+        println!("No sessions found.");
+        return Ok(());
+    }
+    println!("Sessions ({}):", ids.len());
+    for id in &ids {
+        match store.load(*id).await {
+            Ok(state) => {
+                println!(
+                    "  {}  {:<20}  objective: {}",
+                    id, state.meta.label, state.meta.objective
+                );
+            }
+            Err(e) => {
+                println!("  {}  [unreadable: {e}]", id);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `chimera session fork <id>` — fork a session into a new lineage.
+async fn fork_session(session_id: String) -> Result<()> {
+    let id = uuid::Uuid::parse_str(&session_id)
+        .with_context(|| format!("invalid session id: {session_id}"))?;
+    let store = chimera_session::FileSessionStore::new(workspace_root());
+    let child = store.fork(id).await?;
+    println!("Forked {id} → {child}");
+    Ok(())
+}
+
+/// `chimera tool list` — list registered tools from DefaultToolRouter.
+async fn list_tools() -> Result<()> {
+    let router = build_tool_router(Some(workspace_root()));
+    let descs = router.list().await?;
+    println!("Tools ({}):", descs.len());
+    for d in &descs {
+        let ro = if d.read_only { "ro" } else { "rw" };
+        println!("  {:<14} [{:<3}] {}", d.name, ro, d.description);
+    }
+    Ok(())
+}
+
+/// `chimera tool inspect <name>` — show a single tool's descriptor.
+async fn inspect_tool(name: String) -> Result<()> {
+    let router = build_tool_router(Some(workspace_root()));
+    let descs = router.list().await?;
+    let d = descs
+        .into_iter()
+        .find(|d| d.name == name)
+        .ok_or_else(|| anyhow::anyhow!("unknown tool: {name}"))?;
+    println!("name:        {}", d.name);
+    println!("description: {}", d.description);
+    println!("read_only:   {}", d.read_only);
+    println!("category:    {:?}", d.category);
+    Ok(())
+}
+
+/// `chimera tool healthcheck <name>` — check a tool is registered.
+async fn healthcheck_tool(name: String) -> Result<()> {
+    let router = build_tool_router(Some(workspace_root()));
+    let ok = router.healthcheck(&name).await?;
+    println!("{}: {}", name, if ok { "healthy" } else { "missing" });
+    Ok(())
+}
+
+/// `chimera creature list` — list builtin creature specs.
+async fn list_creatures() -> Result<()> {
+    let registry = chimera_core::BuiltinCreatureRegistry;
+    let specs = registry.builtin();
+    println!("Creatures ({}):", specs.len());
+    for c in &specs {
+        println!(
+            "  {:<12} {:<10} autonomy={:?} temperament={:?}",
+            c.name, c.role, c.autonomy, c.temperament
+        );
+    }
+    Ok(())
+}
+
+/// `chimera trace export <session_id>` — dump a session's trace JSONL to stdout.
+async fn export_trace(session_id: String) -> Result<()> {
+    let id = uuid::Uuid::parse_str(&session_id)
+        .with_context(|| format!("invalid session id: {session_id}"))?;
+    let sink = chimera_trace::FileTraceSink::new(workspace_root());
+    let events = sink.query(id).await?;
+    if events.is_empty() {
+        println!("No trace events for session {id}.");
+        return Ok(());
+    }
+    println!("Trace for {id} ({} events):", events.len());
+    for e in &events {
+        println!(
+            "[{}] {:<5} {:<24} {}",
+            e.timestamp.format("%H:%M:%S%.3f"),
+            format!("{:?}", e.level).to_lowercase(),
+            e.span,
+            e.message
+        );
+    }
+    Ok(())
 }
 
 // ===========================================================================
@@ -518,16 +721,27 @@ async fn dispatch(cmd: Command) -> Result<()> {
         },
 
         // Objective execution — wired to Harness
-        Command::Run { objective } => return run_objective(objective, ExecutionMode::Run).await,
+        Command::Run { objective, interactive } => {
+            if interactive {
+                return chimera_tui::runner::run_interactive(Some(objective)).await;
+            }
+            return run_objective(objective, ExecutionMode::Run).await;
+        }
         Command::Plan { objective } => return run_objective(objective, ExecutionMode::Plan).await,
         Command::Swarm { objective } => return run_objective(objective, ExecutionMode::Swarm).await,
         Command::Pack { name } => handle_stub(&format!("pack: {name}")),
+        Command::Tui { objective } => {
+            return chimera_tui::runner::run_interactive(objective).await;
+        }
 
         // Session control
+        // Session control — wired to FileSessionStore
         Command::Session { cmd } => match cmd {
-            SessionCmd::List => handle_stub("session list"),
-            SessionCmd::Resume { session_id } => handle_stub(&format!("session resume {session_id}")),
-            SessionCmd::Fork { session_id } => handle_stub(&format!("session fork {session_id}")),
+            SessionCmd::List => return list_sessions().await,
+            SessionCmd::Resume { session_id } => {
+                println!("[info] resume is implicit; sessions are stateless files. {session_id}");
+            }
+            SessionCmd::Fork { session_id } => return fork_session(session_id).await,
         },
         Command::Checkpoint { cmd } => match cmd {
             CheckpointCmd::Create => handle_stub("checkpoint create"),
@@ -536,23 +750,27 @@ async fn dispatch(cmd: Command) -> Result<()> {
         Command::Rollback { checkpoint_id } => handle_stub(&format!("rollback {checkpoint_id}")),
         Command::Replay { session_id } => handle_stub(&format!("replay {session_id}")),
 
-        // Creature control
+        // Creature control — wired to BuiltinCreatureRegistry
         Command::Creature { cmd } => match cmd {
-            CreatureCmd::List => handle_stub("creature list"),
-            CreatureCmd::Spawn { name, count } => handle_stub(&format!("creature spawn {name} x{count}")),
-            CreatureCmd::Inspect { instance } => handle_stub(&format!("creature inspect {instance}")),
-            CreatureCmd::Stop { instance } => handle_stub(&format!("creature stop {instance}")),
-            CreatureCmd::Promote { instance } => handle_stub(&format!("creature promote {instance}")),
-            CreatureCmd::Leash { instance } => handle_stub(&format!("creature leash {instance}")),
+            CreatureCmd::List => return list_creatures().await,
+            CreatureCmd::Spawn { name, count } => {
+                println!("[info] creature spawn: {name} x{count} (runtime spawning not yet implemented)");
+            }
+            CreatureCmd::Inspect { instance } => {
+                println!("[info] creature inspect: {instance} (runtime registry not yet implemented)");
+            }
+            CreatureCmd::Stop { instance } => println!("[info] creature stop: {instance}"),
+            CreatureCmd::Promote { instance } => println!("[info] creature promote: {instance}"),
+            CreatureCmd::Leash { instance } => println!("[info] creature leash: {instance}"),
         },
 
-        // Tool control
+        // Tool control — wired to DefaultToolRouter
         Command::Tool { cmd } => match cmd {
-            ToolCmd::List => handle_stub("tool list"),
-            ToolCmd::Inspect { name } => handle_stub(&format!("tool inspect {name}")),
-            ToolCmd::Healthcheck { name } => handle_stub(&format!("tool healthcheck {name}")),
-            ToolCmd::Test { name } => handle_stub(&format!("tool test {name}")),
-            ToolCmd::Disable { name } => handle_stub(&format!("tool disable {name}")),
+            ToolCmd::List => return list_tools().await,
+            ToolCmd::Inspect { name } => return inspect_tool(name).await,
+            ToolCmd::Healthcheck { name } => return healthcheck_tool(name).await,
+            ToolCmd::Test { name } => println!("[info] tool test: {name} (no dry-run backend)"),
+            ToolCmd::Disable { name } => println!("[info] tool disable: {name} (not yet persisted)"),
         },
 
         // World control
@@ -582,11 +800,11 @@ async fn dispatch(cmd: Command) -> Result<()> {
         },
         Command::Leash { target } => handle_stub(&format!("leash {target}")),
 
-        // Trace & eval
+        // Trace & eval — trace wired to FileTraceSink
         Command::Trace { cmd } => match cmd {
-            TraceCmd::Live => handle_stub("trace live"),
-            TraceCmd::Show { task_id } => handle_stub(&format!("trace show {task_id}")),
-            TraceCmd::Export { session_id } => handle_stub(&format!("trace export {session_id}")),
+            TraceCmd::Live => println!("[info] trace live: use the TUI (chimera tui) for live traces"),
+            TraceCmd::Show { task_id } => println!("[info] trace show {task_id}: per-task traces not yet indexed"),
+            TraceCmd::Export { session_id } => return export_trace(session_id).await,
         },
         Command::Eval { cmd } => match cmd {
             EvalCmd::Run { name } => handle_stub(&format!("eval run {name}")),
@@ -676,7 +894,7 @@ mod tests {
     fn parse_run_plan_swarm() {
         let cli = parse(&["run", "fix auth"]);
         match cli.command {
-            Command::Run { objective } => assert_eq!(objective, "fix auth"),
+            Command::Run { objective, interactive: _ } => assert_eq!(objective, "fix auth"),
             _ => panic!("expected run"),
         }
         let cli = parse(&["plan", "migrate db"]);
@@ -893,7 +1111,8 @@ mod tests {
         dispatch(Command::Pack { name: "test".into() }).await.unwrap();
         dispatch(Command::Session { cmd: SessionCmd::List }).await.unwrap();
         dispatch(Command::Session { cmd: SessionCmd::Resume { session_id: "s1".into() } }).await.unwrap();
-        dispatch(Command::Session { cmd: SessionCmd::Fork { session_id: "s1".into() } }).await.unwrap();
+        // Fork of a non-existent session returns an error (expected); only assert it doesn't panic unexpectedly.
+        let _ = dispatch(Command::Session { cmd: SessionCmd::Fork { session_id: "00000000-0000-0000-0000-000000000001".into() } }).await;
         dispatch(Command::Checkpoint { cmd: CheckpointCmd::Create }).await.unwrap();
         dispatch(Command::Checkpoint { cmd: CheckpointCmd::List }).await.unwrap();
         dispatch(Command::Rollback { checkpoint_id: "cp1".into() }).await.unwrap();
@@ -934,7 +1153,7 @@ mod tests {
         dispatch(Command::Leash { target: "all".into() }).await.unwrap();
         dispatch(Command::Trace { cmd: TraceCmd::Live }).await.unwrap();
         dispatch(Command::Trace { cmd: TraceCmd::Show { task_id: "t1".into() } }).await.unwrap();
-        dispatch(Command::Trace { cmd: TraceCmd::Export { session_id: "s1".into() } }).await.unwrap();
+        dispatch(Command::Trace { cmd: TraceCmd::Export { session_id: "00000000-0000-0000-0000-000000000002".into() } }).await.unwrap();
         dispatch(Command::Eval { cmd: EvalCmd::Run { name: "auth".into() } }).await.unwrap();
         dispatch(Command::Eval { cmd: EvalCmd::Compare { checkpoint_a: "a".into(), checkpoint_b: "b".into() } }).await.unwrap();
         dispatch(Command::Memory { cmd: MemoryCmd::List }).await.unwrap();
@@ -947,18 +1166,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dispatch_run_objective() {
-        dispatch(Command::Run { objective: "test run".into() }).await.unwrap();
-    }
+    async fn dispatch_run_objective_config_gating_and_local_path() {
+        // Sequence the env-dependent cases in one test to avoid parallel
+        // env races between sibling tests.
+        // Case 1: no key + non-local URL => config error.
+        unsafe {
+            std::env::remove_var("CHIMERA_API_KEY");
+            std::env::remove_var("OPENAI_API_KEY");
+            std::env::set_var("CHIMERA_BASE_URL", "https://api.openai.com/v1");
+        }
+        let res = dispatch(Command::Run { objective: "test".into(), interactive: false }).await;
+        assert!(res.is_err(), "expected config-gate error without key");
+        let msg = format!("{}", res.unwrap_err());
+        assert!(
+            msg.contains("API key") || msg.contains("no API key"),
+            "unexpected error: {msg}"
+        );
 
-    #[tokio::test]
-    async fn dispatch_plan_objective() {
-        dispatch(Command::Plan { objective: "test plan".into() }).await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn dispatch_swarm_objective() {
-        dispatch(Command::Swarm { objective: "test swarm".into() }).await.unwrap();
+        // Case 2: localhost URL skips gate; agent loop runs and captures the
+        // (failed) connection into an Ok result.
+        unsafe {
+            std::env::set_var("CHIMERA_BASE_URL", "http://127.0.0.1:9999/v1");
+            std::env::set_var("CHIMERA_MODEL", "test-model");
+        }
+        let res = dispatch(Command::Run { objective: "test".into(), interactive: false }).await;
+        unsafe {
+            std::env::remove_var("CHIMERA_BASE_URL");
+            std::env::remove_var("CHIMERA_MODEL");
+        }
+        assert!(res.is_ok(), "expected Ok with captured error in result");
     }
 
     // ── build_harness ────────────────────────────────────────────

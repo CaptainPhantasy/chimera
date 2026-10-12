@@ -78,7 +78,7 @@ class Screen:
     def wait_for(self, marker, offset=0, seconds=10):
         def visible():
             # Cursor moves may split a wrapped word in the byte stream.
-            return re.sub(rb'\x1b\[[0-?]*[ -/]*[@-~]', b'', self.output[offset:])
+            return re.sub(rb'\x1b\[[0-?]*[ -/]*[@-~]', b'', self.output[offset:]).replace('  ℹ '.encode(), b'')
         deadline = time.monotonic() + seconds
         while marker.encode() not in visible():
             self.drain()
@@ -242,7 +242,8 @@ def main():
         screen.wait_for(str(config), offset)
         offset = screen.send('/help\r')
         screen.wait_for('CHIMERA controls', offset)
-        screen.send('\x1b')
+        offset = screen.send('\x1b')
+        screen.wait_for(NEEDED, offset)
         prompt = 'remember setup recovery'
         offset = screen.send(prompt + '\r')
         screen.wait_for(NEEDED, offset)

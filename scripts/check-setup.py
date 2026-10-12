@@ -13,6 +13,8 @@ import json
 import os
 from pathlib import Path
 import pty
+import re
+import re
 import select
 import struct
 import subprocess
@@ -74,12 +76,15 @@ class Screen:
                 self.closed = True
 
     def wait_for(self, marker, offset=0, seconds=10):
+        def visible():
+            # Cursor moves may split a wrapped word in the byte stream.
+            return re.sub(rb'\x1b\[[0-?]*[ -/]*[@-~]', b'', self.output[offset:])
         deadline = time.monotonic() + seconds
-        while marker.encode() not in self.output[offset:]:
+        while marker.encode() not in visible():
             self.drain()
             if self.process.poll() is not None:
                 self.drain(0)
-                self.check('screen shows ' + marker, marker.encode() in self.output[offset:])
+                self.check('screen shows ' + marker, marker.encode() in visible())
                 return
             if time.monotonic() >= deadline:
                 raise ObservationTimeout('Still waiting for screen text: ' + marker)
@@ -216,7 +221,7 @@ def main():
         with lock:
             last = requests[-1]
         user = [m.get('content') for m in last['messages'] if m.get('role') == 'user']
-        check('preserved objective reaches model intact', user[-1] == prompt)
+        check('explicit objective reaches model intact', user[-1] == prompt)
 
     def answer_saved(directory):
         sessions = list((directory / '.chimera' / 'sessions').glob('*.json'))
@@ -241,10 +246,12 @@ def main():
         prompt = 'remember setup recovery'
         offset = screen.send(prompt + '\r')
         screen.wait_for(NEEDED, offset)
+        retained = 'editable ' + prompt
+        screen.send('\x1b[Heditable ')
         offset = screen.refresh()
-        screen.wait_for(prompt, offset)
+        screen.wait_for(retained, offset)
         check('blocked request sends no model request', count() == 0)
-        screen.clear_input(prompt)
+        screen.clear_input(retained)
         local_settings(config)
         offset = screen.send('/reload\r')
         screen.wait_for(RELOADED, offset)
@@ -289,15 +296,18 @@ def main():
             screen, config, directory = start(name, arguments)
             before = count()
             screen.wait_for(NEEDED)
+            retained = 'editable ' + prompt
+            screen.send('\x1b[Heditable ')
             offset = screen.refresh()
-            screen.wait_for(prompt, offset)
+            screen.wait_for(retained, offset)
             check('initial objective does not run without settings', count() == before)
-            screen.clear_input(prompt)
+            screen.clear_input(retained)
             local_settings(config)
             offset = screen.send('/reload\r')
             screen.wait_for(RELOADED, offset)
             check('reload leaves initial objective unsent', count() == before)
-            offset = screen.send(prompt + '\r')
+            # Recall /reload, then the initial objective. Do not retype it.
+            offset = screen.send('\x1b[A\x1b[A\r')
             screen.wait_for('Answer saved.', offset)
             sent_request(prompt, before)
             answer_saved(directory)
@@ -325,13 +335,10 @@ def main():
             check('no setup screen reveals the fake secret', SENTINEL.encode() not in screen.output)
         check('binary unchanged during checks', hashlib.sha256(binary.read_bytes()).hexdigest() == report['binary_sha256'])
         report['status'] = 'passed'
-        return 0
     except ObservationTimeout as error:
         report['status'], report['error'] = 'inconclusive', str(error)
-        return 1
     except Exception as error:
         report['status'], report['error'] = 'failed', str(error)
-        return 1
     finally:
         for screen in screens:
             try:
@@ -347,6 +354,7 @@ def main():
         save()
         print(json.dumps({'status': report['status'], 'checks': len(report['checks']),
                           'model_requests': count(), 'report': str(report_path)}), flush=True)
+    return 0 if report['status'] == 'passed' else 1
 
 
 if __name__ == '__main__':

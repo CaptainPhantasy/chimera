@@ -561,6 +561,8 @@ async fn run_screen(
     let restore = TerminalGuard::new();
     let mut terminal = init_terminal()?;
     if let Some(objective) = initial.filter(|s| !s.trim().is_empty()) {
+        // Setup commands must not erase a request supplied on the command line.
+        tui.input.history.push_back(objective.clone());
         tui.tx.try_send(TuiEvent::Submit(objective))?;
     }
     let result: Result<()> = async {

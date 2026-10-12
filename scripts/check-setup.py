@@ -14,7 +14,6 @@ import os
 from pathlib import Path
 import pty
 import re
-import re
 import select
 import struct
 import subprocess
@@ -185,11 +184,12 @@ def main():
             body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
             with lock:
                 requests.append(body)
+                reply = ANSWER + '_' + str(len(requests))
             self.send_response(200)
             self.send_header('Content-Type', 'text/event-stream')
             self.end_headers()
             for item in [
-                {'choices': [{'delta': {'content': ANSWER}, 'finish_reason': None}]},
+                {'choices': [{'delta': {'content': reply}, 'finish_reason': None}]},
                 {'choices': [{'delta': {}, 'finish_reason': 'stop'}]},
                 {'choices': [], 'usage': {'prompt_tokens': 5, 'completion_tokens': 3, 'total_tokens': 8}},
             ]:
@@ -216,17 +216,58 @@ def main():
         screens.append(screen)
         return screen, config, directory
 
-    def sent_request(prompt, before):
+    def complete_request(screen, directory, prompt, before, offset):
+        # A redraw can contain an older "Answer saved." notice. First observe
+        # this request at the model, then its unique answer and saved outcome.
+        deadline = time.monotonic() + 10
+        while count() <= before:
+            screen.drain()
+            check_running = screen.process.poll() is None
+            if not check_running:
+                check('program remains open until model receives request', False)
+            if time.monotonic() >= deadline:
+                raise ObservationTimeout('Model has not received current objective: ' + prompt)
         check('exactly one model request sent', count() == before + 1)
         with lock:
             last = requests[-1]
         user = [m.get('content') for m in last['messages'] if m.get('role') == 'user']
         check('explicit objective reaches model intact', user[-1] == prompt)
+        answer = ANSWER + '_' + str(before + 1)
+        screen.wait_for(answer, offset)
 
-    def answer_saved(directory):
-        sessions = list((directory / '.chimera' / 'sessions').glob('*.json'))
-        check('answer persisted in saved conversation',
-              any(ANSWER in p.read_text() for p in sessions))
+        def saved_current_result():
+            for path in (directory / '.chimera' / 'sessions').glob('*.json'):
+                data = json.loads(path.read_text())['data']
+                events = data['events']
+                starts = [e['payload'] for e in events if e.get('key') == 'run_started']
+                results = [e['payload'] for e in events if e.get('key') == 'run_result']
+                outcomes = [e['payload'] for e in events if e.get('key') == 'run_outcome']
+                if not starts or not results or not outcomes:
+                    continue
+                result = results[-1]
+                messages = [m for m in result.get('messages', [])
+                            if m.get('role') in ('user', 'assistant')]
+                if (not data['active'] and starts[-1].get('objective') == prompt
+                        and outcomes[-1].get('outcome') == 'completed'
+                        and result.get('done_reason') == 'final_answer'
+                        and result.get('final_answer') == answer
+                        and len(messages) >= 2
+                        and messages[-2].get('role') == 'user'
+                        and messages[-2].get('content') == prompt
+                        and messages[-1].get('role') == 'assistant'
+                        and messages[-1].get('content') == answer):
+                    return True
+            return False
+
+        deadline = time.monotonic() + 10
+        while not saved_current_result():
+            screen.drain()
+            if screen.process.poll() is not None:
+                check('program remains open until current answer is saved', False)
+            if time.monotonic() >= deadline:
+                raise ObservationTimeout('Current objective and answer are not yet saved: ' + prompt)
+        check('current objective and answer saved with completed outcome', True)
+        screen.wait_for('Answer saved.', offset)
 
     try:
         # The operating system selects a free temporary loopback port.
@@ -258,9 +299,7 @@ def main():
         screen.wait_for(RELOADED, offset)
         check('reload does not automatically send a request', count() == 0)
         offset = screen.send(prompt + '\r')
-        screen.wait_for('Answer saved.', offset)
-        sent_request(prompt, 0)
-        answer_saved(directory)
+        complete_request(screen, directory, prompt, 0, offset)
         # A bad reload must prevent new work even after a previous success.
         config.write_text('{broken settings\n')
         offset = screen.send('/reload\r')
@@ -275,8 +314,7 @@ def main():
         offset = screen.send('/reload\r')
         screen.wait_for(RELOADED, offset)
         offset = screen.send(blocked + '\r')
-        screen.wait_for('Answer saved.', offset)
-        sent_request(blocked, before)
+        complete_request(screen, directory, blocked, before, offset)
         screen.finish()
 
         # Keep a fake secret in the invalid field to catch error-chain leakage.
@@ -309,9 +347,7 @@ def main():
             check('reload leaves initial objective unsent', count() == before)
             # Recall /reload, then the initial objective. Do not retype it.
             offset = screen.send('\x1b[A\x1b[A\r')
-            screen.wait_for('Answer saved.', offset)
-            sent_request(prompt, before)
-            answer_saved(directory)
+            complete_request(screen, directory, prompt, before, offset)
             screen.finish()
 
         # Resume a real saved conversation produced above, with settings missing.

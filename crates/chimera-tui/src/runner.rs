@@ -444,10 +444,7 @@ pub async fn run_interactive_with_config(
     model: String,
     provider: String,
 ) -> Result<()> {
-    let mut config = chimera_config::Config::load()?;
-    config.provider.model = model;
-    config.provider.name = provider;
-    run_screen(initial, None, None, config).await
+    run_screen(initial, None, None, Some((model, provider))).await
 }
 
 pub async fn run_saved_interactive(
@@ -455,17 +452,65 @@ pub async fn run_saved_interactive(
     resume: Option<uuid::Uuid>,
     profile: Option<String>,
 ) -> Result<()> {
-    run_screen(initial, resume, profile, chimera_config::Config::load()?).await
+    run_screen(initial, resume, profile, None).await
+}
+
+/// A failed read must never make default settings eligible to run a request.
+struct ScreenSettings {
+    loaded: bool,
+    overrides: Option<(String, String)>,
+}
+
+impl ScreenSettings {
+    fn new(overrides: Option<(String, String)>) -> Self {
+        Self {
+            loaded: false,
+            overrides,
+        }
+    }
+
+    fn load(&mut self) -> Result<chimera_config::Config> {
+        self.accept(chimera_config::Config::load())
+    }
+
+    fn accept(&mut self, result: Result<chimera_config::Config>) -> Result<chimera_config::Config> {
+        self.loaded = false;
+        // Parsing errors may contain private file values. Keep details out of chat.
+        let mut config =
+            result.map_err(|_| anyhow::anyhow!("Model settings could not be read."))?;
+        if let Some((model, provider)) = &self.overrides {
+            config.provider.model = model.clone();
+            config.provider.name = provider.clone();
+        }
+        config
+            .validate_credentials()
+            .map_err(|_| anyhow::anyhow!("Model setup needed."))?;
+        self.loaded = true;
+        Ok(config)
+    }
+
+    fn ready(&self, config: &chimera_config::Config) -> bool {
+        self.loaded && config.validate_credentials().is_ok()
+    }
+}
+
+fn show_setup_needed(tui: &mut Tui) {
+    tui.status.running = false;
+    tui.status.mode = "SETUP".into();
+    tui.log.push(Message::System {
+        text: "Model setup needed. Use /setup for the settings file and /reload after saving it. Your request has not been sent.".into(),
+        kind: SystemKind::Warning,
+    });
 }
 
 async fn run_screen(
     initial: Option<String>,
     resume: Option<uuid::Uuid>,
     profile: Option<String>,
-    mut config: chimera_config::Config,
+    overrides: Option<(String, String)>,
 ) -> Result<()> {
-    config.validate()?;
-    config.validate_credentials()?;
+    let mut settings = ScreenSettings::new(overrides);
+    let mut config = settings.load().unwrap_or_default();
     anyhow::ensure!(
         matches!(
             profile.as_deref(),
@@ -502,6 +547,9 @@ async fn run_screen(
             }),
             _ => {}
         }
+    }
+    if !settings.ready(&config) {
+        show_setup_needed(&mut tui);
     }
     let mut session = Some(session);
     let mut active: Option<
@@ -575,6 +623,7 @@ async fn run_screen(
             }
             while let Ok(input) = tui.rx.try_recv() {
                 let TuiEvent::Submit(text) = input else { continue };
+                let unsent = text.clone();
                 let trimmed = text.trim();
                 let (command, argument) = trimmed.split_once(' ').unwrap_or((trimmed, ""));
                 let mut plan = profile.as_deref() == Some("read-only");
@@ -592,10 +641,47 @@ async fn run_screen(
                         } else { tui.log.push(Message::System { text: "No action is waiting for approval.".into(), kind: SystemKind::Warning }); }
                         continue;
                     }
+                    "/setup" => {
+                        let path = chimera_config::config_file_path()
+                            .map(|path| path.display().to_string())
+                            .unwrap_or_else(|| "Set CHIMERA_CONFIG to a settings file.".into());
+                        tui.log.push(Message::System {
+                            text: format!("Model settings file: {path}\nSet provider.base_url to your model service address and provider.model to its model name. A remote service also needs provider.api_key. Keep keys in the settings file, never in chat.\nRun chimera init in another terminal to create a missing file. Save changes, then use /reload here. Existing environment settings override file values; changing those needs a restart."),
+                            kind: SystemKind::Info,
+                        });
+                        continue;
+                    }
+                    "/reload" => {
+                        if active.is_some() {
+                            tui.log.push(Message::System { text: "Cancel or finish the current request before reloading settings.".into(), kind: SystemKind::Warning });
+                        } else {
+                            match settings.load() {
+                                Ok(loaded) => {
+                                    config = loaded;
+                                    tui.status.model = config.provider.model.clone();
+                                    tui.status.provider = config.provider.name.clone();
+                                    tui.status.max_iterations = config.agent.max_iterations;
+                                    tui.status.mode = if profile.as_deref() == Some("read-only") { "PLAN" } else { "RUN" }.into();
+                                    tui.log.push(Message::System { text: "Model settings reloaded. Send your request when ready.".into(), kind: SystemKind::Success });
+                                }
+                                Err(_) => {
+                                    tui.log.push(Message::System { text: "Could not reload model settings. Fix the settings file, then use /reload.".into(), kind: SystemKind::Warning });
+                                    show_setup_needed(&mut tui);
+                                }
+                            }
+                        }
+                        continue;
+                    }
                     "/model" => {
                         if argument.is_empty() { tui.log.push(Message::System { text: config.provider.model.clone(), kind: SystemKind::Info }); }
                         else if active.is_some() { tui.log.push(Message::System { text: "Cancel or finish the current request before changing the model.".into(), kind: SystemKind::Warning }); }
-                        else { config.provider.model = argument.trim().into(); config.validate()?; tui.status.model = config.provider.model.clone(); }
+                        else if !settings.ready(&config) { show_setup_needed(&mut tui); }
+                        else {
+                            let mut changed = config.clone();
+                            changed.provider.model = argument.trim().into();
+                            if changed.validate().is_ok() { config = changed; tui.status.model = config.provider.model.clone(); }
+                            else { tui.log.push(Message::System { text: "That model setting is not valid. The previous model is unchanged.".into(), kind: SystemKind::Warning }); }
+                        }
                         continue;
                     }
                     "/tools" => {
@@ -617,6 +703,12 @@ async fn run_screen(
                 if active.is_some() {
                     tui.input.buffer = objective.clone(); tui.input.cursor = objective.len();
                     tui.log.push(Message::System { text: "A request is already running. Finish it or use /cancel; your new text remains in the input.".into(), kind: SystemKind::Warning });
+                    continue;
+                }
+                if !settings.ready(&config) {
+                    tui.input.buffer = unsent;
+                    tui.input.cursor = tui.input.buffer.len();
+                    show_setup_needed(&mut tui);
                     continue;
                 }
                 tui.objective = objective.clone();
@@ -695,6 +787,38 @@ impl Drop for TerminalGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_settings_never_allow_default_or_previous_config_to_run() {
+        let mut state = ScreenSettings::new(None);
+        let mut local = chimera_config::Config::default();
+        local.provider.base_url = "http://127.0.0.1:12434/v1".into();
+        let valid = state.accept(Ok(local.clone())).unwrap();
+        assert!(state.ready(&valid));
+        let error = state
+            .accept(Err(anyhow::anyhow!("secret-sentinel")))
+            .unwrap_err();
+        assert!(!error.to_string().contains("secret-sentinel"));
+        assert!(!state.ready(&valid));
+        assert!(state.accept(Ok(chimera_config::Config::default())).is_err());
+        assert!(!state.ready(&valid));
+        let recovered = state.accept(Ok(local)).unwrap();
+        assert!(state.ready(&recovered));
+    }
+
+    #[test]
+    fn explicit_model_and_provider_survive_settings_reload() {
+        let mut state =
+            ScreenSettings::new(Some(("chosen-model".into(), "chosen-provider".into())));
+        let mut local = chimera_config::Config::default();
+        local.provider.base_url = "http://127.0.0.1:12434/v1".into();
+        for _ in 0..2 {
+            let config = state.accept(Ok(local.clone())).unwrap();
+            assert_eq!(config.provider.model, "chosen-model");
+            assert_eq!(config.provider.name, "chosen-provider");
+            assert!(state.ready(&config));
+        }
+    }
 
     #[test]
     fn help_scroll_preserves_input_and_normal_q_is_text() {

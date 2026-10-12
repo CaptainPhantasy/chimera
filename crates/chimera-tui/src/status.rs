@@ -111,6 +111,8 @@ fn append_group(
 fn status_line(info: &StatusInfo, styles: &Styles, width: usize) -> Line<'static> {
     let state = if info.running {
         "● Working"
+    } else if info.mode == "SETUP" {
+        "○ Setup needed"
     } else {
         "○ Ready"
     };
@@ -122,7 +124,16 @@ fn status_line(info: &StatusInfo, styles: &Styles, width: usize) -> Line<'static
     let state = if state.width() <= width {
         state.to_owned()
     } else {
-        fit_text(if info.running { "Working" } else { "Ready" }, width)
+        fit_text(
+            if info.running {
+                "Working"
+            } else if info.mode == "SETUP" {
+                "Setup needed"
+            } else {
+                "Ready"
+            },
+            width,
+        )
     };
     let mut used = state.width();
     let mut spans = vec![Span::styled(state, state_style)];

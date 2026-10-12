@@ -318,6 +318,8 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("help", "show keyboard shortcuts and commands"),
     ("run", "execute an objective"),
     ("plan", "plan without write side effects"),
+    ("setup", "show model setup help"),
+    ("reload", "reload saved model settings"),
     ("model", "show or change the active model"),
     ("tools", "list available tools"),
     ("sessions", "list sessions"),

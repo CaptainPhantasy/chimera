@@ -20,6 +20,7 @@ const CONTROLS: &[(&str, &str)] = &[
     ("F1 / Escape", "show / close help"),
     ("Ctrl+L / /theme", "dark or light display"),
     ("/run or /plan TEXT", "act, or read only"),
+    ("/setup /reload", "view setup help / reload saved settings"),
     ("/model [NAME]", "show or change model"),
     ("/tools /sessions", "show tools or saved sessions"),
     ("/approve /deny", "decide the displayed action once"),

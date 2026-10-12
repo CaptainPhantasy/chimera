@@ -13,3 +13,4 @@ serde_json.workspace = true
 async-trait.workspace = true
 uuid.workspace = true
 chrono.workspace = true
+chimera-shell.workspace = true

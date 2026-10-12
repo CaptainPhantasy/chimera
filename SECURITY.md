@@ -1,19 +1,11 @@
-# Security Policy
+# Security and private reports
 
-Reporting a Vulnerability
-If you discover a security vulnerability, please report it privately by opening an issue and marking it as a security report, or email security@chimera.local (placeholder). Include a clear description, reproduction steps, and an impact assessment.
+The private reporting destination has not yet been confirmed. The old `security@chimera.local` address was a placeholder and must not be used. Do not post a private vulnerability or credentials in a public issue. A working private contact is an open beta requirement.
 
-Supported release: initial public release v0.1.0
+CHIMERA limits built-in file tools to the selected project, rejects protected state and symbolic-link escapes, requires exact approval for file changes and commands, and keeps recoverable originals. Shell commands use the implemented macOS isolation boundary and deny network access. Unavailable isolation must return an error rather than run on the host without it.
 
-Security model
-- ExecutionScope and approval classes are primary safety mechanisms. Packs restrict network/commit permissions.
-- Sensitive files are excluded by default from worktrees (see pack ExecutionScope denied_paths defaults).
+External tool programs and browser/device sessions require explicit review. Browser origin rules are not an operating-system network sandbox. Android network-disabled operation is unavailable. A tool description, role prompt or model response cannot grant permission.
 
-Handling secrets
-- Do not commit secrets into the repository. Worktrees and worlds default to read-only unless explicitly configured.
+Saved conversation and recovery files can contain private project content. Keep `.chimera/` and model settings private. Use `session export` for diagnostics; ordinary replay is private conversation output. Environment keys must not be committed or included in reports.
 
-Third-party components
-- Keep dependencies up to date. The workspace uses tokio, tracing, serde, clap, and other standard crates.
-
-Responsible disclosure
-- We will acknowledge reporters promptly and coordinate disclosure timelines.
+This repository is under beta preparation. A passing controlled test is not a claim that every provider, device or user workflow has been verified.

@@ -1,6 +1,6 @@
-pub mod dashboard;
-pub mod creature_inspector;
 pub mod approval;
+pub mod creature_inspector;
+pub mod dashboard;
 pub mod shell_grid;
 
 #[cfg(test)]

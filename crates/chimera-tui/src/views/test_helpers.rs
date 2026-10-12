@@ -11,7 +11,10 @@ pub fn test_terminal(width: u16, height: u16) -> Terminal<TestBackend> {
 
 /// Create an App populated with sample data for rendering tests.
 pub fn sample_app() -> App {
-    let mut app = App::new("test-session".into(), "Extract auth module and verify".into());
+    let mut app = App::new(
+        "test-session".into(),
+        "Extract auth module and verify".into(),
+    );
     app.mode = "SWARM".into();
     app.autonomy = "MEDIUM".into();
     app.repo = "~/work/app".into();
@@ -39,10 +42,22 @@ pub fn sample_app() -> App {
     ];
 
     app.tasks = vec![
-        TaskRow { description: "map auth files".into(), status: TaskDisplayStatus::Complete },
-        TaskRow { description: "patch extraction".into(), status: TaskDisplayStatus::InProgress },
-        TaskRow { description: "run smoke test".into(), status: TaskDisplayStatus::Pending },
-        TaskRow { description: "broken step".into(), status: TaskDisplayStatus::Failed },
+        TaskRow {
+            description: "map auth files".into(),
+            status: TaskDisplayStatus::Complete,
+        },
+        TaskRow {
+            description: "patch extraction".into(),
+            status: TaskDisplayStatus::InProgress,
+        },
+        TaskRow {
+            description: "run smoke test".into(),
+            status: TaskDisplayStatus::Pending,
+        },
+        TaskRow {
+            description: "broken step".into(),
+            status: TaskDisplayStatus::Failed,
+        },
     ];
 
     app.push_feed("RAVEN-1", "found token refresh path");

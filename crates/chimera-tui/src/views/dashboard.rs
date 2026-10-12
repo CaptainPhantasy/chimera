@@ -13,7 +13,7 @@ pub fn render(f: &mut Frame, app: &App) {
         .constraints([
             Constraint::Length(3),  // header
             Constraint::Length(3),  // objective
-            Constraint::Min(8),    // creatures
+            Constraint::Min(8),     // creatures
             Constraint::Length(10), // task graph
             Constraint::Length(8),  // feed
             Constraint::Length(1),  // key hints
@@ -30,7 +30,12 @@ pub fn render(f: &mut Frame, app: &App) {
 
 fn render_header(f: &mut Frame, app: &App, area: Rect) {
     let text = vec![Line::from(vec![
-        Span::styled("chimera", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            "chimera",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::raw(" :: "),
         Span::raw(&app.session_label),
         Span::raw("    Mode: "),
@@ -44,17 +49,23 @@ fn render_header(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_objective(f: &mut Frame, app: &App, area: Rect) {
-    let block = Block::default()
-        .title(" Objective ")
-        .borders(Borders::ALL);
+    let block = Block::default().title(" Objective ").borders(Borders::ALL);
     let p = Paragraph::new(app.objective.as_str()).block(block);
     f.render_widget(p, area);
 }
 
 fn render_creatures(f: &mut Frame, app: &App, area: Rect) {
-    let header = Row::new(vec!["ID", "Role", "State", "World", "Conf", "Tokens", "Last Action"])
-        .style(Style::default().add_modifier(Modifier::BOLD))
-        .bottom_margin(1);
+    let header = Row::new(vec![
+        "ID",
+        "Role",
+        "State",
+        "World",
+        "Conf",
+        "Tokens",
+        "Last Action",
+    ])
+    .style(Style::default().add_modifier(Modifier::BOLD))
+    .bottom_margin(1);
 
     let rows: Vec<Row> = app
         .creatures
@@ -120,9 +131,7 @@ fn render_task_graph(f: &mut Frame, app: &App, area: Rect) {
         })
         .collect();
 
-    let block = Block::default()
-        .title(" Task Graph ")
-        .borders(Borders::ALL);
+    let block = Block::default().title(" Task Graph ").borders(Borders::ALL);
     let p = Paragraph::new(lines).block(block);
     f.render_widget(p, area);
 }
@@ -149,9 +158,7 @@ fn render_feed(f: &mut Frame, app: &App, area: Rect) {
         })
         .collect();
 
-    let block = Block::default()
-        .title(" Live Feed ")
-        .borders(Borders::ALL);
+    let block = Block::default().title(" Live Feed ").borders(Borders::ALL);
     let p = Paragraph::new(lines).block(block);
     f.render_widget(p, area);
 }
@@ -185,18 +192,14 @@ mod tests {
     fn dashboard_renders_without_panic() {
         let app = sample_app();
         let mut terminal = test_terminal(120, 40);
-        terminal
-            .draw(|f| render(f, &app))
-            .unwrap();
+        terminal.draw(|f| render(f, &app)).unwrap();
     }
 
     #[test]
     fn dashboard_renders_empty_app() {
         let app = App::new("empty".into(), "nothing".into());
         let mut terminal = test_terminal(80, 24);
-        terminal
-            .draw(|f| render(f, &app))
-            .unwrap();
+        terminal.draw(|f| render(f, &app)).unwrap();
     }
 
     #[test]

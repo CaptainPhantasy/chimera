@@ -1,7 +1,7 @@
 # CHIMERA — FLOYD.md
-**Version:** 1.7.0
+**Version:** 1.7.2
 **Initialized:** 2026-05-12T14:58:53-0400
-**Governance:** .supercache/ v1.7.0
+**Governance:** .supercache/ v1.7.2
 **Port:** N/A — CLI/TUI tool, no network port binding
 **Drive:** Storage
 **Path:** /Volumes/Storage/CHIMERA

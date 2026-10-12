@@ -1,3 +1,6 @@
+pub mod delivery;
+pub use delivery::{DeliveryRecord, DeliveryStatus, Destination, FileCommsBridge, PendingPrompt};
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -122,11 +125,13 @@ pub trait CommsBridge: Send + Sync {
 // ---------------------------------------------------------------------------
 
 /// A mock CommsBridge that records messages in memory.
+#[cfg(test)]
 pub struct MockCommsBridge {
     messages: tokio::sync::RwLock<Vec<(MessageId, Notification)>>,
     approvals: tokio::sync::RwLock<std::collections::HashMap<PendingApprovalId, Option<bool>>>,
 }
 
+#[cfg(test)]
 impl MockCommsBridge {
     pub fn new() -> Self {
         Self {
@@ -141,12 +146,14 @@ impl MockCommsBridge {
     }
 }
 
+#[cfg(test)]
 impl Default for MockCommsBridge {
     fn default() -> Self {
         Self::new()
     }
 }
 
+#[cfg(test)]
 #[async_trait::async_trait]
 impl CommsBridge for MockCommsBridge {
     async fn notify(&self, msg: Notification) -> anyhow::Result<MessageId> {
@@ -155,7 +162,10 @@ impl CommsBridge for MockCommsBridge {
         Ok(id)
     }
 
-    async fn request_approval(&self, _prompt: CommsApprovalPrompt) -> anyhow::Result<PendingApprovalId> {
+    async fn request_approval(
+        &self,
+        _prompt: CommsApprovalPrompt,
+    ) -> anyhow::Result<PendingApprovalId> {
         let id = Uuid::new_v4();
         self.approvals.write().await.insert(id, None);
         Ok(id)
@@ -167,14 +177,15 @@ impl CommsBridge for MockCommsBridge {
 
     async fn receipt(&self, id: MessageId) -> anyhow::Result<Option<DeliveryReceipt>> {
         let msgs = self.messages.read().await;
-        Ok(msgs.iter().find(|(mid, _)| *mid == id).map(|(mid, msg)| {
-            DeliveryReceipt {
+        Ok(msgs
+            .iter()
+            .find(|(mid, _)| *mid == id)
+            .map(|(mid, msg)| DeliveryReceipt {
                 message_id: *mid,
                 channel: msg.channel.clone(),
                 delivered_at: Utc::now(),
                 acknowledged: true,
-            }
-        }))
+            }))
     }
 }
 
@@ -195,7 +206,10 @@ mod tests {
     #[tokio::test]
     async fn notify_stores_message() {
         let bridge = MockCommsBridge::new();
-        let id = bridge.notify(make_notification("test alert")).await.unwrap();
+        let id = bridge
+            .notify(make_notification("test alert"))
+            .await
+            .unwrap();
 
         let receipt = bridge.receipt(id).await.unwrap();
         assert!(receipt.is_some());
@@ -206,7 +220,9 @@ mod tests {
     async fn request_approval_starts_pending() {
         let bridge = MockCommsBridge::new();
         let prompt = CommsApprovalPrompt {
-            channel: Channel::Slack { channel: "#ops".into() },
+            channel: Channel::Slack {
+                channel: "#ops".into(),
+            },
             actor: "MANTIS-1".into(),
             class: "yellow".into(),
             action: "modify 6 files".into(),

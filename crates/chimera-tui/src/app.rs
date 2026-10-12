@@ -326,8 +326,10 @@ mod tests {
     #[test]
     fn task_display_status_variants() {
         let statuses = [
-            TaskDisplayStatus::Pending, TaskDisplayStatus::InProgress,
-            TaskDisplayStatus::Complete, TaskDisplayStatus::Failed,
+            TaskDisplayStatus::Pending,
+            TaskDisplayStatus::InProgress,
+            TaskDisplayStatus::Complete,
+            TaskDisplayStatus::Failed,
         ];
         for s in &statuses {
             let json = serde_json::to_string(s).unwrap();

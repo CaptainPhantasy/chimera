@@ -20,7 +20,7 @@ use crate::theme::Styles;
 /// The text input editor state.
 #[derive(Debug, Clone)]
 pub struct InputBar {
-    /// Buffer content (single line for now; multi-line on Enter with Shift).
+    /// Buffer content, including newlines entered with Alt/Shift+Enter or paste.
     pub buffer: String,
     /// Cursor position (byte offset into buffer).
     pub cursor: usize,
@@ -64,6 +64,9 @@ impl InputBar {
 
     /// Insert a character at the cursor.
     pub fn insert_char(&mut self, c: char) {
+        if self.buffer.len() + c.len_utf8() > 65_536 {
+            return;
+        }
         self.buffer.insert(self.cursor, c);
         self.cursor += c.len_utf8();
         self.update_suggestions();
@@ -71,9 +74,7 @@ impl InputBar {
 
     /// Delete the character before the cursor (backspace).
     pub fn backspace(&mut self) {
-        if self.cursor > 0 {
-            // Find the char boundary before cursor.
-            let prev = self.buffer[..self.cursor].chars().last().unwrap();
+        if let Some(prev) = self.buffer[..self.cursor].chars().next_back() {
             let char_start = self.cursor - prev.len_utf8();
             self.buffer.replace_range(char_start..self.cursor, "");
             self.cursor = char_start;
@@ -83,8 +84,7 @@ impl InputBar {
 
     /// Delete the character at the cursor (delete).
     pub fn delete_char(&mut self) {
-        if self.cursor < self.buffer.len() {
-            let next = self.buffer[self.cursor..].chars().next().unwrap();
+        if let Some(next) = self.buffer[self.cursor..].chars().next() {
             let end = self.cursor + next.len_utf8();
             self.buffer.replace_range(self.cursor..end, "");
             self.update_suggestions();
@@ -93,16 +93,14 @@ impl InputBar {
 
     /// Move cursor left one char.
     pub fn cursor_left(&mut self) {
-        if self.cursor > 0 {
-            let prev = self.buffer[..self.cursor].chars().last().unwrap();
+        if let Some(prev) = self.buffer[..self.cursor].chars().next_back() {
             self.cursor -= prev.len_utf8();
         }
     }
 
     /// Move cursor right one char.
     pub fn cursor_right(&mut self) {
-        if self.cursor < self.buffer.len() {
-            let next = self.buffer[self.cursor..].chars().next().unwrap();
+        if let Some(next) = self.buffer[self.cursor..].chars().next() {
             self.cursor += next.len_utf8();
         }
     }
@@ -175,6 +173,7 @@ impl InputBar {
         self.history_pos = Some(pos);
         self.buffer = self.history[pos].clone();
         self.cursor = self.buffer.len();
+        self.update_suggestions();
     }
 
     /// Navigate to next history entry (newer).
@@ -195,6 +194,7 @@ impl InputBar {
                 }
             }
         }
+        self.update_suggestions();
     }
 
     /// Update slash-command suggestions based on current buffer.
@@ -243,28 +243,41 @@ impl InputBar {
         };
 
         let text_style = if self.buffer.is_empty() {
-            styles.text_faint()
+            styles.text_muted()
         } else {
             styles.text()
         };
 
-        // Build the paragraph with cursor indicator.
-        let mut spans = vec![Span::styled(display_text.clone(), text_style)];
-        let _ = &mut spans; // suppress unused warning
-
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(border_style)
-            .title(Span::styled(" input ", styles.title()));
-
-        let p = Paragraph::new(Line::from(Span::styled(display_text, text_style))).block(block);
+        let title = if area.width >= 38 {
+            " Message · Alt+Enter new line "
+        } else {
+            " Message "
+        };
+        let mut block = Block::default().border_style(border_style);
+        if area.height >= 3 {
+            block = block
+                .borders(Borders::ALL)
+                .title(Span::styled(title, styles.title()));
+        }
+        let inner = block.inner(area);
+        let before = &self.buffer[..self.cursor];
+        let row = before.chars().filter(|c| *c == '\n').count();
+        let col = self.cursor_display_offset();
+        let scroll_y = row.saturating_sub(inner.height.saturating_sub(1) as usize);
+        let scroll_x = col.saturating_sub(inner.width.saturating_sub(1) as usize);
+        let p = Paragraph::new(display_text)
+            .style(text_style)
+            .block(block)
+            .scroll((
+                scroll_y.min(u16::MAX as usize) as u16,
+                scroll_x.min(u16::MAX as usize) as u16,
+            ));
         f.render_widget(p, area);
-
-        // Render cursor if focused.
-        if self.focused {
-            let cursor_x = area.x + 1 + self.cursor_display_offset() as u16;
-            let cursor_y = area.y + 1;
-            f.set_cursor_position((cursor_x, cursor_y));
+        if self.focused && inner.width > 0 && inner.height > 0 {
+            f.set_cursor_position((
+                inner.x + (col - scroll_x) as u16,
+                inner.y + (row - scroll_y) as u16,
+            ));
         }
     }
 
@@ -294,11 +307,9 @@ impl InputBar {
     }
 
     fn cursor_display_offset(&self) -> usize {
-        // Approximate display column of cursor (assuming ASCII/monospace).
-        self.buffer[..self.cursor.min(self.buffer.len())]
-            .chars()
-            .map(|c| unicode_width::UnicodeWidthChar::width(c).unwrap_or(0))
-            .sum()
+        unicode_width::UnicodeWidthStr::width(
+            self.buffer[..self.cursor].rsplit('\n').next().unwrap_or(""),
+        )
     }
 }
 
@@ -310,9 +321,13 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("model", "show or change the active model"),
     ("tools", "list available tools"),
     ("sessions", "list sessions"),
-    ("clear", "clear the conversation"),
+    ("clear", "clear the screen; keep saved context"),
     ("theme", "switch between dark and light themes"),
+    ("approve", "allow the displayed action once"),
+    ("deny", "reject the displayed action"),
+    ("cancel", "stop current work"),
     ("quit", "exit chimera"),
+    ("exit", "exit chimera"),
 ];
 
 // ---------------------------------------------------------------------------
@@ -383,6 +398,57 @@ mod tests {
         let (name, args) = input.parse_command().unwrap();
         assert_eq!(name, "model");
         assert_eq!(args, "gpt-4o");
+    }
+
+    #[test]
+    fn multiline_cursor_uses_current_line_and_stays_in_bounds() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut input = InputBar::new();
+        for c in "a very long first line\n世界é".chars() {
+            input.insert_char(c);
+        }
+        assert_eq!(input.cursor_display_offset(), 5);
+        input.cursor_left();
+        assert_eq!(input.cursor_display_offset(), 4);
+        input.backspace();
+        assert_eq!(input.text(), "a very long first line\n世é");
+        for (width, height) in [(1, 1), (12, 2), (40, 3), (80, 5)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal
+                .draw(|f| input.render(f, f.area(), &Styles::dark(), "Message"))
+                .unwrap();
+            let cursor = terminal.get_cursor_position().unwrap();
+            assert!(cursor.x < width && cursor.y < height);
+        }
+    }
+
+    #[test]
+    fn one_row_input_displays_typing_without_a_title_row() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut input = InputBar::new();
+        input.insert_char('x');
+        let mut terminal = Terminal::new(TestBackend::new(2, 1)).unwrap();
+        terminal
+            .draw(|f| input.render(f, f.area(), &Styles::dark(), "Message"))
+            .unwrap();
+        assert_eq!(terminal.backend().buffer()[(0, 0)].symbol(), "x");
+        assert_eq!(
+            terminal.get_cursor_position().unwrap(),
+            ratatui::layout::Position::new(1, 0)
+        );
+    }
+
+    #[test]
+    fn history_refreshes_command_hints() {
+        let mut input = InputBar::new();
+        for c in "/model".chars() {
+            input.insert_char(c);
+        }
+        input.submit();
+        input.history_prev();
+        assert!(input.suggestions.iter().any(|s| s.starts_with("/model")));
+        input.history_next();
+        assert!(input.suggestions.is_empty());
     }
 
     impl InputBar {

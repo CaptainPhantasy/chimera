@@ -16,6 +16,7 @@ pub mod dialog;
 pub mod help;
 pub mod input;
 pub mod message;
+mod models;
 pub mod runner;
 pub mod status;
 pub mod theme;

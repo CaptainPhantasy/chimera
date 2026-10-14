@@ -22,7 +22,7 @@ const CONTROLS: &[(&str, &str)] = &[
     ("/run or /plan TEXT", "act, or read only"),
     ("/connect /setup F2", "choose and connect a provider"),
     ("/reload", "reload saved settings"),
-    ("/model [NAME]", "show or change model"),
+    ("/model [NAME]", "show, choose or change model"),
     ("/tools /sessions", "show tools or saved sessions"),
     ("/approve /deny", "decide the displayed action once"),
     ("/clear", "clear screen; retain saved context"),

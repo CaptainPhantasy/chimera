@@ -528,6 +528,17 @@ fn show_setup_needed(tui: &mut Tui) {
     });
 }
 
+/// Report a saved default model, naming any override this process keeps using.
+fn model_saved_message(config: &chimera_config::Config, provider: &str, chosen: &str) -> String {
+    if config.provider.model == chosen {
+        format!(
+            "{chosen} is saved as your default model for {provider}. Your draft is ready to send."
+        )
+    } else {
+        format!("{chosen} is saved as your default model for {provider}, but this session keeps using {} until CHIMERA is restarted.", config.provider.model)
+    }
+}
+
 async fn run_screen(
     initial: Option<String>,
     resume: Option<uuid::Uuid>,
@@ -584,6 +595,7 @@ async fn run_screen(
     let (events, mut updates) = chimera_core::runtime::event_channel();
     let mut pending: Option<(uuid::Uuid, tokio::sync::oneshot::Sender<bool>)> = None;
     let mut connections = crate::connect::Connections::default();
+    let mut models = crate::models::Models::default();
     let restore = TerminalGuard::new();
     let mut terminal = init_terminal()?;
     if let Some(objective) = initial.filter(|s| !s.trim().is_empty()) {
@@ -594,6 +606,7 @@ async fn run_screen(
     let result: Result<()> = async {
         loop {
             connections.poll(&mut tui.dialog).await;
+            models.poll(&mut tui.dialog).await;
             // A busy stream must still leave time for keys and drawing.
             for _ in 0..128 {
                 let Ok(update) = updates.try_recv() else { break };
@@ -652,7 +665,28 @@ async fn run_screen(
             }
             while let Ok(input) = tui.rx.try_recv() {
                 let text = match input {
-                    TuiEvent::DialogClosed => { connections.cancel(); continue; },
+                    TuiEvent::DialogClosed => { connections.cancel(); models.cancel(); continue; },
+                    TuiEvent::DialogAction(action, _values) if action.starts_with("models:") => {
+                        match models.action(&action, &config, &mut tui.dialog).await {
+                            Ok(Some(saved)) => {
+                                let chosen = saved.provider.model.clone();
+                                let provider = saved.provider.name.clone();
+                                match settings.load() {
+                                    Ok(loaded) => {
+                                        config = loaded;
+                                        tui.status.model = config.provider.model.clone();
+                                        tui.status.provider = config.provider.name.clone();
+                                        tui.status.mode = if profile.as_deref() == Some("read-only") { "PLAN" } else { "RUN" }.into();
+                                        tui.log.push(Message::System { text: model_saved_message(&config, &provider, &chosen), kind: SystemKind::Success });
+                                    }
+                                    Err(_) => tui.log.push(Message::System { text: "The model choice was saved, but settings could not be read back. Fix the settings file, then use /reload.".into(), kind: SystemKind::Warning }),
+                                }
+                            },
+                            Ok(None) => {},
+                            Err(error) => if let Some(dialog) = &mut tui.dialog { dialog.note = error.to_string(); }
+                        }
+                        continue;
+                    },
                     TuiEvent::DialogAction(action, values) => {
                         match connections.action(&action, &values, &config, &mut tui.dialog).await {
                             Ok(Some(saved)) => {
@@ -715,15 +749,24 @@ async fn run_screen(
                         continue;
                     }
                     "/model" => {
-                        if argument.is_empty() { tui.log.push(Message::System { text: config.provider.model.clone(), kind: SystemKind::Info }); }
+                        if argument.is_empty() { tui.log.push(Message::System { text: format!("Current model: {}. Use /models to list this service's models and save a default.", config.provider.model), kind: SystemKind::Info }); }
                         else if active.is_some() { tui.log.push(Message::System { text: "Cancel or finish the current request before changing the model.".into(), kind: SystemKind::Warning }); }
                         else if !settings.ready(&config) { show_setup_needed(&mut tui); }
                         else {
                             let mut changed = config.clone();
                             changed.provider.model = argument.trim().into();
-                            if changed.validate().is_ok() { config = changed; tui.status.model = config.provider.model.clone(); }
-                            else { tui.log.push(Message::System { text: "That model setting is not valid. The previous model is unchanged.".into(), kind: SystemKind::Warning }); }
+                            if changed.validate().is_ok() {
+                                config = changed;
+                                tui.status.model = config.provider.model.clone();
+                                tui.log.push(Message::System { text: format!("{} is used for this chat only. Use /models to choose and save a default.", config.provider.model), kind: SystemKind::Info });
+                            } else { tui.log.push(Message::System { text: "That model setting is not valid. The previous model is unchanged.".into(), kind: SystemKind::Warning }); }
                         }
+                        continue;
+                    }
+                    "/models" => {
+                        if active.is_some() { tui.log.push(Message::System { text: "Cancel or finish the current request before changing the model.".into(), kind: SystemKind::Warning }); }
+                        else if !settings.ready(&config) { show_setup_needed(&mut tui); }
+                        else { tui.dialog = Some(models.open(&config)); }
                         continue;
                     }
                     "/tools" => {
@@ -1048,5 +1091,21 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn saved_model_message_names_an_override_that_still_wins() {
+        let config = chimera_config::Config {
+            provider: chimera_config::ProviderConfig {
+                model: "pinned".into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(model_saved_message(&config, "Local", "pinned")
+            .contains("pinned is saved as your default model for Local"));
+        let message = model_saved_message(&config, "Local", "chosen");
+        assert!(message.contains("chosen is saved as your default model for Local"));
+        assert!(message.contains("keeps using pinned until CHIMERA is restarted"));
     }
 }

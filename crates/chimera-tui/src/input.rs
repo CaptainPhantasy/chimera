@@ -322,6 +322,7 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("setup", "choose and connect a provider"),
     ("reload", "reload saved model settings"),
     ("model", "show or change the active model"),
+    ("models", "choose a model and save it as your default"),
     ("tools", "list available tools"),
     ("sessions", "list sessions"),
     ("clear", "clear the screen; keep saved context"),

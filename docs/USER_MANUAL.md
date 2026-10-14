@@ -123,7 +123,7 @@ To choose a separate file for one launch:
 CHIMERA_CONFIG=/absolute/path/to/config.json chimera tui
 ```
 
-After editing the file, finish or cancel active work and use `/reload`. Changes to environment values require restarting the app. `/model NAME` changes the current chat's choice; edit the settings file for a lasting default. Reloading returns to the configured settings.
+After editing the file, finish or cancel active work and use `/reload`. Changes to environment values require restarting the app. `/model NAME` changes the current chat's choice; `/models` lists a saved service's models and saves the one you choose as a lasting default. When `CHIMERA_MODEL` or another environment value is set, it keeps winning in that session and the screen says so. Reloading returns to the configured settings.
 
 ### Check a connection
 

@@ -126,6 +126,14 @@ pub fn save_provider(path: &Path, provider: &ProviderConfig) -> Result<Config> {
     Ok(config)
 }
 
+/// Save the chosen model as the default for its provider, keeping other settings.
+pub fn save_model(path: &Path, provider: &ProviderConfig, model: &str) -> Result<Config> {
+    let mut updated = provider.clone();
+    updated.model = model.trim().to_string();
+    anyhow::ensure!(!updated.model.is_empty(), "Choose a model from the list.");
+    save_provider(path, &updated)
+}
+
 pub fn save_private(path: &Path, bytes: &[u8]) -> Result<()> {
     let parent = path
         .parent()
@@ -214,5 +222,25 @@ mod tests {
                 0o600
             );
         }
+    }
+    #[test]
+    fn save_model_changes_only_the_default_model() {
+        let root = std::env::temp_dir().join(format!("chimera-model-{}", uuid::Uuid::new_v4()));
+        let path = root.join("config.json");
+        let mut cfg = Config::default();
+        cfg.agent.max_iterations = 23;
+        cfg.provider = ProviderConfig {
+            name: "Local".into(),
+            base_url: "http://127.0.0.1:12434/v1".into(),
+            model: "first".into(),
+            ..Default::default()
+        };
+        save_private(&path, &serde_json::to_vec(&cfg).unwrap()).unwrap();
+        let saved = save_model(&path, &cfg.provider, "  second  ").unwrap();
+        assert_eq!(saved.provider.model, "second");
+        assert_eq!(saved.provider.name, "Local");
+        assert_eq!(saved.agent.max_iterations, 23);
+        assert_eq!(Config::from_file(&path).unwrap().provider.model, "second");
+        assert!(save_model(&path, &cfg.provider, "   ").is_err());
     }
 }

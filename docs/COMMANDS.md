@@ -31,6 +31,7 @@ Type these in CHIMERA, not at your shell prompt.
 | `/connect` or `/setup` | Choose a provider, enter a masked key, check its connection, and save a model. |
 | `/reload` | Reload saved settings when no request is running. |
 | `/model` | Show the selected model. |
+| `/models` | List a service's available models and save your choice as the default. |
 | `/model NAME` | Change the model for this open chat; does not save it to the settings file. |
 | `/tools` | List built-in tool descriptions. |
 | `/sessions` | List this project's saved session identifiers. |

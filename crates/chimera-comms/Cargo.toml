@@ -4,6 +4,8 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+chimera-memory.workspace = true
+reqwest.workspace = true
 tokio.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true

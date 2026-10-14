@@ -1,21 +1,19 @@
+mod commands;
+mod device_commands;
+mod work_commands;
+mod notify_commands;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 
 use chimera_config::Config;
-use chimera_core::{
-    agent::{self, AgentConfig},
-    BuiltinCreatureRegistry, ExecutionMode, Harness,
-    StubBrowserController, StubCommsBridge, StubEvaluator, StubMcpClient, StubMemoryStore,
-    StubMobileController, StubSessionStore, StubShellManager, StubToolRouter, StubTraceSink,
-    StubWorldManager,
-};
+use chimera_core::{agent::{AgentConfig, DoneReason}, runtime::{SavedSession, RunEvent}, ExecutionMode};
 use chimera_llm::LlmProvider;
 use chimera_tools::ToolRouter;
-use chimera_creatures::CreatureRegistry;
 use chimera_session::SessionStore;
-use chimera_trace::TraceSink;
+use serde_json::{json, Value};
+use std::io::{IsTerminal, Write};
 
 // ===========================================================================
 // Top-level CLI
@@ -61,7 +59,7 @@ pub enum Command {
     Up,
     /// Gracefully stop the control plane.
     Down,
-    /// Run diagnostics on dependencies and connectivity.
+    /// Check settings, credentials, saved sessions, and tool availability.
     Doctor,
     /// Show current harness status.
     Status,
@@ -79,12 +77,18 @@ pub enum Command {
         /// Launch in interactive TUI mode.
         #[arg(long, short = 'i')]
         interactive: bool,
+        /// Explicit external tool-server settings (ordinary terminal mode).
+        #[arg(long)]
+        mcp_config: Option<std::path::PathBuf>,
+        /// Run tools inside this saved execution environment.
+        #[arg(long)]
+        world: Option<String>,
     },
     Plan {
         /// The objective description.
         objective: String,
     },
-    /// Execute an objective with parallel creatures and worlds.
+    /// Run specialist sessions with the project's saved permissions.
     Swarm {
         /// The objective description.
         objective: String,
@@ -93,6 +97,12 @@ pub enum Command {
     Pack {
         /// Pack name (e.g. "ship-hotfix", "incident-response").
         name: String,
+        /// Work this team should perform.
+        #[arg(long)]
+        objective: Option<String>,
+        /// Explicit JSON pack definition, including its limits.
+        #[arg(long)]
+        definition: Option<std::path::PathBuf>,
     },
     /// Launch the interactive terminal UI (TUI).
     Tui {
@@ -130,6 +140,13 @@ pub enum Command {
     },
 
     // ----- Tool control (5.2.5) -----
+    /// Connect to an explicitly selected external tool-server configuration.
+    Mcp {
+        #[arg(long)]
+        config: std::path::PathBuf,
+        #[command(subcommand)]
+        cmd: McpCmd,
+    },
     /// Manage tools.
     Tool {
         #[command(subcommand)]
@@ -212,10 +229,16 @@ pub enum Command {
         /// The objective description.
         objective: String,
     },
-    /// Watch and react to events.
+    /// Inspect, pause, resume or cancel saved jobs.
+    Jobs { #[command(subcommand)] cmd: JobsCmd },
+    /// Deliver an explicitly reviewed message to a saved destination.
+    Notify { #[command(subcommand)] cmd: NotifyCmd },
+    /// Watch project files and run after they change.
     Watch {
         /// The watch objective description.
         objective: String,
+        #[arg(long,default_value="**")]
+        pattern: String,
     },
 }
 
@@ -231,6 +254,31 @@ pub enum DaemonCmd {
     Start,
     /// Stop the background daemon.
     Stop,
+    /// Inspect the running service.
+    Status,
+    /// Run the service in this terminal until stopped.
+    Serve,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum JobsCmd {
+    List, Inspect {id:String}, Pause {id:String}, Resume {id:String}, Cancel {id:String},
+}
+
+#[derive(Debug, Subcommand)]
+pub enum NotifyCmd {
+    /// Save a terminal inbox or an HTTPS webhook selected by the owner.
+    Destination {name:String, #[arg(long)] url:Option<String>, #[arg(long)] terminal:bool},
+    Destinations,
+    Disable {name:String},
+    /// Review and send a message once.
+    Send {destination:String,subject:String,body:String},
+    /// Send a pending action for review; delivery never approves it.
+    Approval {id:String,#[arg(long)] destination:String},
+    List,
+    Inspect {id:String},
+    Inbox,
+    Acknowledge {id:String},
 }
 
 // ----- Session -----
@@ -244,6 +292,10 @@ pub enum SessionCmd {
         /// Session ID.
         session_id: String,
     },
+    /// Recover the previous saved record; preserve the damaged record.
+    Recover { session_id: String },
+    /// Export private-data-free diagnostics as JSON.
+    Export { session_id: String },
     /// Fork a session into a new lineage.
     Fork {
         /// Session ID to fork.
@@ -255,8 +307,15 @@ pub enum SessionCmd {
 
 #[derive(Debug, Subcommand)]
 pub enum CheckpointCmd {
-    /// Create a new checkpoint.
-    Create,
+    /// Save conversation state and explicitly selected project files.
+    Create {
+        /// Session identifier; defaults to the most recently created session.
+        #[arg(long)]
+        session: Option<String>,
+        /// Relative project files to capture, including a currently absent path.
+        #[arg(long = "file")]
+        files: Vec<std::path::PathBuf>,
+    },
     /// List all checkpoints.
     List,
 }
@@ -274,6 +333,9 @@ pub enum CreatureCmd {
         /// Number of instances to spawn.
         #[arg(long, default_value = "1")]
         count: u32,
+        /// Request for these specialist instances.
+        #[arg(long)]
+        objective: Option<String>,
     },
     /// Inspect a creature instance.
     Inspect {
@@ -318,6 +380,8 @@ pub enum ToolCmd {
         /// Tool name.
         name: String,
     },
+    /// Re-enable a tool without granting action approval.
+    Enable { name: String },
     /// Disable a tool.
     Disable {
         /// Tool name.
@@ -329,6 +393,16 @@ pub enum ToolCmd {
 
 #[derive(Debug, Subcommand)]
 pub enum WorldCmd {
+    /// Inspect an existing environment.
+    Inspect { id: String },
+    /// Stop accepting commands and stop running work.
+    Close { id: String },
+    /// Pause an environment and cancel its owned work.
+    Pause { id: String },
+    /// Resume a paused environment.
+    Resume { id: String },
+    /// Run one explicitly approved command inside an environment.
+    Exec { id: String, command: String, #[arg(long, default_value="120")] timeout: u64 },
     /// List all active worlds.
     List,
     /// Spawn a new world.
@@ -346,6 +420,12 @@ pub enum BrowserCmd {
     Open {
         /// Target (URL or environment name).
         target: String,
+        #[arg(long)]
+        actions: Option<std::path::PathBuf>,
+        #[arg(long = "allow-origin")]
+        allowed_origins: Vec<String>,
+        #[arg(long,default_value=".chimera/artifacts")]
+        output_dir: std::path::PathBuf,
     },
 }
 
@@ -357,6 +437,14 @@ pub enum PhoneCmd {
     Boot {
         /// Device spec (e.g. "pixel8").
         device: String,
+        #[arg(long)]
+        app: std::path::PathBuf,
+        #[arg(long)]
+        package: String,
+        #[arg(long)]
+        network: bool,
+        #[arg(long,default_value=".chimera/artifacts")]
+        output_dir: std::path::PathBuf,
     },
 }
 
@@ -364,8 +452,12 @@ pub enum PhoneCmd {
 
 #[derive(Debug, Subcommand)]
 pub enum ApproveCmd {
-    /// Approve the next pending action.
+    /// Review the oldest pending action in an interactive terminal.
     Next,
+    /// Show pending actions and their exact arguments.
+    List,
+    /// Approve this exact pending identifier once.
+    Action { id: String },
     /// Approve the current plan.
     Plan,
 }
@@ -376,8 +468,10 @@ pub enum ApproveCmd {
 pub enum PolicyCmd {
     /// Show current policy.
     Show,
-    /// Edit the policy configuration.
+    /// Show the private policy file and supported changes.
     Edit,
+    /// Persist supervised or read-only permissions for this project.
+    Set { profile: String },
 }
 
 // ----- Autonomy -----
@@ -386,7 +480,7 @@ pub enum PolicyCmd {
 pub enum AutonomyCmd {
     /// Set the global autonomy level.
     Set {
-        /// Level: none, low, medium, high, full.
+        /// none: stop tools; low: review every action; medium: review file changes and commands.
         level: String,
     },
 }
@@ -413,6 +507,10 @@ pub enum TraceCmd {
 
 #[derive(Debug, Subcommand)]
 pub enum EvalCmd {
+    /// Save an evaluation containing an explicit command and target file.
+    Define { name: String, #[arg(long)] file: String, #[arg(long)] command: String },
+    /// List saved evaluations.
+    List,
     /// Run an evaluation.
     Run {
         /// Evaluation target name.
@@ -431,6 +529,12 @@ pub enum EvalCmd {
 
 #[derive(Debug, Subcommand)]
 pub enum MemoryCmd {
+    /// Save a fact for this project.
+    Remember { key: String, content: String },
+    /// Archive a saved fact.
+    Forget { episode_id: String },
+    /// Combine exact duplicates without discarding distinct facts.
+    Compact,
     /// List stored memory items.
     List,
     /// Show a specific memory episode.
@@ -444,6 +548,8 @@ pub enum MemoryCmd {
 
 #[derive(Debug, Subcommand)]
 pub enum SkillCmd {
+    /// Capture the objective of a completed saved conversation.
+    Capture { name: String, session_id: String, #[arg(long, default_value="Saved workflow")] description: String },
     /// List available skills.
     List,
     /// Inspect a skill.
@@ -458,403 +564,428 @@ pub enum SkillCmd {
     },
 }
 
-// ===========================================================================
-// Harness construction
-// ===========================================================================
-
-#[allow(dead_code)]
-fn build_harness() -> Harness {
-    Harness {
-        sessions: Arc::new(StubSessionStore),
-        creatures: Arc::new(BuiltinCreatureRegistry),
-        tools: Arc::new(StubToolRouter),
-        trace: Arc::new(StubTraceSink),
-        shells: Arc::new(StubShellManager),
-        worlds: Arc::new(StubWorldManager),
-        browser: Arc::new(StubBrowserController),
-        mobile: Arc::new(StubMobileController),
-        comms: Arc::new(StubCommsBridge),
-        memory: Arc::new(StubMemoryStore),
-        eval: Arc::new(StubEvaluator),
-        mcp: Arc::new(StubMcpClient),
-    }
+#[derive(Debug, Subcommand)]
+pub enum McpCmd {
+    Tools { server: String },
+    Call { server: String, tool: String, #[arg(long, default_value="{}")] args: String },
+    Resources { server: String },
+    Read { server: String, uri: String },
+    Healthcheck { server: String },
 }
 
-/// Build the tool router, preferring the concrete `DefaultToolRouter` when
-/// available, falling back to the core stub otherwise.
-fn build_tool_router(repo_root: Option<std::path::PathBuf>) -> Arc<dyn ToolRouter> {
-    chimera_tools::try_build_default_tool_router(repo_root)
-        .unwrap_or_else(|| Arc::new(chimera_core::StubToolRouter))
-}
-
-/// Run an objective through the REAL LLM-driven agent loop.
-///
-/// Loads config, builds an OpenAI-compatible provider, a default tool router,
-/// and runs the agent loop with live streaming to stdout.
-async fn run_objective(objective: String, mode: ExecutionMode) -> Result<()> {
-    let cfg = Config::load().context("failed to load CHIMERA config")?;
-
-    if cfg.provider.api_key.is_empty()
-        && !cfg.provider.base_url.contains("localhost")
-        && !cfg.provider.base_url.contains("127.0.0.1")
-    {
-        anyhow::bail!(
-            "no API key configured. Set CHIMERA_API_KEY or OPENAI_API_KEY, or point \
-             CHIMERA_BASE_URL at a local server (e.g. LM Studio on localhost)."
-        );
-    }
-
-    let provider = cfg.build_provider();
-    let repo_root = std::env::current_dir().ok();
-    let tools = build_tool_router(repo_root);
-    let tool_defs = agent::build_tool_definitions(tools.as_ref())
-        .await
-        .context("failed to enumerate tools")?;
-
-    let agent_cfg = AgentConfig {
-        max_iterations: cfg.agent.max_iterations,
-        system_prompt: if matches!(mode, ExecutionMode::Plan) {
-            format!(
-                "{}\n\nYou are in PLAN mode. Do not make any changes. Read the codebase, \
-                 investigate, and produce a concrete plan. Do not call write tools.",
-                chimera_core::agent::DEFAULT_SYSTEM_PROMPT
-            )
-        } else {
-            chimera_core::agent::DEFAULT_SYSTEM_PROMPT.to_string()
-        },
-        temperature: Some(cfg.provider.temperature),
-        max_tokens: Some(cfg.provider.max_tokens),
-    };
-
-    println!("chimera ▸ {} ▸ {}\n", provider.name(), cfg.provider.model);
-    println!("objective: {objective}\n");
-
-    let creature_id = uuid::Uuid::new_v4();
-    let mut saw_text = false;
-    let mut cb = |kind: String, value: serde_json::Value| {
-        if kind == "text" {
-            if let Some(t) = value.as_str() {
-                print!("{t}");
-                use std::io::Write;
-                let _ = std::io::stdout().flush();
-                saw_text = true;
-            }
-        } else if kind == "tool_call" {
-            if saw_text {
-                println!();
-                saw_text = false;
-            }
-            if let Some(name) = value.get("name").and_then(|v| v.as_str()) {
-                eprintln!("  ↳ tool: {name}");
-            }
-        }
-    };
-
-    let result = agent::run_agent_loop(
-        &provider,
-        tools.as_ref(),
-        &cfg.provider.model,
-        &objective,
-        creature_id,
-        &agent_cfg,
-        &tool_defs,
-        &mut cb,
-    )
-    .await
-    .context("agent loop failed")?;
-
-    if saw_text {
-        println!();
-    }
-
-    println!("\n─── run complete ───");
-    println!(
-        "iterations: {}  |  done: {:?}  |  tokens: {}+{}",
-        result.iterations,
-        result.done_reason,
-        result.total_prompt_tokens,
-        result.total_completion_tokens
-    );
-
-    Ok(())
-}
-
-// ===========================================================================
-// Stub handler for non-harness commands
-// ===========================================================================
-
-fn handle_stub(label: &str) {
-    println!("[stub] {label}");
-}
-
-// ===========================================================================
-// Wired command helpers
-// ===========================================================================
-
-/// Resolve the workspace root (current directory).
 fn workspace_root() -> std::path::PathBuf {
     std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
 }
 
-/// `chimera session list` — list persisted sessions from FileSessionStore.
-async fn list_sessions() -> Result<()> {
-    let store = chimera_session::FileSessionStore::new(workspace_root());
-    let ids = store.list().await?;
-    if ids.is_empty() {
-        println!("No sessions found.");
-        return Ok(());
+fn output(format: OutputFormat, value: Value, human: impl AsRef<str>) -> Result<()> {
+    let mut stdout = std::io::stdout().lock();
+    match format {
+        OutputFormat::Json => writeln!(stdout, "{}", serde_json::to_string(&value)?)?,
+        OutputFormat::Human => writeln!(stdout, "{}", human.as_ref())?,
     }
-    println!("Sessions ({}):", ids.len());
-    for id in &ids {
-        match store.load(*id).await {
-            Ok(state) => {
-                println!(
-                    "  {}  {:<20}  objective: {}",
-                    id, state.meta.label, state.meta.objective
-                );
-            }
-            Err(e) => {
-                println!("  {}  [unreadable: {e}]", id);
-            }
+    stdout.flush()?;
+    Ok(())
+}
+
+fn policy(profile: Option<&str>, plan: bool) -> Result<chimera_tools::ToolPolicy> {
+    anyhow::ensure!(matches!(profile, None | Some("supervised") | Some("read-only")),
+        "unknown policy. Choose supervised or read-only with --profile");
+    let saved=chimera_core::approval::PolicyStore::new(workspace_root()).get()?;
+    Ok(if plan || profile == Some("read-only") || saved.read_only { chimera_tools::ToolPolicy::read_only() }
+       else { chimera_tools::ToolPolicy::supervised() })
+}
+
+#[derive(Debug)]
+enum RunEventFlow {
+    Continue,
+    // Keep the reply alive until the caller has polled cancellation through
+    // the session/team. Closing it sooner can look like denial to a worker.
+    Cancelled(Option<tokio::sync::oneshot::Sender<bool>>),
+}
+
+fn retain_cancelled_prompt(flow: RunEventFlow, held: &mut Vec<tokio::sync::oneshot::Sender<bool>>) {
+    if let RunEventFlow::Cancelled(Some(answer)) = flow { held.push(answer); }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PromptDecision { Allow, Deny, Cancel }
+
+fn finish_approval(
+    store: &chimera_core::approval::ApprovalStore,
+    id: uuid::Uuid,
+    answer: tokio::sync::oneshot::Sender<bool>,
+    decision: PromptDecision,
+    cancellation: Option<&tokio::sync::watch::Sender<bool>>,
+) -> Result<RunEventFlow> {
+    if decision == PromptDecision::Cancel {
+        // Set cancellation before dropping the answer channel. A concurrently
+        // running specialist must observe cancellation, not an ordinary denial.
+        if let Some(cancellation) = cancellation { cancellation.send_replace(true); }
+        if cancellation.is_some() {
+            return Ok(RunEventFlow::Cancelled(Some(answer)));
+        }
+        store.cancel(id)?;
+        drop(answer);
+        return Ok(RunEventFlow::Cancelled(None));
+    }
+    let _ = answer.send(decision == PromptDecision::Allow);
+    Ok(RunEventFlow::Continue)
+}
+
+/// Tokio's standard-input adapter owns a blocking worker that cannot be
+/// cancelled. A separate nonblocking terminal descriptor leaves no worker
+/// behind when an approval is interrupted or decided from another process.
+#[cfg(unix)]
+async fn read_prompt_line() -> std::io::Result<String> {
+    use std::os::unix::fs::OpenOptionsExt;
+    #[cfg(any(target_os="macos",target_os="ios",target_os="freebsd",target_os="openbsd",target_os="netbsd",target_os="dragonfly"))]
+    const NONBLOCK:i32=0x4;
+    #[cfg(not(any(target_os="macos",target_os="ios",target_os="freebsd",target_os="openbsd",target_os="netbsd",target_os="dragonfly")))]
+    const NONBLOCK:i32=0x800;
+    let terminal=std::fs::OpenOptions::new().read(true).custom_flags(NONBLOCK).open("/dev/tty")?;
+    read_nonblocking_prompt_line(terminal).await
+}
+
+#[cfg(unix)]
+async fn read_nonblocking_prompt_line(mut terminal: impl std::io::Read) -> std::io::Result<String> {
+    let mut line=Vec::new();
+    loop {
+        // macOS rejects registering /dev/tty with kqueue (and AsyncFd).
+        // A nonblocking read plus a short timer is cancellable on every turn
+        // and preserves the terminal's canonical input, echo and EOF handling.
+        let mut byte=[0u8;1];
+        match terminal.read(&mut byte) {
+            Ok(0) => break,
+            Ok(_) if byte[0]==b'\n' => break,
+            Ok(_) => {
+                if line.len()>=4096 {return Err(std::io::Error::new(std::io::ErrorKind::InvalidData,"approval reply exceeds 4096 bytes"));}
+                line.push(byte[0]);
+            },
+            Err(error) if error.kind()==std::io::ErrorKind::WouldBlock => {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            },
+            Err(error) if error.kind()==std::io::ErrorKind::Interrupted => tokio::task::yield_now().await,
+            Err(error)=>return Err(error),
         }
     }
+    String::from_utf8(line).map_err(|error|std::io::Error::new(std::io::ErrorKind::InvalidData,error))
+}
+
+#[cfg(not(unix))]
+async fn read_prompt_line() -> std::io::Result<String> {
+    Err(std::io::Error::new(std::io::ErrorKind::Unsupported,"interactive approval input is unavailable on this platform; use an exact saved action decision from another process"))
+}
+
+async fn show_run_event(event: RunEvent, format: OutputFormat, cancellation: Option<&tokio::sync::watch::Sender<bool>>) -> Result<RunEventFlow> {
+    match event {
+        RunEvent::Update { kind, value } => match format {
+            OutputFormat::Json => output(format, json!({"event":kind,"value":value}), "")?,
+            OutputFormat::Human => {
+                if kind == "text" { print!("{}", value.as_str().unwrap_or("")); std::io::stdout().flush()?; }
+                else if kind == "tool_call" { eprintln!("\nTool: {}", value["name"].as_str().unwrap_or("unknown")); }
+                else if kind == "tool_result" && value["ok"] == false { eprintln!("Tool failed: {}", value["output"]); }
+            }
+        },
+        RunEvent::Approval { id, call, answer } => {
+            // Register before displaying the prompt, including direct commands
+            // which have no surrounding saved-session signal listener.
+            #[cfg(unix)]
+            let mut interrupts=tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+            let approvals=chimera_core::approval::ApprovalStore::new(workspace_root());
+            if cancellation.is_some_and(|sender| *sender.borrow()) {
+                return finish_approval(&approvals,id,answer,PromptDecision::Cancel,cancellation);
+            }
+            let shown=chimera_core::approval::display_value(serde_json::to_value(&call)?);
+            let decision = if matches!(format, OutputFormat::Human) && std::io::stdin().is_terminal() {
+                eprintln!("\nAction {id}: {} {}\nAllow this exact action once? Type yes or no:", call.tool, shown["args"]);
+                tokio::select! {
+                    biased;
+                    _ = async {
+                        #[cfg(unix)] {let _=interrupts.recv().await;}
+                        #[cfg(not(unix))] {let _=tokio::signal::ctrl_c().await;}
+                    } => PromptDecision::Cancel,
+                    result = read_prompt_line() => if result?.trim() == "yes" {PromptDecision::Allow} else {PromptDecision::Deny},
+                    decision = async {
+                        loop {
+                            if let Ok(row)=chimera_core::approval::ApprovalStore::new(workspace_root()).get(id) {
+                                use chimera_core::approval::Decision;
+                                match row.decision {Decision::Pending=>(),Decision::Approved=>break PromptDecision::Allow,Decision::Cancelled=>break PromptDecision::Cancel,_=>break PromptDecision::Deny}
+                            }
+                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        }
+                    } => decision,
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(300)) => PromptDecision::Deny,
+                }
+            } else if std::env::var("CHIMERA_WAIT_APPROVAL").as_deref()==Ok("1") {
+                output(format,json!({"event":"approval_required","id":id,"call":shown}),format!("Waiting for exact approval {id}; use chimera approve action {id} in this project."))?;
+                return Ok(RunEventFlow::Continue);
+            } else {
+                output(format, json!({"event":"approval_required","id":id,"call":shown,"approved":false}),
+                    "Action denied: use an interactive terminal to review and approve it.")?;
+                PromptDecision::Deny
+            };
+            return finish_approval(&approvals,id,answer,decision,cancellation);
+        }
+    }
+    Ok(RunEventFlow::Continue)
+}
+
+async fn run_objective(objective: String, mode: ExecutionMode, format: OutputFormat, profile: Option<&str>) -> Result<()> {
+    run_objective_with_tools(objective,mode,format,profile,None,None).await
+}
+
+async fn run_objective_with_tools(objective: String, mode: ExecutionMode, format: OutputFormat, profile: Option<&str>,mcp_config:Option<std::path::PathBuf>,world:Option<String>) -> Result<()> {
+    // Install before publishing a session or starting work. Creating the
+    // ctrl_c future inside select leaves a gap before its first poll.
+    #[cfg(unix)]
+    let mut interrupts=tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+    let cfg = Config::load().context("could not load CHIMERA settings")?;
+    cfg.validate_credentials()?;
+    let provider = cfg.build_provider();
+    let tools:Arc<dyn ToolRouter> = Arc::new(chimera_tools::DefaultToolRouter::with_policy(Some(workspace_root()), policy(profile, matches!(mode, ExecutionMode::Plan))?));
+    anyhow::ensure!(world.is_none() || mcp_config.is_none(),"external tool programs cannot attach to an isolated world; run them separately with explicit startup review");
+    let watched_world=world.as_deref().map(uuid::Uuid::parse_str).transpose()?;
+    let tools:Arc<dyn ToolRouter>=if let Some(id)=world {
+        Arc::new(chimera_core::world_tools::WorldTools::with_read_only(Arc::new(chimera_sandbox::LocalWorldManager::new(workspace_root())?),uuid::Uuid::parse_str(&id)?,policy(profile,matches!(mode,ExecutionMode::Plan))?.read_only).await?)
+    } else {tools};
+    let external=if let Some(path)=mcp_config {
+        anyhow::ensure!(!policy(profile,matches!(mode,ExecutionMode::Plan))?.read_only,"read-only execution cannot launch external programs");
+        Some(commands::external_tools(tools.clone(),path,format).await?)
+    } else {None};
+    let tools:Arc<dyn ToolRouter>=external.as_ref().map(|p|p.clone() as Arc<dyn ToolRouter>).unwrap_or(tools);
+    let config = AgentConfig { max_iterations: cfg.agent.max_iterations,
+        temperature: Some(cfg.provider.temperature), max_tokens: Some(cfg.provider.max_tokens), ..Default::default() };
+    let mut session = SavedSession::create(workspace_root(), &objective).await?;
+    output(format, json!({"event":"session","id":session.id,"model":cfg.provider.model,"provider":provider.name()}),
+        format!("Session {} · {} · {}",session.id,provider.name(),cfg.provider.model))?;
+    let (events, mut receive) = chimera_core::runtime::event_channel();
+    let (cancel, cancellation) = tokio::sync::watch::channel(false);
+    // This task also runs while the foreground is waiting for a human reply.
+    // Dropping the guard stops it on every exit, including display errors.
+    struct StopWatcher(Option<tokio::task::JoinHandle<()>>);
+    impl Drop for StopWatcher { fn drop(&mut self) {if let Some(task)=self.0.take(){task.abort();}} }
+    let _watcher=StopWatcher(if let Some(id)=watched_world {
+        let manager=chimera_sandbox::LocalWorldManager::new(workspace_root())?;
+        let cancel=cancel.clone();
+        Some(tokio::spawn(async move {
+            use chimera_sandbox::{WorldManager,WorldStatus};
+            loop {
+                let available=match manager.inspect(id).await {
+                    Ok(state)=>state.status==WorldStatus::Running && state.spec.limits.timeout_secs.is_none_or(|limit| (chrono::Utc::now()-state.created_at).num_seconds()<limit as i64),
+                    Err(_)=>false,
+                };
+                if !available {cancel.send_replace(true);break;}
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        }))
+    } else {None});
+    let mut prompt_cancel=cancel.subscribe();
+    let mut cancelled_prompts=Vec::new();
+    let result = {
+        let run = session.run(&provider, tools, &cfg.provider.model, &objective, &config, chimera_core::runtime::RunChannels { events, cancellation });
+        tokio::pin!(run);
+        let result = loop {
+            tokio::select! {
+                result = &mut run => break result,
+                Some(event) = receive.recv() => {
+                    tokio::select! {
+                        result=show_run_event(event, format, Some(&cancel))=>retain_cancelled_prompt(result?,&mut cancelled_prompts),
+                        _=async {if !*prompt_cancel.borrow(){let _=prompt_cancel.changed().await;}}=>(),
+                    }
+                },
+                _ = async {
+                    #[cfg(unix)]
+                    {let _=interrupts.recv().await;}
+                    #[cfg(not(unix))]
+                    {let _=tokio::signal::ctrl_c().await;}
+                } => { cancel.send_replace(true); }
+            }
+        };
+        while let Ok(event) = receive.try_recv() { retain_cancelled_prompt(show_run_event(event, format, Some(&cancel)).await?,&mut cancelled_prompts); }
+        result
+    };
+    if let Some(external)=external {external.shutdown().await?;}
+    let result=result?;
+    let success = matches!(result.done_reason, DoneReason::FinalAnswer);
+    let message = match result.done_reason {
+        DoneReason::FinalAnswer => format!("\nAnswer saved to session {}.", session.id),
+        DoneReason::MaxIterations => "Work limit reached. The request is unfinished; progress was saved.".into(),
+        DoneReason::Error => result.error.clone().unwrap_or_else(|| "Run failed; progress was saved.".into()),
+    };
+    output(format, json!({"event":"result","session":session.id,"success":success,"result":result}), &message)?;
+    anyhow::ensure!(success, "{message}");
     Ok(())
 }
 
-/// `chimera session fork <id>` — fork a session into a new lineage.
-async fn fork_session(session_id: String) -> Result<()> {
-    let id = uuid::Uuid::parse_str(&session_id)
-        .with_context(|| format!("invalid session id: {session_id}"))?;
+async fn select_session(store: &chimera_session::FileSessionStore, selected: Option<String>) -> Result<uuid::Uuid> {
+    if let Some(id) = selected { return uuid::Uuid::parse_str(&id).context("invalid session identifier"); }
+    let mut latest = None;
+    for id in store.list().await? {
+        let state=store.load(id).await?;
+        if latest.as_ref().is_none_or(|(date,_)|state.meta.created_at > *date) { latest=Some((state.meta.created_at,id)); }
+    }
+    latest.map(|(_,id)|id).context("no saved session; run a request first or specify --session")
+}
+
+async fn dispatch_with_options(cmd: Command, format: OutputFormat, profile: Option<String>) -> Result<()> {
+    let effective = policy(profile.as_deref(), false)?;
     let store = chimera_session::FileSessionStore::new(workspace_root());
-    let child = store.fork(id).await?;
-    println!("Forked {id} → {child}");
-    Ok(())
-}
-
-/// `chimera tool list` — list registered tools from DefaultToolRouter.
-async fn list_tools() -> Result<()> {
-    let router = build_tool_router(Some(workspace_root()));
-    let descs = router.list().await?;
-    println!("Tools ({}):", descs.len());
-    for d in &descs {
-        let ro = if d.read_only { "ro" } else { "rw" };
-        println!("  {:<14} [{:<3}] {}", d.name, ro, d.description);
-    }
-    Ok(())
-}
-
-/// `chimera tool inspect <name>` — show a single tool's descriptor.
-async fn inspect_tool(name: String) -> Result<()> {
-    let router = build_tool_router(Some(workspace_root()));
-    let descs = router.list().await?;
-    let d = descs
-        .into_iter()
-        .find(|d| d.name == name)
-        .ok_or_else(|| anyhow::anyhow!("unknown tool: {name}"))?;
-    println!("name:        {}", d.name);
-    println!("description: {}", d.description);
-    println!("read_only:   {}", d.read_only);
-    println!("category:    {:?}", d.category);
-    Ok(())
-}
-
-/// `chimera tool healthcheck <name>` — check a tool is registered.
-async fn healthcheck_tool(name: String) -> Result<()> {
-    let router = build_tool_router(Some(workspace_root()));
-    let ok = router.healthcheck(&name).await?;
-    println!("{}: {}", name, if ok { "healthy" } else { "missing" });
-    Ok(())
-}
-
-/// `chimera creature list` — list builtin creature specs.
-async fn list_creatures() -> Result<()> {
-    let registry = chimera_core::BuiltinCreatureRegistry;
-    let specs = registry.builtin();
-    println!("Creatures ({}):", specs.len());
-    for c in &specs {
-        println!(
-            "  {:<12} {:<10} autonomy={:?} temperament={:?}",
-            c.name, c.role, c.autonomy, c.temperament
-        );
-    }
-    Ok(())
-}
-
-/// `chimera trace export <session_id>` — dump a session's trace JSONL to stdout.
-async fn export_trace(session_id: String) -> Result<()> {
-    let id = uuid::Uuid::parse_str(&session_id)
-        .with_context(|| format!("invalid session id: {session_id}"))?;
-    let sink = chimera_trace::FileTraceSink::new(workspace_root());
-    let events = sink.query(id).await?;
-    if events.is_empty() {
-        println!("No trace events for session {id}.");
-        return Ok(());
-    }
-    println!("Trace for {id} ({} events):", events.len());
-    for e in &events {
-        println!(
-            "[{}] {:<5} {:<24} {}",
-            e.timestamp.format("%H:%M:%S%.3f"),
-            format!("{:?}", e.level).to_lowercase(),
-            e.span,
-            e.message
-        );
-    }
-    Ok(())
-}
-
-// ===========================================================================
-// Async command dispatch
-// ===========================================================================
-
-async fn dispatch(cmd: Command) -> Result<()> {
+    let router = chimera_tools::DefaultToolRouter::with_policy(Some(workspace_root()), effective.clone());
     match cmd {
-        // Bootstrap & lifecycle
-        Command::Init => handle_stub("chimera init"),
-        Command::Up => handle_stub("chimera up"),
-        Command::Down => handle_stub("chimera down"),
-        Command::Doctor => handle_stub("chimera doctor"),
-        Command::Status => handle_stub("chimera status"),
-        Command::Daemon { cmd } => match cmd {
-            DaemonCmd::Start => handle_stub("daemon start"),
-            DaemonCmd::Stop => handle_stub("daemon stop"),
-        },
-
-        // Objective execution — wired to Harness
-        Command::Run { objective, interactive } => {
+        Command::Init => {
+            let path = chimera_config::init_config()?;
+            output(format, json!({"config":path}), format!("Settings: {}. Set your model address and name before running a task.",path.display()))
+        }
+        Command::Doctor => {
+            let config = Config::load()?;
+            config.validate_credentials()?;
+            let sessions = store.list().await?;
+            for id in &sessions { store.load(*id).await?; }
+            let tools = router.list().await?;
+            output(format, json!({"settings":"valid","model":config.provider.model,"provider":config.provider.name,"sessions":sessions.len(),"tools":tools,"connection_tested":false}),
+                format!("Settings valid. Model: {}. {} saved conversations readable; {} tools registered. Model connection has not been tested; use a small run to check it.",config.provider.model,sessions.len(),tools.len()))
+        }
+        Command::Status => {
+            let sessions = store.list().await?;
+            output(format, json!({"version":env!("CARGO_PKG_VERSION"),"workspace":workspace_root(),"sessions":sessions,"policy":if effective.read_only {"read-only"} else {"supervised"}}),
+                format!("CHIMERA {}\nWorkspace: {}\nSaved conversations: {}\nPolicy: {}",env!("CARGO_PKG_VERSION"),workspace_root().display(),sessions.len(),if effective.read_only {"read-only"} else {"supervised"}))
+        }
+        Command::Run { objective, interactive, mcp_config, world } => {
             if interactive {
-                return chimera_tui::runner::run_interactive(Some(objective)).await;
-            }
-            return run_objective(objective, ExecutionMode::Run).await;
+                anyhow::ensure!(mcp_config.is_none() && world.is_none(),"external tools and saved environments currently use ordinary terminal run; omit --interactive");
+                anyhow::ensure!(matches!(format, OutputFormat::Human), "the interactive screen requires --format human");
+                chimera_tui::runner::run_saved_interactive(Some(objective), None, profile).await
+            } else { run_objective_with_tools(objective, ExecutionMode::Run, format, profile.as_deref(),mcp_config,world).await }
         }
-        Command::Plan { objective } => return run_objective(objective, ExecutionMode::Plan).await,
-        Command::Swarm { objective } => return run_objective(objective, ExecutionMode::Swarm).await,
-        Command::Pack { name } => handle_stub(&format!("pack: {name}")),
+        Command::Plan { objective } => run_objective(objective, ExecutionMode::Plan, format, profile.as_deref()).await,
         Command::Tui { objective } => {
-            return chimera_tui::runner::run_interactive(objective).await;
+            anyhow::ensure!(matches!(format, OutputFormat::Human), "the interactive screen requires --format human");
+            chimera_tui::runner::run_saved_interactive(objective, None, profile).await
         }
-
-        // Session control
-        // Session control — wired to FileSessionStore
-        Command::Session { cmd } => match cmd {
-            SessionCmd::List => return list_sessions().await,
-            SessionCmd::Resume { session_id } => {
-                println!("[info] resume is implicit; sessions are stateless files. {session_id}");
+        Command::Session { cmd: SessionCmd::List } => {
+            let mut rows = Vec::new();
+            for id in store.list().await? {
+                let state = store.load(id).await?;
+                rows.push(json!({"id":id,"label":state.meta.label,"objective":state.meta.objective,"active":state.active}));
             }
-            SessionCmd::Fork { session_id } => return fork_session(session_id).await,
-        },
-        Command::Checkpoint { cmd } => match cmd {
-            CheckpointCmd::Create => handle_stub("checkpoint create"),
-            CheckpointCmd::List => handle_stub("checkpoint list"),
-        },
-        Command::Rollback { checkpoint_id } => handle_stub(&format!("rollback {checkpoint_id}")),
-        Command::Replay { session_id } => handle_stub(&format!("replay {session_id}")),
-
-        // Creature control — wired to BuiltinCreatureRegistry
-        Command::Creature { cmd } => match cmd {
-            CreatureCmd::List => return list_creatures().await,
-            CreatureCmd::Spawn { name, count } => {
-                println!("[info] creature spawn: {name} x{count} (runtime spawning not yet implemented)");
-            }
-            CreatureCmd::Inspect { instance } => {
-                println!("[info] creature inspect: {instance} (runtime registry not yet implemented)");
-            }
-            CreatureCmd::Stop { instance } => println!("[info] creature stop: {instance}"),
-            CreatureCmd::Promote { instance } => println!("[info] creature promote: {instance}"),
-            CreatureCmd::Leash { instance } => println!("[info] creature leash: {instance}"),
-        },
-
-        // Tool control — wired to DefaultToolRouter
-        Command::Tool { cmd } => match cmd {
-            ToolCmd::List => return list_tools().await,
-            ToolCmd::Inspect { name } => return inspect_tool(name).await,
-            ToolCmd::Healthcheck { name } => return healthcheck_tool(name).await,
-            ToolCmd::Test { name } => println!("[info] tool test: {name} (no dry-run backend)"),
-            ToolCmd::Disable { name } => println!("[info] tool disable: {name} (not yet persisted)"),
-        },
-
-        // World control
-        Command::World { cmd } => match cmd {
-            WorldCmd::List => handle_stub("world list"),
-            WorldCmd::Spawn { kind } => handle_stub(&format!("world spawn {kind}")),
-        },
-        Command::Browser { cmd } => match cmd {
-            BrowserCmd::Open { target } => handle_stub(&format!("browser open {target}")),
-        },
-        Command::Phone { cmd } => match cmd {
-            PhoneCmd::Boot { device } => handle_stub(&format!("phone boot {device}")),
-        },
-
-        // Policy & approvals
-        Command::Approve { cmd } => match cmd {
-            ApproveCmd::Next => handle_stub("approve next"),
-            ApproveCmd::Plan => handle_stub("approve plan"),
-        },
-        Command::Deny { call_id } => handle_stub(&format!("deny {call_id}")),
-        Command::Policy { cmd } => match cmd {
-            PolicyCmd::Show => handle_stub("policy show"),
-            PolicyCmd::Edit => handle_stub("policy edit"),
-        },
-        Command::Autonomy { cmd } => match cmd {
-            AutonomyCmd::Set { level } => handle_stub(&format!("autonomy set {level}")),
-        },
-        Command::Leash { target } => handle_stub(&format!("leash {target}")),
-
-        // Trace & eval — trace wired to FileTraceSink
-        Command::Trace { cmd } => match cmd {
-            TraceCmd::Live => println!("[info] trace live: use the TUI (chimera tui) for live traces"),
-            TraceCmd::Show { task_id } => println!("[info] trace show {task_id}: per-task traces not yet indexed"),
-            TraceCmd::Export { session_id } => return export_trace(session_id).await,
-        },
-        Command::Eval { cmd } => match cmd {
-            EvalCmd::Run { name } => handle_stub(&format!("eval run {name}")),
-            EvalCmd::Compare { checkpoint_a, checkpoint_b } => {
-                handle_stub(&format!("eval compare {checkpoint_a} {checkpoint_b}"))
-            }
-        },
-
-        // Memory & skills
-        Command::Memory { cmd } => match cmd {
-            MemoryCmd::List => handle_stub("memory list"),
-            MemoryCmd::Show { episode_id } => handle_stub(&format!("memory show {episode_id}")),
-        },
-        Command::Skill { cmd } => match cmd {
-            SkillCmd::List => handle_stub("skill list"),
-            SkillCmd::Inspect { name } => handle_stub(&format!("skill inspect {name}")),
-            SkillCmd::Run { name } => handle_stub(&format!("skill run {name}")),
-        },
-
-        // Durable jobs
-        Command::Schedule { frequency, objective } => {
-            handle_stub(&format!("schedule {frequency}: {objective}"))
+            output(format, json!({"sessions":rows}), rows.iter().map(|row|format!("{}  {}",row["id"].as_str().unwrap_or(""),row["objective"].as_str().unwrap_or(""))).collect::<Vec<_>>().join("\n"))
         }
-        Command::Watch { objective } => handle_stub(&format!("watch: {objective}")),
+        Command::Session { cmd: SessionCmd::Fork { session_id } } => {
+            let parent = uuid::Uuid::parse_str(&session_id).context("invalid session identifier")?;
+            let child = store.fork(parent).await?;
+            output(format, json!({"parent":parent,"session":child}), format!("Forked {parent} into {child}"))
+        }
+        Command::Session { cmd: SessionCmd::Resume { session_id } } => {
+            let id = uuid::Uuid::parse_str(&session_id).context("invalid session identifier")?;
+            anyhow::ensure!(matches!(format, OutputFormat::Human), "resume opens the terminal screen; use --format human");
+            chimera_tui::runner::run_saved_interactive(None, Some(id), profile).await
+        }
+        Command::Session { cmd: SessionCmd::Export { session_id } } | Command::Trace { cmd: TraceCmd::Export { session_id } } => {
+            let id = uuid::Uuid::parse_str(&session_id).context("invalid session identifier")?;
+            // Export is always machine-readable, with secrets removed.
+            println!("{}", serde_json::to_string(&store.export_redacted(id).await?)?);
+            Ok(())
+        }
+        Command::Replay { session_id } | Command::Trace { cmd: TraceCmd::Show {task_id:session_id} } => {
+            let state=store.load(uuid::Uuid::parse_str(&session_id)?).await?;
+            let events=state.effective_events()?;
+            let messages=events.iter().rev().find_map(|event|match event {chimera_session::SessionEvent::Custom {key,payload} if key=="messages"=>Some(payload.clone()),_=>None}).unwrap_or(json!([]));
+            let human=messages.as_array().context("saved messages are damaged")?.iter().map(|m|format!("{}: {}",m["role"].as_str().unwrap_or("event"),m["content"].as_str().unwrap_or("[tool call]"))).collect::<Vec<_>>().join("\n\n");
+            output(format,json!({"session":state.id,"messages":messages,"executes_tools":false}),human)
+        }
+        Command::Session { cmd: SessionCmd::Recover { session_id } } => {
+            let id = uuid::Uuid::parse_str(&session_id).context("invalid session identifier")?;
+            let state = store.recover_previous(id).await?;
+            output(format,json!({"session":state.id,"recovered":true}),format!("Recovered previous record for {}. The damaged record was preserved.",state.id))
+        }
+        Command::Checkpoint { cmd: CheckpointCmd::Create { session, files } } => {
+            let id = select_session(&store, session).await?;
+            let checkpoint = store.checkpoint_with_files(id,&files).await?;
+            output(format,json!({"session":id,"checkpoint":checkpoint,"files":files}),format!("Checkpoint {checkpoint} saved for session {id}; {} selected files captured.",files.len()))
+        }
+        Command::Checkpoint { cmd: CheckpointCmd::List } => {
+            let mut rows = Vec::new();
+            for id in store.list().await? {
+                for checkpoint in store.load(id).await?.checkpoints {
+                    rows.push(json!({"session":id,"checkpoint":checkpoint}));
+                }
+            }
+            output(format,json!({"checkpoints":rows}),rows.iter().map(|row|format!("{}  session {}",row["checkpoint"],row["session"])).collect::<Vec<_>>().join("\n"))
+        }
+        Command::Rollback { checkpoint_id } => {
+            anyhow::ensure!(!effective.read_only,"read-only policy does not allow restoring files");
+            let checkpoint = uuid::Uuid::parse_str(&checkpoint_id).context("invalid checkpoint identifier")?;
+            let mut owner = None;
+            for id in store.list().await? { if store.load(id).await?.checkpoints.contains(&checkpoint) { owner = Some(id); break; } }
+            let id = owner.context("checkpoint was not found in this project")?;
+            let preview = store.preview_restore(id,checkpoint).await?;
+            if !preview.restored_files.is_empty() {
+                anyhow::ensure!(matches!(format,OutputFormat::Human) && std::io::stdin().is_terminal(),"restoring files requires an interactive terminal to review the current files");
+                #[cfg(unix)]
+                let mut interrupts=tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+                eprintln!("Restore these files from checkpoint {checkpoint}: {}\nCurrent versions will be preserved. Type yes to restore, or no to leave them unchanged:",preview.restored_files.iter().map(|f|f.path.display().to_string()).collect::<Vec<_>>().join(", "));
+                let line=tokio::select! {
+                    biased;
+                    _=async {
+                        #[cfg(unix)] {let _=interrupts.recv().await;}
+                        #[cfg(not(unix))] {let _=tokio::signal::ctrl_c().await;}
+                    }=>anyhow::bail!("restore cancelled; nothing changed"),
+                    result=read_prompt_line()=>result?,
+                    _=tokio::time::sleep(std::time::Duration::from_secs(300))=>anyhow::bail!("restore approval expired; nothing changed"),
+                };
+                anyhow::ensure!(line.trim()=="yes","restore cancelled; nothing changed");
+            }
+            store.restore_checkpoint(id,checkpoint,&preview.current_files).await?;
+            output(format,json!({"session":id,"restored_checkpoint":checkpoint}),format!("Restored checkpoint {checkpoint} for session {id}. Previous file versions and history were preserved."))
+        }
+        Command::Tool { cmd: ToolCmd::List } => {
+            let tools = router.list().await?;
+            output(format, json!({"tools":tools}), tools.iter().map(|t| format!("{}: {}",t.name,t.description)).collect::<Vec<_>>().join("\n"))
+        }
+        Command::Tool { cmd: ToolCmd::Inspect { name } } => {
+            let tool = router.list().await?.into_iter().find(|tool|tool.name==name).with_context(||format!("unknown tool: {name}"))?;
+            output(format, json!(tool), format!("{}: {}\nRead only: {}",tool.name,tool.description,tool.read_only))
+        }
+        Command::Tool { cmd: ToolCmd::Healthcheck { name } } => {
+            anyhow::ensure!(router.healthcheck(&name).await?, "unknown or unavailable tool: {name}");
+            output(format, json!({"tool":name,"registered":true}), format!("{name}: registered. Execution requires a permitted call."))
+        }
+        Command::Policy { cmd: PolicyCmd::Show } => {
+            let saved=chimera_core::approval::PolicyStore::new(workspace_root()).get()?;
+            output(format, json!({"saved":saved,"effective_read_only":effective.read_only,"writes_require_exact_approval":true,"network":false}),
+                format!("Read only: {}. Action review: {}. Disabled tools: {}. Changes and shell commands always require exact approval.",effective.read_only,saved.autonomy,saved.disabled_tools.iter().cloned().collect::<Vec<_>>().join(", ")))
+        }
+        other => commands::execute(other, format, profile).await,
     }
-
-    Ok(())
 }
 
-// ===========================================================================
-// Main
-// ===========================================================================
+#[cfg(test)]
+async fn dispatch(cmd: Command) -> Result<()> { dispatch_with_options(cmd, OutputFormat::Human, None).await }
+
+fn console_log_filter(command: &Command, verbose: bool) -> &'static str {
+    // Fullscreen requests already show and save their errors through RunEvent.
+    // A console log writes outside Ratatui's screen buffer and corrupts it.
+    // Startup/final errors are still printed by main after terminal restoration.
+    if matches!(command, Command::Tui { .. } | Command::Run { interactive:true, .. }
+        | Command::Session { cmd:SessionCmd::Resume { .. } }) { "off" }
+    else if verbose { "debug" } else { "warn" }
+}
 
 #[tokio::main]
-async fn main() -> Result<()> {
-    // Initialize tracing subscriber
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
-
+async fn main() -> std::process::ExitCode {
     let cli = Cli::parse();
-
-    if cli.verbose {
-        tracing::info!("verbose mode enabled");
+    tracing_subscriber::fmt().with_writer(std::io::stderr)
+        .with_env_filter(console_log_filter(&cli.command,cli.verbose)).init();
+    match dispatch_with_options(cli.command, cli.format, cli.profile).await {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(error) => {
+            match cli.format {
+                OutputFormat::Json => println!("{}",json!({"success":false,"error":format!("{error:#}")})),
+                OutputFormat::Human => eprintln!("Error: {error:#}"),
+            }
+            std::process::ExitCode::FAILURE
+        }
     }
-
-    dispatch(cli.command).await
 }
 
 #[cfg(test)]
@@ -866,6 +997,38 @@ mod tests {
 
     fn parse(args: &[&str]) -> Cli {
         Cli::parse_from(std::iter::once("chimera").chain(args.iter().copied()))
+    }
+
+    #[test]
+    fn console_logs_do_not_overwrite_fullscreen_entrypoints() {
+        use std::sync::{Arc,Mutex};
+        #[derive(Clone)]
+        struct Capture(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Capture {
+            fn write(&mut self,bytes:&[u8])->std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);Ok(bytes.len())
+            }
+            fn flush(&mut self)->std::io::Result<()> {Ok(())}
+        }
+        for args in [vec!["tui"],vec!["run","--interactive","test"],vec!["session","resume","saved-id"],vec!["run","test"],vec!["plan","test"],vec!["session","list"]] {
+            for verbose in [false,true] {
+                let cli=parse(&args);
+                let fullscreen=args==["tui"] || args.contains(&"--interactive") || args.contains(&"resume");
+                let captured=Capture(Arc::default());let writer=captured.clone();
+                let subscriber=tracing_subscriber::fmt().without_time().with_ansi(false)
+                    .with_writer(move||writer.clone()).with_env_filter(console_log_filter(&cli.command,verbose)).finish();
+                tracing::subscriber::with_default(subscriber,|| {
+                    tracing::warn!(error="controlled provider error", "provider request failed");
+                    tracing::debug!("controlled diagnostic detail");
+                });
+                let output=String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+                if fullscreen {assert!(output.is_empty(),"fullscreen {args:?} wrote {output:?}");}
+                else {
+                    assert!(output.contains("controlled provider error"),"ordinary command lost warning: {args:?}");
+                    assert_eq!(output.contains("controlled diagnostic detail"),verbose);
+                }
+            }
+        }
     }
 
     #[test]
@@ -894,7 +1057,7 @@ mod tests {
     fn parse_run_plan_swarm() {
         let cli = parse(&["run", "fix auth"]);
         match cli.command {
-            Command::Run { objective, interactive: _ } => assert_eq!(objective, "fix auth"),
+            Command::Run { objective, .. } => assert_eq!(objective, "fix auth"),
             _ => panic!("expected run"),
         }
         let cli = parse(&["plan", "migrate db"]);
@@ -913,7 +1076,7 @@ mod tests {
     fn parse_pack() {
         let cli = parse(&["pack", "ship-hotfix"]);
         match cli.command {
-            Command::Pack { name } => assert_eq!(name, "ship-hotfix"),
+            Command::Pack { name, .. } => assert_eq!(name, "ship-hotfix"),
             _ => panic!("expected pack"),
         }
     }
@@ -933,7 +1096,7 @@ mod tests {
 
     #[test]
     fn parse_checkpoint_rollback_replay() {
-        assert!(matches!(parse(&["checkpoint", "create"]).command, Command::Checkpoint { cmd: CheckpointCmd::Create }));
+        assert!(matches!(parse(&["checkpoint", "create"]).command, Command::Checkpoint { cmd: CheckpointCmd::Create { .. } }));
         assert!(matches!(parse(&["checkpoint", "list"]).command, Command::Checkpoint { cmd: CheckpointCmd::List }));
         match parse(&["rollback", "cp-1"]).command {
             Command::Rollback { checkpoint_id } => assert_eq!(checkpoint_id, "cp-1"),
@@ -949,7 +1112,7 @@ mod tests {
     fn parse_creature_commands() {
         assert!(matches!(parse(&["creature", "list"]).command, Command::Creature { cmd: CreatureCmd::List }));
         match parse(&["creature", "spawn", "raven", "--count", "3"]).command {
-            Command::Creature { cmd: CreatureCmd::Spawn { name, count } } => {
+            Command::Creature { cmd: CreatureCmd::Spawn { name, count, .. } } => {
                 assert_eq!(name, "raven");
                 assert_eq!(count, 3);
             }
@@ -1002,11 +1165,11 @@ mod tests {
             _ => panic!("expected spawn"),
         }
         match parse(&["browser", "open", "staging"]).command {
-            Command::Browser { cmd: BrowserCmd::Open { target } } => assert_eq!(target, "staging"),
+            Command::Browser { cmd: BrowserCmd::Open { target, .. } } => assert_eq!(target, "staging"),
             _ => panic!("expected open"),
         }
-        match parse(&["phone", "boot", "pixel8"]).command {
-            Command::Phone { cmd: PhoneCmd::Boot { device } } => assert_eq!(device, "pixel8"),
+        match parse(&["phone", "boot", "pixel8", "--app", "app.apk", "--package", "com.example.app"]).command {
+            Command::Phone { cmd: PhoneCmd::Boot { device, .. } } => assert_eq!(device, "pixel8"),
             _ => panic!("expected boot"),
         }
     }
@@ -1083,7 +1246,7 @@ mod tests {
             _ => panic!("expected schedule"),
         }
         match parse(&["watch", "monitor logs"]).command {
-            Command::Watch { objective } => assert_eq!(objective, "monitor logs"),
+            Command::Watch { objective, .. } => assert_eq!(objective, "monitor logs"),
             _ => panic!("expected watch"),
         }
     }
@@ -1096,111 +1259,126 @@ mod tests {
         assert_eq!(cli.profile, Some("strict".into()));
     }
 
-    // ── Dispatch tests ───────────────────────────────────────────
-
     #[tokio::test]
-    async fn dispatch_stub_commands() {
-        // Test a representative sample of stub-dispatched commands
-        dispatch(Command::Init).await.unwrap();
-        dispatch(Command::Up).await.unwrap();
-        dispatch(Command::Down).await.unwrap();
-        dispatch(Command::Doctor).await.unwrap();
-        dispatch(Command::Status).await.unwrap();
-        dispatch(Command::Daemon { cmd: DaemonCmd::Start }).await.unwrap();
-        dispatch(Command::Daemon { cmd: DaemonCmd::Stop }).await.unwrap();
-        dispatch(Command::Pack { name: "test".into() }).await.unwrap();
-        dispatch(Command::Session { cmd: SessionCmd::List }).await.unwrap();
-        dispatch(Command::Session { cmd: SessionCmd::Resume { session_id: "s1".into() } }).await.unwrap();
-        // Fork of a non-existent session returns an error (expected); only assert it doesn't panic unexpectedly.
-        let _ = dispatch(Command::Session { cmd: SessionCmd::Fork { session_id: "00000000-0000-0000-0000-000000000001".into() } }).await;
-        dispatch(Command::Checkpoint { cmd: CheckpointCmd::Create }).await.unwrap();
-        dispatch(Command::Checkpoint { cmd: CheckpointCmd::List }).await.unwrap();
-        dispatch(Command::Rollback { checkpoint_id: "cp1".into() }).await.unwrap();
-        dispatch(Command::Replay { session_id: "s1".into() }).await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn dispatch_creature_commands() {
-        dispatch(Command::Creature { cmd: CreatureCmd::List }).await.unwrap();
-        dispatch(Command::Creature { cmd: CreatureCmd::Spawn { name: "raven".into(), count: 2 } }).await.unwrap();
-        dispatch(Command::Creature { cmd: CreatureCmd::Inspect { instance: "m-1".into() } }).await.unwrap();
-        dispatch(Command::Creature { cmd: CreatureCmd::Stop { instance: "m-1".into() } }).await.unwrap();
-        dispatch(Command::Creature { cmd: CreatureCmd::Promote { instance: "m-1".into() } }).await.unwrap();
-        dispatch(Command::Creature { cmd: CreatureCmd::Leash { instance: "m-1".into() } }).await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn dispatch_tool_world_browser_phone() {
-        dispatch(Command::Tool { cmd: ToolCmd::List }).await.unwrap();
-        dispatch(Command::Tool { cmd: ToolCmd::Inspect { name: "bash".into() } }).await.unwrap();
-        dispatch(Command::Tool { cmd: ToolCmd::Healthcheck { name: "mcp".into() } }).await.unwrap();
-        dispatch(Command::Tool { cmd: ToolCmd::Test { name: "git".into() } }).await.unwrap();
-        dispatch(Command::Tool { cmd: ToolCmd::Disable { name: "comms".into() } }).await.unwrap();
-        dispatch(Command::World { cmd: WorldCmd::List }).await.unwrap();
-        dispatch(Command::World { cmd: WorldCmd::Spawn { kind: "vm".into() } }).await.unwrap();
-        dispatch(Command::Browser { cmd: BrowserCmd::Open { target: "staging".into() } }).await.unwrap();
-        dispatch(Command::Phone { cmd: PhoneCmd::Boot { device: "pixel8".into() } }).await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn dispatch_policy_trace_eval_memory_skill() {
-        dispatch(Command::Approve { cmd: ApproveCmd::Next }).await.unwrap();
-        dispatch(Command::Approve { cmd: ApproveCmd::Plan }).await.unwrap();
-        dispatch(Command::Deny { call_id: "4".into() }).await.unwrap();
-        dispatch(Command::Policy { cmd: PolicyCmd::Show }).await.unwrap();
-        dispatch(Command::Policy { cmd: PolicyCmd::Edit }).await.unwrap();
-        dispatch(Command::Autonomy { cmd: AutonomyCmd::Set { level: "low".into() } }).await.unwrap();
-        dispatch(Command::Leash { target: "all".into() }).await.unwrap();
-        dispatch(Command::Trace { cmd: TraceCmd::Live }).await.unwrap();
-        dispatch(Command::Trace { cmd: TraceCmd::Show { task_id: "t1".into() } }).await.unwrap();
-        dispatch(Command::Trace { cmd: TraceCmd::Export { session_id: "00000000-0000-0000-0000-000000000002".into() } }).await.unwrap();
-        dispatch(Command::Eval { cmd: EvalCmd::Run { name: "auth".into() } }).await.unwrap();
-        dispatch(Command::Eval { cmd: EvalCmd::Compare { checkpoint_a: "a".into(), checkpoint_b: "b".into() } }).await.unwrap();
-        dispatch(Command::Memory { cmd: MemoryCmd::List }).await.unwrap();
-        dispatch(Command::Memory { cmd: MemoryCmd::Show { episode_id: "e1".into() } }).await.unwrap();
-        dispatch(Command::Skill { cmd: SkillCmd::List }).await.unwrap();
-        dispatch(Command::Skill { cmd: SkillCmd::Inspect { name: "hotfix".into() } }).await.unwrap();
-        dispatch(Command::Skill { cmd: SkillCmd::Run { name: "hotfix".into() } }).await.unwrap();
-        dispatch(Command::Schedule { frequency: "daily".into(), objective: "check".into() }).await.unwrap();
-        dispatch(Command::Watch { objective: "monitor".into() }).await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn dispatch_run_objective_config_gating_and_local_path() {
-        // Sequence the env-dependent cases in one test to avoid parallel
-        // env races between sibling tests.
-        // Case 1: no key + non-local URL => config error.
-        unsafe {
-            std::env::remove_var("CHIMERA_API_KEY");
-            std::env::remove_var("OPENAI_API_KEY");
-            std::env::set_var("CHIMERA_BASE_URL", "https://api.openai.com/v1");
+    async fn unfinished_commands_and_missing_tools_fail() {
+        for command in [Command::Pack{name:"missing".into(),objective:None,definition:None},Command::Tool{cmd:ToolCmd::Healthcheck{name:"does-not-exist".into()}}] {
+            assert!(dispatch(command).await.is_err());
         }
-        let res = dispatch(Command::Run { objective: "test".into(), interactive: false }).await;
-        assert!(res.is_err(), "expected config-gate error without key");
-        let msg = format!("{}", res.unwrap_err());
-        assert!(
-            msg.contains("API key") || msg.contains("no API key"),
-            "unexpected error: {msg}"
-        );
-
-        // Case 2: localhost URL skips gate; agent loop runs and captures the
-        // (failed) connection into an Ok result.
-        unsafe {
-            std::env::set_var("CHIMERA_BASE_URL", "http://127.0.0.1:9999/v1");
-            std::env::set_var("CHIMERA_MODEL", "test-model");
-        }
-        let res = dispatch(Command::Run { objective: "test".into(), interactive: false }).await;
-        unsafe {
-            std::env::remove_var("CHIMERA_BASE_URL");
-            std::env::remove_var("CHIMERA_MODEL");
-        }
-        assert!(res.is_ok(), "expected Ok with captured error in result");
     }
-
-    // ── build_harness ────────────────────────────────────────────
 
     #[test]
-    fn build_harness_succeeds() {
-        let _harness = build_harness();
+    fn invalid_policy_cannot_silently_select_another_policy() {
+        assert!(policy(Some("strict"),false).is_err());
+        assert!(policy(Some("supervised"),true).unwrap().read_only);
+        assert!(policy(Some("read-only"),false).unwrap().read_only);
+    }
+
+    fn prompt_test_root()->std::path::PathBuf {
+        let root=std::env::temp_dir().join(format!("chimera-prompt-order-{}",uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();root
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn prompt_reader_accepts_yes_after_waiting_without_executing_an_action() {
+        use std::{io::Write,os::unix::net::UnixStream};
+        let (input,mut writer)=UnixStream::pair().unwrap();
+        input.set_nonblocking(true).unwrap();
+        let write=async {
+            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+            writer.write_all(b"yes\n").unwrap();
+        };
+        let read=read_nonblocking_prompt_line(input);
+        let ((),line)=tokio::time::timeout(std::time::Duration::from_secs(1),async {tokio::join!(write,read)}).await.unwrap();
+        assert_eq!(line.unwrap(),"yes");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn prompt_reader_cancellation_closes_input_without_a_blocking_worker() {
+        use std::{io::Read,os::unix::net::UnixStream};
+        let (input,mut writer)=UnixStream::pair().unwrap();
+        input.set_nonblocking(true).unwrap();writer.set_nonblocking(true).unwrap();
+        assert!(tokio::time::timeout(std::time::Duration::from_millis(30),read_nonblocking_prompt_line(input)).await.is_err());
+        assert_eq!(writer.read(&mut [0]).unwrap(),0,"cancelled input descriptor must close immediately");
+    }
+
+    struct PromptModel;
+    #[async_trait::async_trait]
+    impl LlmProvider for PromptModel {
+        fn name(&self)->&str {"controlled-approval-order"}
+        async fn complete(&self,request:&chimera_llm::CompletionRequest)->std::result::Result<chimera_llm::CompletionResponse,chimera_llm::LlmError> {
+            assert_ne!(request.messages.last().unwrap().role,chimera_llm::Role::Tool,"denied or cancelled action must not request another model response");
+            Ok(chimera_llm::CompletionResponse {content:None,tool_calls:vec![chimera_llm::ToolCall{id:"review-write".into(),kind:"function".into(),function:chimera_llm::FunctionCall{name:"write_file".into(),arguments:json!({"path":"effect.txt","content":"must not happen"}).to_string()}}],finish_reason:Some("tool_calls".into()),usage:None})
+        }
+    }
+
+    #[tokio::test]
+    async fn prompt_cancel_preserves_session_cancellation_while_no_remains_denial() {
+        use chimera_core::approval::{ApprovalStore,Decision};
+        for decision in [PromptDecision::Cancel,PromptDecision::Deny] {
+            let root=prompt_test_root();let approvals=ApprovalStore::new(root.clone());
+            let mut session=SavedSession::create(root.clone(),"request a reviewed write").await.unwrap();
+            let tools=Arc::new(chimera_tools::DefaultToolRouter::new(Some(root.clone())));
+            let (events,mut receive)=chimera_core::runtime::event_channel();let (cancel,cancelled)=tokio::sync::watch::channel(false);
+            let config=AgentConfig::default();let mut held=Vec::new();let mut action=None;
+            let outcome={
+                let run=session.run(&PromptModel,tools,"test","request a reviewed write",&config,chimera_core::runtime::RunChannels { events, cancellation: cancelled });tokio::pin!(run);
+                tokio::time::timeout(std::time::Duration::from_secs(5),async {
+                    loop {tokio::select! {
+                        result=&mut run=>break result,
+                        Some(event)=receive.recv()=>if let RunEvent::Approval{id,answer,..}=event {
+                            action=Some(id);retain_cancelled_prompt(finish_approval(&approvals,id,answer,decision,Some(&cancel)).unwrap(),&mut held);
+                        },
+                    }}
+                }).await.unwrap()
+            };
+            let state=session.store.load(session.id).await.unwrap();assert!(!state.active);
+            if decision==PromptDecision::Cancel {
+                assert!(outcome.unwrap_err().to_string().contains("cancelled"));assert!(*cancel.borrow());
+                assert_eq!(approvals.get(action.unwrap()).unwrap().decision,Decision::Cancelled);
+                assert!(state.events.iter().any(|event|matches!(event,chimera_session::SessionEvent::Custom{key,payload} if key=="run_outcome" && payload["outcome"]=="cancelled")));
+            } else {
+                assert!(matches!(outcome.unwrap().done_reason,DoneReason::Error));assert!(!*cancel.borrow());
+                assert_eq!(approvals.get(action.unwrap()).unwrap().decision,Decision::Denied);
+                assert!(state.events.iter().any(|event|matches!(event,chimera_session::SessionEvent::Custom{key,payload} if key=="run_outcome" && payload["outcome"]=="failed")));
+            }
+            assert!(!root.join("effect.txt").exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn prompt_cancel_reaches_concurrent_team_before_reply_channels_close() {
+        use chimera_core::{approval::{ApprovalStore,Decision},team::{TeamRegistry,TeamRequest,TeamStatus}};
+        let root=prompt_test_root();let registry=TeamRegistry::new(root.clone()).unwrap();
+        let request=TeamRequest{objective:"request reviewed writes".into(),creatures:vec!["mantis".into(),"mantis".into()],scope:Default::default(),max_parallel:2,read_only:false};
+        let record=registry.create(request).unwrap();let approvals=ApprovalStore::new(root.clone());
+        let (events,mut receive)=tokio::sync::mpsc::channel(256);let (cancel,cancelled)=tokio::sync::watch::channel(false);
+        let mut held=Vec::new();let mut count=0;
+        let execute=registry.execute(record.id,Arc::new(PromptModel),"test".into(),AgentConfig::default(),events,cancelled);tokio::pin!(execute);
+        let result=tokio::time::timeout(std::time::Duration::from_secs(5),async {
+            loop {tokio::select! {
+                result=&mut execute=>break result.unwrap(),
+                Some(event)=receive.recv()=>if let RunEvent::Approval{id,answer,..}=event.event {
+                    count+=1;retain_cancelled_prompt(finish_approval(&approvals,id,answer,PromptDecision::Cancel,Some(&cancel)).unwrap(),&mut held);
+                },
+            }}
+        }).await.unwrap();
+        assert!(count>=1);assert_eq!(result.status,TeamStatus::Cancelled);
+        assert!(result.members.iter().all(|member|member.status==TeamStatus::Cancelled));
+        assert!(approvals.list().unwrap().iter().all(|row|row.decision==Decision::Cancelled));
+        assert!(!root.join("effect.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn direct_prompt_cancel_closes_pending_action_without_denial_or_execution() {
+        use chimera_core::approval::{ApprovalStore,Decision};
+        let root=prompt_test_root();let approvals=ApprovalStore::new(root.clone());let actor=uuid::Uuid::new_v4();
+        let call=chimera_tools::ToolCall{tool:"write_file".into(),args:json!({"path":"effect.txt","content":"no"}),world:None,requested_by:actor};
+        let row=approvals.request(actor,call.clone(),std::time::Duration::from_secs(300)).unwrap();
+        let (answer,receive)=tokio::sync::oneshot::channel();
+        assert!(matches!(finish_approval(&approvals,row.id,answer,PromptDecision::Cancel,None).unwrap(),RunEventFlow::Cancelled(None)));
+        assert!(receive.await.is_err());assert_eq!(approvals.get(row.id).unwrap().decision,Decision::Cancelled);
+        assert!(approvals.consume(row.id,actor,&call).is_err());assert!(!root.join("effect.txt").exists());
     }
 }

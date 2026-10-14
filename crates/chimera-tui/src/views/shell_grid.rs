@@ -35,19 +35,19 @@ pub fn render(f: &mut Frame, app: &App) {
                 _ => Color::White,
             };
             Line::from(vec![
-                Span::styled(
-                    format!(" {:20}", r.label),
-                    Style::default().fg(Color::Cyan),
-                ),
+                Span::styled(format!(" {:20}", r.label), Style::default().fg(Color::Cyan)),
                 Span::raw(format!("{:40}", r.command)),
-                Span::styled(&r.status, Style::default().fg(status_color).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    &r.status,
+                    Style::default()
+                        .fg(status_color)
+                        .add_modifier(Modifier::BOLD),
+                ),
             ])
         })
         .collect();
 
-    let block = Block::default()
-        .title(" Shell Grid ")
-        .borders(Borders::ALL);
+    let block = Block::default().title(" Shell Grid ").borders(Borders::ALL);
     let p = Paragraph::new(lines).block(block);
     f.render_widget(p, f.area());
 }

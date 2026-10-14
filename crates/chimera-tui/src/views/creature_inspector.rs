@@ -11,8 +11,11 @@ pub fn render(f: &mut Frame, app: &App) {
     let creature = match app.creatures.get(app.selected_creature) {
         Some(c) => c,
         None => {
-            let p = Paragraph::new("No creature selected.")
-                .block(Block::default().title(" Creature Inspector ").borders(Borders::ALL));
+            let p = Paragraph::new("No creature selected.").block(
+                Block::default()
+                    .title(" Creature Inspector ")
+                    .borders(Borders::ALL),
+            );
             f.render_widget(p, f.area());
             return;
         }
@@ -21,8 +24,8 @@ pub fn render(f: &mut Frame, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(7),  // info
-            Constraint::Length(6),  // plan placeholder
+            Constraint::Length(7), // info
+            Constraint::Length(6), // plan placeholder
             Constraint::Min(4),    // evidence
             Constraint::Length(1), // keys
         ])
@@ -60,16 +63,12 @@ pub fn render(f: &mut Frame, app: &App) {
     let plan_block = Block::default()
         .title(" Current Plan ")
         .borders(Borders::ALL);
-    let plan = Paragraph::new(" (plan details populated at runtime)")
-        .block(plan_block);
+    let plan = Paragraph::new(" (plan details populated at runtime)").block(plan_block);
     f.render_widget(plan, chunks[1]);
 
     // Evidence placeholder
-    let evidence_block = Block::default()
-        .title(" Evidence ")
-        .borders(Borders::ALL);
-    let evidence = Paragraph::new(" (evidence details populated at runtime)")
-        .block(evidence_block);
+    let evidence_block = Block::default().title(" Evidence ").borders(Borders::ALL);
+    let evidence = Paragraph::new(" (evidence details populated at runtime)").block(evidence_block);
     f.render_widget(evidence, chunks[2]);
 
     // Keys

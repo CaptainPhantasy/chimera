@@ -21,10 +21,10 @@ pub fn render(f: &mut Frame, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(7),  // header
-            Constraint::Length(6),  // resources
-            Constraint::Length(6),  // verification
-            Constraint::Length(3),  // rollback
+            Constraint::Length(7), // header
+            Constraint::Length(6), // resources
+            Constraint::Length(6), // verification
+            Constraint::Length(3), // rollback
             Constraint::Min(1),    // spacer
             Constraint::Length(1), // keys
         ])
@@ -82,9 +82,7 @@ pub fn render(f: &mut Frame, app: &App) {
     f.render_widget(Paragraph::new(verify_lines).block(verify_block), chunks[2]);
 
     // Rollback
-    let rollback_block = Block::default()
-        .title(" Rollback ")
-        .borders(Borders::ALL);
+    let rollback_block = Block::default().title(" Rollback ").borders(Borders::ALL);
     let rollback = Paragraph::new(format!("  {}", prompt.rollback_info)).block(rollback_block);
     f.render_widget(rollback, chunks[3]);
 
@@ -92,7 +90,12 @@ pub fn render(f: &mut Frame, app: &App) {
     let keys = Line::from(vec![
         Span::styled("[y]", Style::default().fg(Color::Green)),
         Span::raw(" approve once  "),
-        Span::styled("[Y]", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            "[Y]",
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::raw(" approve for task  "),
         Span::styled("[n]", Style::default().fg(Color::Red)),
         Span::raw(" deny  "),

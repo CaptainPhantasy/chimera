@@ -2,13 +2,20 @@ pub mod pack;
 pub mod scheduler;
 pub mod skill;
 pub mod agent;
+pub mod runtime;
+pub mod approval;
+pub mod external_tools;
+pub mod world_tools;
+pub mod daemon;
+pub mod team;
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use tracing::{info, info_span, Instrument};
+#[cfg(test)]
+use tracing::info;
 use uuid::Uuid;
 
 use chimera_browser::BrowserController;
@@ -233,172 +240,11 @@ pub struct Harness {
 }
 
 impl Harness {
-    /// Execute an objective through the full orchestration loop.
-    ///
-    /// Phases: intake → decompose → assign creatures → assign worlds →
-    /// execute → verify → approve → commit → memory update.
-    pub async fn run_objective(&self, req: ObjectiveRequest) -> anyhow::Result<RunReport> {
-        let session_id = Uuid::new_v4();
-
-        let root_span = info_span!(
-            "harness.run_objective",
-            session_id = %session_id,
-            objective = %req.objective,
-            mode = ?req.mode,
-        );
-
-        async {
-            // ── Phase 1: Intake ──────────────────────────────────────
-            let _intake = info_span!("phase.intake").entered();
-            info!(objective = %req.objective, "objective received");
-            drop(_intake);
-
-            // ── Phase 2: Decompose into tasks ────────────────────────
-            let tasks = {
-                let _span = info_span!("phase.decompose").entered();
-                let tasks = vec![
-                    "analyze codebase structure".to_string(),
-                    "identify affected modules".to_string(),
-                    "apply changes".to_string(),
-                    "run verification checks".to_string(),
-                ];
-                info!(task_count = tasks.len(), "decomposed objective into tasks");
-                tasks
-            };
-
-            // ── Phase 3: Assign creatures ────────────────────────────
-            let assigned_creatures = {
-                let _span = info_span!("phase.assign_creatures").entered();
-                let available = self.creatures.builtin();
-                let mut assigned = Vec::new();
-                for (i, task) in tasks.iter().enumerate() {
-                    let creature = if i < available.len() {
-                        available[i].clone()
-                    } else {
-                        available[0].clone()
-                    };
-                    info!(
-                        task = %task,
-                        creature = %creature.name,
-                        role = %creature.role,
-                        "assigned creature to task"
-                    );
-                    assigned.push((task.clone(), creature));
-                }
-                assigned
-            };
-
-            // ── Phase 4: Assign worlds ───────────────────────────────
-            {
-                let _span = info_span!("phase.assign_worlds").entered();
-                for (task, creature) in &assigned_creatures {
-                    let world = creature
-                        .preferred_worlds
-                        .first()
-                        .copied()
-                        .unwrap_or(WorldKind::LocalShell);
-                    info!(
-                        task = %task,
-                        creature = %creature.name,
-                        world = ?world,
-                        "assigned world to creature"
-                    );
-                }
-            }
-
-            // ── Phase 5: Execute ─────────────────────────────────────
-            let task_reports = {
-                let _span = info_span!("phase.execute").entered();
-                let mut reports = Vec::new();
-                for (task, creature) in &assigned_creatures {
-                    let creature_id = Uuid::new_v4();
-                    let exec_span = info_span!(
-                        "creature.execute",
-                        creature = %creature.name,
-                        creature_id = %creature_id,
-                        task = %task,
-                    );
-                    let _enter = exec_span.enter();
-
-                    info!("executing task");
-
-                    // Emit trace event
-                    let trace_event = chimera_trace::TraceEvent {
-                        timestamp: Utc::now(),
-                        level: chimera_trace::TraceLevel::Info,
-                        session_id,
-                        creature_id: Some(creature_id),
-                        span: format!("execute:{}", creature.name),
-                        message: format!("executing: {}", task),
-                        fields: serde_json::json!({
-                            "autonomy": format!("{:?}", creature.autonomy),
-                            "temperament": format!("{:?}", creature.temperament),
-                        }),
-                    };
-                    self.trace.emit(trace_event).await?;
-
-                    reports.push(TaskReport {
-                        description: task.clone(),
-                        creature_id,
-                        success: true,
-                        evidence: vec![],
-                    });
-                    info!("task complete");
-                }
-                reports
-            };
-
-            // ── Phase 6: Verify ──────────────────────────────────────
-            {
-                let _span = info_span!("phase.verify").entered();
-                info!(
-                    tasks_passed = task_reports.iter().filter(|t| t.success).count(),
-                    tasks_total = task_reports.len(),
-                    "verification complete"
-                );
-            }
-
-            // ── Phase 7: Approval ────────────────────────────────────
-            let approvals = {
-                let _span = info_span!("phase.approval").entered();
-                info!("no approval gates triggered (stub mode)");
-                vec![]
-            };
-
-            // ── Phase 8: Commit / checkpoint ─────────────────────────
-            let checkpoints = {
-                let _span = info_span!("phase.commit").entered();
-                let checkpoint_id = Uuid::new_v4();
-                info!(checkpoint_id = %checkpoint_id, "checkpoint created");
-                vec![checkpoint_id]
-            };
-
-            // ── Phase 9: Memory update ───────────────────────────────
-            {
-                let _span = info_span!("phase.memory_update").entered();
-                info!("memory update complete (stub mode)");
-            }
-
-            // ── Build report ─────────────────────────────────────────
-            let report = RunReport {
-                session_id,
-                status: RunStatus::Completed,
-                tasks: task_reports,
-                approvals,
-                evidence: vec![],
-                checkpoints,
-            };
-
-            info!(
-                status = ?report.status,
-                task_count = report.tasks.len(),
-                "objective run complete"
-            );
-
-            Ok(report)
-        }
-        .instrument(root_span)
-        .await
+    /// The old component bundle has no model provider and cannot execute work.
+    /// Use `runtime::SavedSession::run` or `team::TeamRegistry::execute`, which
+    /// require a provider and persist actual messages and outcomes.
+    pub async fn run_objective(&self, _req: ObjectiveRequest) -> anyhow::Result<RunReport> {
+        anyhow::bail!("no model provider supplied to Harness; use the saved-session or team runtime")
     }
 }
 
@@ -407,8 +253,10 @@ impl Harness {
 // ---------------------------------------------------------------------------
 
 /// A no-op TraceSink that logs events but does not persist them.
+#[cfg(test)]
 pub struct StubTraceSink;
 
+#[cfg(test)]
 #[async_trait::async_trait]
 impl TraceSink for StubTraceSink {
     async fn emit(&self, event: chimera_trace::TraceEvent) -> anyhow::Result<()> {
@@ -437,8 +285,10 @@ impl TraceSink for StubTraceSink {
 }
 
 /// A stub SessionStore that creates in-memory sessions.
+#[cfg(test)]
 pub struct StubSessionStore;
 
+#[cfg(test)]
 #[async_trait::async_trait]
 impl SessionStore for StubSessionStore {
     async fn create(
@@ -493,75 +343,25 @@ impl SessionStore for StubSessionStore {
     }
 }
 
-/// A stub CreatureRegistry providing builtin creature specs.
+/// Built-in profiles matching the real file-scoped specialist runtime.
 pub struct BuiltinCreatureRegistry;
 
 impl CreatureRegistry for BuiltinCreatureRegistry {
     fn builtin(&self) -> Vec<CreatureSpec> {
-        use chimera_creatures::ToolCapability;
-
-        vec![
-            CreatureSpec {
-                name: "raven".into(),
-                role: "reconnaissance and evidence gathering".into(),
-                temperament: Temperament::Cautious,
-                toolbelt: vec![
-                    ToolCapability { name: "grep".into(), read_only: true },
-                    ToolCapability { name: "rg".into(), read_only: true },
-                    ToolCapability { name: "browser".into(), read_only: true },
-                ],
-                preferred_worlds: vec![WorldKind::WorktreeReadOnly],
-                autonomy: AutonomyLevel::Medium,
-                stop_conditions: vec![],
-                escalation_rules: vec![],
-                token_budget: Some(50_000),
-                deadline_secs: Some(300),
-            },
-            CreatureSpec {
-                name: "mantis".into(),
-                role: "code surgery and patch application".into(),
-                temperament: Temperament::Balanced,
-                toolbelt: vec![
-                    ToolCapability { name: "bash".into(), read_only: false },
-                    ToolCapability { name: "git".into(), read_only: false },
-                ],
-                preferred_worlds: vec![WorldKind::WorktreeReadWrite],
-                autonomy: AutonomyLevel::Low,
-                stop_conditions: vec![],
-                escalation_rules: vec![],
-                token_budget: Some(80_000),
-                deadline_secs: Some(600),
-            },
-            CreatureSpec {
-                name: "hound".into(),
-                role: "monitoring and regression hunting".into(),
-                temperament: Temperament::Patient,
-                toolbelt: vec![
-                    ToolCapability { name: "bash".into(), read_only: true },
-                    ToolCapability { name: "test-runner".into(), read_only: true },
-                ],
-                preferred_worlds: vec![WorldKind::Container],
-                autonomy: AutonomyLevel::Medium,
-                stop_conditions: vec![],
-                escalation_rules: vec![],
-                token_budget: Some(40_000),
-                deadline_secs: Some(900),
-            },
-            CreatureSpec {
-                name: "owl".into(),
-                role: "evaluator, critic, and verifier".into(),
-                temperament: Temperament::Cautious,
-                toolbelt: vec![
-                    ToolCapability { name: "analyze".into(), read_only: true },
-                ],
-                preferred_worlds: vec![WorldKind::LocalShell],
-                autonomy: AutonomyLevel::High,
-                stop_conditions: vec![],
-                escalation_rules: vec![],
-                token_budget: Some(30_000),
-                deadline_secs: Some(120),
-            },
-        ]
+        team::specialists().into_iter().map(|spec| CreatureSpec {
+            name: spec.name,
+            role: spec.role,
+            temperament: Temperament::Cautious,
+            toolbelt: spec.tools.into_iter().map(|name| chimera_creatures::ToolCapability {
+                read_only: !matches!(name.as_str(), "write_file" | "edit_file"), name,
+            }).collect(),
+            preferred_worlds: vec![WorldKind::LocalShell],
+            autonomy: AutonomyLevel::Low,
+            stop_conditions: vec![chimera_creatures::StopCondition::MaxToolCalls(spec.max_tool_calls), chimera_creatures::StopCondition::DeadlineExceeded, chimera_creatures::StopCondition::OperatorStop],
+            escalation_rules: vec![],
+            token_budget: None,
+            deadline_secs: Some(spec.timeout_secs),
+        }).collect()
     }
 
     fn resolve(&self, name: &str) -> anyhow::Result<CreatureSpec> {
@@ -573,8 +373,10 @@ impl CreatureRegistry for BuiltinCreatureRegistry {
 }
 
 /// A stub ToolRouter that acknowledges calls but does nothing.
+#[cfg(test)]
 pub struct StubToolRouter;
 
+#[cfg(test)]
 #[async_trait::async_trait]
 impl ToolRouter for StubToolRouter {
     async fn call(&self, req: chimera_tools::ToolCall) -> anyhow::Result<chimera_tools::ToolResult> {
@@ -597,8 +399,10 @@ impl ToolRouter for StubToolRouter {
 }
 
 /// A stub ShellManager for one-shot execution.
+#[cfg(test)]
 pub struct StubShellManager;
 
+#[cfg(test)]
 #[async_trait::async_trait]
 impl ShellManager for StubShellManager {
     async fn spawn_shell(&self, spec: chimera_shell::ShellSpec) -> anyhow::Result<chimera_shell::ShellId> {
@@ -643,8 +447,10 @@ impl ShellManager for StubShellManager {
 }
 
 /// A stub WorldManager for one-shot execution.
+#[cfg(test)]
 pub struct StubWorldManager;
 
+#[cfg(test)]
 #[async_trait::async_trait]
 impl WorldManager for StubWorldManager {
     async fn allocate(&self, spec: chimera_sandbox::WorldSpec) -> anyhow::Result<chimera_sandbox::WorldId> {
@@ -689,8 +495,10 @@ impl WorldManager for StubWorldManager {
 }
 
 /// A stub BrowserController for one-shot execution.
+#[cfg(test)]
 pub struct StubBrowserController;
 
+#[cfg(test)]
 #[async_trait::async_trait]
 impl BrowserController for StubBrowserController {
     async fn open(&self, target: chimera_browser::BrowserTarget) -> anyhow::Result<chimera_browser::BrowserSessionId> {
@@ -732,8 +540,10 @@ impl BrowserController for StubBrowserController {
 }
 
 /// A stub MobileController.
+#[cfg(test)]
 pub struct StubMobileController;
 
+#[cfg(test)]
 #[async_trait::async_trait]
 impl MobileController for StubMobileController {
     async fn boot(&self, spec: chimera_mobile::DeviceSpec) -> anyhow::Result<chimera_mobile::DeviceId> {
@@ -770,8 +580,10 @@ impl MobileController for StubMobileController {
 }
 
 /// A stub CommsBridge.
+#[cfg(test)]
 pub struct StubCommsBridge;
 
+#[cfg(test)]
 #[async_trait::async_trait]
 impl CommsBridge for StubCommsBridge {
     async fn notify(&self, msg: chimera_comms::Notification) -> anyhow::Result<chimera_comms::MessageId> {
@@ -794,8 +606,10 @@ impl CommsBridge for StubCommsBridge {
 }
 
 /// A stub MemoryStore.
+#[cfg(test)]
 pub struct StubMemoryStore;
 
+#[cfg(test)]
 #[async_trait::async_trait]
 impl MemoryStore for StubMemoryStore {
     async fn remember(&self, item: chimera_memory::MemoryItem) -> anyhow::Result<chimera_memory::MemoryId> {
@@ -817,8 +631,10 @@ impl MemoryStore for StubMemoryStore {
 }
 
 /// A stub Evaluator.
+#[cfg(test)]
 pub struct StubEvaluator;
 
+#[cfg(test)]
 #[async_trait::async_trait]
 impl Evaluator for StubEvaluator {
     async fn grade(&self, req: chimera_eval::EvalRequest) -> anyhow::Result<chimera_eval::EvalReport> {
@@ -844,8 +660,10 @@ impl Evaluator for StubEvaluator {
 }
 
 /// A stub McpClient.
+#[cfg(test)]
 pub struct StubMcpClient;
 
+#[cfg(test)]
 #[async_trait::async_trait]
 impl McpClient for StubMcpClient {
     async fn list_tools(&self, server: &str) -> anyhow::Result<Vec<chimera_mcp::McpToolDescriptor>> {
@@ -880,6 +698,7 @@ impl McpClient for StubMcpClient {
 // ---------------------------------------------------------------------------
 
 /// Build a Harness with all stub/mock backends for testing.
+#[cfg(test)]
 pub fn build_stub_harness() -> Harness {
     Harness {
         sessions: Arc::new(StubSessionStore),
@@ -904,7 +723,7 @@ mod tests {
     // ── Harness tests ────────────────────────────────────────────
 
     #[tokio::test]
-    async fn harness_run_objective_completes() {
+    async fn harness_without_provider_cannot_invent_completed_tasks() {
         let harness = build_stub_harness();
         let req = ObjectiveRequest {
             objective: "test objective".into(),
@@ -913,11 +732,8 @@ mod tests {
             policy_profile: None,
             evidence_level: EvidenceLevel::Standard,
         };
-        let report = harness.run_objective(req).await.unwrap();
-        assert_eq!(report.status, RunStatus::Completed);
-        assert_eq!(report.tasks.len(), 4);
-        assert!(report.tasks.iter().all(|t| t.success));
-        assert_eq!(report.checkpoints.len(), 1);
+        let error = harness.run_objective(req).await.unwrap_err();
+        assert!(error.to_string().contains("no model provider"));
     }
 
     #[tokio::test]
@@ -930,8 +746,8 @@ mod tests {
             policy_profile: None,
             evidence_level: EvidenceLevel::Minimal,
         };
-        let report = harness.run_objective(req).await.unwrap();
-        assert_eq!(report.status, RunStatus::Completed);
+        let error = harness.run_objective(req).await.unwrap_err();
+        assert!(error.to_string().contains("no model provider"));
     }
 
     #[tokio::test]
@@ -944,8 +760,8 @@ mod tests {
             policy_profile: Some("strict".into()),
             evidence_level: EvidenceLevel::Full,
         };
-        let report = harness.run_objective(req).await.unwrap();
-        assert_eq!(report.status, RunStatus::Completed);
+        let error = harness.run_objective(req).await.unwrap_err();
+        assert!(error.to_string().contains("no model provider"));
     }
 
     // ── StubTraceSink ────────────────────────────────────────────
@@ -1022,7 +838,9 @@ mod tests {
     fn builtin_creature_registry_resolve() {
         let reg = BuiltinCreatureRegistry;
         let raven = reg.resolve("raven").unwrap();
-        assert_eq!(raven.role, "reconnaissance and evidence gathering");
+        assert!(raven.role.contains("evidence"));
+        assert!(raven.toolbelt.iter().all(|tool| ["read_file", "glob", "grep"].contains(&tool.name.as_str())));
+        assert!(raven.token_budget.is_none());
         assert!(reg.resolve("nonexistent").is_err());
     }
 
@@ -1394,8 +1212,7 @@ mod tests {
 
     // ── Creature wrapping fallback ───────────────────────────────
 
-    /// A single-creature registry to force the wrapping fallback
-    /// in Harness::run_objective when tasks outnumber creatures.
+    /// A registry without an execution provider.
     struct SingleCreatureRegistry;
 
     impl CreatureRegistry for SingleCreatureRegistry {
@@ -1423,9 +1240,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn harness_wraps_creatures_when_tasks_exceed_count() {
-        // With only 1 creature but 4 tasks, the harness must wrap
-        // around to available[0] for tasks 1..3 (the else branch).
+    async fn a_creature_registry_does_not_substitute_for_a_model_provider() {
+        // A role registry alone cannot execute or verify an objective.
         let harness = Harness {
             sessions: Arc::new(StubSessionStore),
             creatures: Arc::new(SingleCreatureRegistry),
@@ -1449,10 +1265,8 @@ mod tests {
             evidence_level: EvidenceLevel::Standard,
         };
 
-        let report = harness.run_objective(req).await.unwrap();
-        assert_eq!(report.status, RunStatus::Completed);
-        // All 4 tasks should complete even with only 1 creature
-        assert_eq!(report.tasks.len(), 4);
-        assert!(report.tasks.iter().all(|t| t.success));
+        let error = harness.run_objective(req).await.unwrap_err();
+        assert!(error.to_string().contains("no model provider"));
+
     }
 }

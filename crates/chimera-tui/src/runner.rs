@@ -4,8 +4,19 @@
 //! events, draws frames at the frame budget, and integrates with the agent
 //! loop via a channel-based streaming model.
 
+use crate::message::SystemKind;
+use chimera_core::{
+    agent::{AgentConfig, DoneReason},
+    runtime::{RunEvent, SavedSession},
+};
+use chimera_session::SessionStore;
+use chimera_tools::ToolRouter;
+use std::cell::Cell;
 use std::io::{self, Stdout};
-use std::time::{Duration, Instant};
+use std::marker::PhantomData;
+use std::rc::Rc;
+use std::sync::{Arc, Once};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -29,22 +40,54 @@ use crate::theme::{Palette, Styles};
 
 pub type TuiTerminal = Terminal<CrosstermBackend<Stdout>>;
 
+thread_local! {
+    // Terminal ownership stays on the thread that enabled raw mode.
+    static TERMINAL_ACTIVE: Cell<bool> = const { Cell::new(false) };
+}
+
+fn install_terminal_panic_hook() {
+    static INSTALL: Once = Once::new();
+    INSTALL.call_once(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            if TERMINAL_ACTIVE.try_with(Cell::get).unwrap_or(false) {
+                let _ = restore_terminal();
+            }
+            previous(info);
+        }));
+    });
+}
+
 /// Initialize the terminal for full-screen TUI rendering.
 pub fn init_terminal() -> Result<TuiTerminal> {
+    install_terminal_panic_hook();
     enable_raw_mode().context("failed to enable raw mode")?;
+    TERMINAL_ACTIVE.with(|active| active.set(true));
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)
-        .context("failed to enter alternate screen")?;
-    let backend = CrosstermBackend::new(stdout);
-    let terminal = Terminal::new(backend).context("failed to create terminal")?;
-    Ok(terminal)
+    let result = (|| {
+        execute!(stdout, EnterAlternateScreen, event::EnableBracketedPaste)
+            .context("failed to enter alternate screen")?;
+        Terminal::new(CrosstermBackend::new(stdout)).context("failed to create terminal")
+    })();
+    if result.is_err() {
+        let _ = restore_terminal();
+    }
+    result
 }
 
 /// Restore the terminal to its original state.
 pub fn restore_terminal() -> Result<()> {
-    disable_raw_mode().context("failed to disable raw mode")?;
-    execute!(io::stdout(), LeaveAlternateScreen)
-        .context("failed to leave alternate screen")?;
+    TERMINAL_ACTIVE.with(|active| active.set(false));
+    let raw = disable_raw_mode().context("failed to disable raw mode");
+    let screen = execute!(
+        io::stdout(),
+        event::DisableBracketedPaste,
+        LeaveAlternateScreen,
+        crossterm::cursor::Show
+    )
+    .context("failed to leave alternate screen");
+    raw?;
+    screen?;
     Ok(())
 }
 
@@ -85,7 +128,10 @@ pub enum AgentUpdate {
     /// An iteration boundary.
     Iteration { n: usize },
     /// A system status message.
-    System { text: String, kind: crate::message::SystemKind },
+    System {
+        text: String,
+        kind: crate::message::SystemKind,
+    },
     /// Token usage update.
     Tokens { prompt: u64, completion: u64 },
 }
@@ -103,21 +149,24 @@ pub struct Tui {
     pub objective: String,
     pub should_quit: bool,
     pub show_help: bool,
+    pub help_scroll: usize,
     /// Receiver for user-submit events.
-    pub rx: mpsc::UnboundedReceiver<TuiEvent>,
+    pub rx: mpsc::Receiver<TuiEvent>,
     /// Sender for user-submit events (cloned for input handling).
-    pub tx: mpsc::UnboundedSender<TuiEvent>,
+    pub tx: mpsc::Sender<TuiEvent>,
     /// Width hint for text wrapping (updated on resize).
     pub width: usize,
+    /// Terminal height for computing the visible conversation rows.
+    pub height: usize,
 }
 
 impl Tui {
     /// Create a new TUI session with the given objective and model info.
     pub fn new(objective: String, model: String, provider: String) -> Self {
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = mpsc::channel(16);
         Self {
             styles: Styles::dark(),
-            log: MessageLog::new(500),
+            log: MessageLog::new(100),
             input: InputBar::new(),
             status: StatusInfo {
                 provider,
@@ -125,6 +174,7 @@ impl Tui {
                 mode: "RUN".into(),
                 prompt_tokens: 0,
                 completion_tokens: 0,
+                usage_available: false,
                 iteration: 0,
                 max_iterations: 40,
                 session_id: short_id(),
@@ -134,16 +184,18 @@ impl Tui {
             objective: objective.clone(),
             should_quit: false,
             show_help: false,
+            help_scroll: 0,
             rx,
             tx,
             width: 80,
+            height: 24,
         }
     }
 
     /// Render a single frame.
     pub fn render(&self, f: &mut ratatui::Frame) {
         if self.show_help {
-            crate::help::render(f, &self.styles);
+            crate::help::render_scrolled(f, &self.styles, self.help_scroll);
             return;
         }
         chat::render(
@@ -159,8 +211,8 @@ impl Tui {
 
     /// Handle a keyboard event.
     fn handle_key(&mut self, key: KeyEvent) {
-        // Only respond to press events (not repeat/release).
-        if key.kind != KeyEventKind::Press {
+        // Text and navigation may repeat; release events never perform an action.
+        if key.kind == KeyEventKind::Release {
             return;
         }
 
@@ -191,6 +243,15 @@ impl Tui {
                 KeyCode::Char('?') | KeyCode::Esc | KeyCode::Char('q') => {
                     self.show_help = false;
                 }
+                KeyCode::Up => self.help_scroll = self.help_scroll.saturating_sub(1),
+                KeyCode::PageUp => self.help_scroll = self.help_scroll.saturating_sub(10),
+                KeyCode::Down | KeyCode::PageDown => {
+                    let step = if key.code == KeyCode::Down { 1 } else { 10 };
+                    let area =
+                        ratatui::layout::Rect::new(0, 0, self.width as u16, self.height as u16);
+                    let limit = crate::help::scroll_limit(area, &self.styles);
+                    self.help_scroll = self.help_scroll.saturating_add(step).min(limit);
+                }
                 _ => {}
             }
             return;
@@ -198,27 +259,48 @@ impl Tui {
 
         // Input bar handling.
         match key.code {
+            KeyCode::Enter
+                if key
+                    .modifiers
+                    .intersects(KeyModifiers::ALT | KeyModifiers::SHIFT) =>
+            {
+                self.input.insert_char('\n');
+            }
             KeyCode::Enter => {
                 let text = self.input.submit();
                 if !text.trim().is_empty() {
-                    let _ = self.tx.send(TuiEvent::Submit(text));
+                    let _ = self.tx.try_send(TuiEvent::Submit(text));
                 }
             }
-            KeyCode::Char('?') => {
+            KeyCode::F(1) => {
                 self.show_help = true;
+                self.help_scroll = 0;
+            }
+            KeyCode::Tab => {
+                if let Some(Message::ToolCall { expanded, .. }) = self
+                    .log
+                    .messages
+                    .iter_mut()
+                    .rev()
+                    .find(|m| matches!(m, Message::ToolCall { .. }))
+                {
+                    *expanded = !*expanded;
+                }
             }
             KeyCode::Up => {
-                self.log.scroll_up();
+                self.input.history_prev();
             }
             KeyCode::Down => {
-                self.log.scroll_down();
+                self.input.history_next();
             }
             KeyCode::PageUp => {
+                let limit = self.scroll_limit();
                 for _ in 0..10 {
-                    self.log.scroll_up();
+                    self.log.scroll_up(limit);
                 }
             }
             KeyCode::PageDown => {
+                self.log.scroll_offset = self.log.scroll_offset.min(self.scroll_limit());
                 for _ in 0..10 {
                     self.log.scroll_down();
                 }
@@ -253,11 +335,22 @@ impl Tui {
                 // Clear screen
                 self.log = MessageLog::new(500);
             }
-            KeyCode::Char(c) => {
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.input.insert_char(c);
             }
             _ => {}
         }
+    }
+
+    fn scroll_limit(&self) -> usize {
+        let area = chat::message_area(
+            ratatui::layout::Rect::new(0, 0, self.width as u16, self.height as u16),
+            !self.input.suggestions.is_empty(),
+        );
+        self.log
+            .to_lines(&self.styles, area.width as usize)
+            .len()
+            .saturating_sub(area.height as usize)
     }
 
     /// Apply an agent update to the message log.
@@ -266,8 +359,10 @@ impl Tui {
         match update {
             AgentUpdate::TextDelta(text) => {
                 // Append to the last assistant message if streaming, else create one.
-                if let Some(Message::Assistant { text: existing, streaming: true }) =
-                    self.log.last_mut()
+                if let Some(Message::Assistant {
+                    text: existing,
+                    streaming: true,
+                }) = self.log.last_mut()
                 {
                     existing.push_str(&text);
                 } else {
@@ -300,9 +395,10 @@ impl Tui {
                 ok,
                 duration_ms,
             } => {
-                // Update the last tool call if it matches.
+                // Approval and decision notices can follow the tool card.
+                // Match the latest unfinished call, leaving completed cards intact.
                 if let Some(Message::ToolCall { name: tn, result: r, ok: o, duration_ms: d, .. }) =
-                    self.log.last_mut()
+                    self.log.messages.iter_mut().rev().find(|message|matches!(message,Message::ToolCall{name:tn,result:None,..} if *tn==name))
                 {
                     if *tn == name {
                         *r = Some(result);
@@ -338,130 +434,350 @@ fn short_id() -> String {
 // Main loop
 // ---------------------------------------------------------------------------
 
-/// Run the TUI. Blocks until the user quits or the agent finishes.
-///
-/// The `objective` is auto-submitted on start if non-empty.
+/// Start a saved conversation with the configured model.
 pub async fn run_interactive(initial_objective: Option<String>) -> Result<()> {
-    run_interactive_with_config(initial_objective, "model-unset".into(), "unknown".into()).await
+    run_saved_interactive(initial_objective, None, None).await
 }
 
-/// Run the TUI with explicit model/provider info.
 pub async fn run_interactive_with_config(
-    initial_objective: Option<String>,
+    initial: Option<String>,
     model: String,
     provider: String,
 ) -> Result<()> {
-    let mut terminal = init_terminal()?;
-    let restore = ScopeGuard::new(|| {
-        let _ = restore_terminal();
+    run_screen(initial, None, None, Some((model, provider))).await
+}
+
+pub async fn run_saved_interactive(
+    initial: Option<String>,
+    resume: Option<uuid::Uuid>,
+    profile: Option<String>,
+) -> Result<()> {
+    run_screen(initial, resume, profile, None).await
+}
+
+/// A failed read must never make default settings eligible to run a request.
+struct ScreenSettings {
+    loaded: bool,
+    overrides: Option<(String, String)>,
+}
+
+impl ScreenSettings {
+    fn new(overrides: Option<(String, String)>) -> Self {
+        Self {
+            loaded: false,
+            overrides,
+        }
+    }
+
+    fn load(&mut self) -> Result<chimera_config::Config> {
+        self.accept(chimera_config::Config::load())
+    }
+
+    fn accept(&mut self, result: Result<chimera_config::Config>) -> Result<chimera_config::Config> {
+        self.loaded = false;
+        // Parsing errors may contain private file values. Keep details out of chat.
+        let mut config =
+            result.map_err(|_| anyhow::anyhow!("Model settings could not be read."))?;
+        if let Some((model, provider)) = &self.overrides {
+            config.provider.model = model.clone();
+            config.provider.name = provider.clone();
+        }
+        config
+            .validate_credentials()
+            .map_err(|_| anyhow::anyhow!("Model setup needed."))?;
+        self.loaded = true;
+        Ok(config)
+    }
+
+    fn ready(&self, config: &chimera_config::Config) -> bool {
+        self.loaded && config.validate_credentials().is_ok()
+    }
+}
+
+fn show_setup_needed(tui: &mut Tui) {
+    tui.status.running = false;
+    tui.status.mode = "SETUP".into();
+    tui.log.push(Message::System {
+        text: "Model setup needed. Use /setup for the settings file and /reload after saving it. Your request has not been sent.".into(),
+        kind: SystemKind::Warning,
     });
+}
 
-    let mut tui = Tui::new(initial_objective.clone().unwrap_or_default(), model, provider);
-
-    // Auto-submit the initial objective if provided.
-    if let Some(obj) = initial_objective {
-        if !obj.trim().is_empty() {
-            tui.log.push(Message::User { text: obj.clone() });
+async fn run_screen(
+    initial: Option<String>,
+    resume: Option<uuid::Uuid>,
+    profile: Option<String>,
+    overrides: Option<(String, String)>,
+) -> Result<()> {
+    let mut settings = ScreenSettings::new(overrides);
+    let mut config = settings.load().unwrap_or_default();
+    anyhow::ensure!(
+        matches!(
+            profile.as_deref(),
+            None | Some("supervised") | Some("read-only")
+        ),
+        "unknown policy; choose supervised or read-only"
+    );
+    let root = std::env::current_dir()?;
+    let session = match resume {
+        Some(id) => SavedSession::resume(root.clone(), id).await?,
+        None => {
+            SavedSession::create(
+                root.clone(),
+                initial.as_deref().unwrap_or("Interactive conversation"),
+            )
+            .await?
+        }
+    };
+    let mut tui = Tui::new(
+        initial.clone().unwrap_or_default(),
+        config.provider.model.clone(),
+        config.provider.name.clone(),
+    );
+    tui.status.session_id = session.id.to_string();
+    tui.status.max_iterations = config.agent.max_iterations;
+    for message in &session.messages {
+        match message.role {
+            chimera_llm::Role::User => tui.log.push(Message::User {
+                text: message.content.clone().unwrap_or_default(),
+            }),
+            chimera_llm::Role::Assistant => tui.log.push(Message::Assistant {
+                text: message.content.clone().unwrap_or_default(),
+                streaming: false,
+            }),
+            _ => {}
         }
     }
-
-    let tick_rate = Duration::from_millis(50);
-    let mut last_render = Instant::now();
-
-    loop {
-        // Update width from terminal size.
-        if let Ok(size) = terminal.size() {
-            tui.width = size.width as usize;
-        }
-
-        // Render.
-        terminal.draw(|f| tui.render(f))?;
-
-        // Poll for events with timeout (non-blocking tick).
-        let timeout = tick_rate
-            .checked_sub(last_render.elapsed())
-            .unwrap_or(Duration::ZERO);
-
-        // Check TUI events first (non-blocking).
-        while let Ok(event) = tui.rx.try_recv() {
-            match event {
-                TuiEvent::Key(k) => tui.handle_key(k),
-                TuiEvent::Submit(text) => {
-                    // Echo user message.
-                    tui.log.push(Message::User { text: text.clone() });
-                    // Handle slash commands locally.
-                    if text.trim() == "/quit" || text.trim() == "/exit" {
-                        break;
+    if !settings.ready(&config) {
+        show_setup_needed(&mut tui);
+    }
+    let mut session = Some(session);
+    let mut active: Option<
+        tokio::task::JoinHandle<(SavedSession, Result<chimera_core::agent::AgentRunResult>)>,
+    > = None;
+    let (cancel, _) = tokio::sync::watch::channel(false);
+    let (events, mut updates) = chimera_core::runtime::event_channel();
+    let mut pending: Option<(uuid::Uuid, tokio::sync::oneshot::Sender<bool>)> = None;
+    let restore = TerminalGuard::new();
+    let mut terminal = init_terminal()?;
+    if let Some(objective) = initial.filter(|s| !s.trim().is_empty()) {
+        // Setup commands must not erase a request supplied on the command line.
+        tui.input.history.push_back(objective.clone());
+        tui.tx.try_send(TuiEvent::Submit(objective))?;
+    }
+    let result: Result<()> = async {
+        loop {
+            // A busy stream must still leave time for keys and drawing.
+            for _ in 0..128 {
+                let Ok(update) = updates.try_recv() else { break };
+                match update {
+                    RunEvent::Approval { id, call, answer } => {
+                        let shown=chimera_core::approval::display_value(call.args);
+                        tui.log.push(Message::System { text: format!("Approval {id}: {} {}. Use /approve or /deny. Expires in five minutes.", call.tool, shown), kind: SystemKind::Warning });
+                        pending = Some((id, answer));
                     }
-                    if text.trim() == "/clear" {
-                        tui.log = MessageLog::new(500);
+                    RunEvent::Update { kind, value } => {
+                        match kind.as_str() {
+                            "text" => tui.apply_agent_update(AgentUpdate::TextDelta(value.as_str().unwrap_or("").into())),
+                            "tool_call" => {
+                                tui.apply_agent_update(AgentUpdate::TextDone);
+                                tui.apply_agent_update(AgentUpdate::ToolCallStart {
+                                    name: value["name"].as_str().unwrap_or("tool").into(), arguments: value["arguments"].to_string(),
+                                });
+                            }
+                            "tool_result" => tui.apply_agent_update(AgentUpdate::ToolCallResult {
+                                name: value["name"].as_str().unwrap_or("tool").into(), result: value["output"].to_string(),
+                                ok: value["ok"].as_bool().unwrap_or(false), duration_ms: value["duration_ms"].as_u64().unwrap_or(0),
+                            }),
+                            "text_done" => tui.apply_agent_update(AgentUpdate::TextDone),
+                            "tokens" => {
+                                tui.status.prompt_tokens = value["prompt"].as_u64().unwrap_or(0);
+                                tui.status.completion_tokens = value["completion"].as_u64().unwrap_or(0);
+                                tui.status.usage_available = value["available"].as_bool().unwrap_or(false);
+                            }
+                            "iteration" => tui.status.iteration = value.as_u64().or_else(|| value["n"].as_u64()).unwrap_or(0) as usize,
+                            _ => {},
+                        }
+                    }
+                }
+            }
+            if active.as_ref().is_some_and(|task| task.is_finished()) && updates.is_empty() {
+                let (saved, result) = active.take().context("finished agent task is missing")?.await.context("agent task stopped unexpectedly")?;
+                session = Some(saved);
+                pending = None;
+                tui.apply_agent_update(AgentUpdate::TextDone);
+                tui.status.running = false;
+                let (text, kind) = match result {
+                    Ok(result) => {
+                        tui.status.iteration = result.iterations;
+                        tui.status.prompt_tokens = result.total_prompt_tokens;
+                        tui.status.completion_tokens = result.total_completion_tokens;
+                        tui.status.usage_available = result.usage_available;
+                        match result.done_reason {
+                            DoneReason::FinalAnswer => ("Answer saved.".into(), SystemKind::Success),
+                            DoneReason::MaxIterations => ("Stopped at the work limit. Progress saved; the request is unfinished.".into(), SystemKind::Warning),
+                            DoneReason::Error => (result.error.unwrap_or_else(|| "Run failed. Progress saved.".into()), SystemKind::Error),
+                        }
+                    }
+                    Err(error) => (format!("{error:#}"), SystemKind::Error),
+                };
+                tui.log.push(Message::System { text, kind });
+            }
+            while let Ok(input) = tui.rx.try_recv() {
+                let TuiEvent::Submit(text) = input else { continue };
+                let unsent = text.clone();
+                let trimmed = text.trim();
+                let (command, argument) = trimmed.split_once(' ').unwrap_or((trimmed, ""));
+                let mut plan = profile.as_deref() == Some("read-only");
+                let objective = match command {
+                    "/quit" | "/exit" => { tui.should_quit = true; break; }
+                    "/clear" => { tui.log = MessageLog::new(100); continue; }
+                    "/help" | "/?" => { tui.show_help = true; tui.help_scroll = 0; continue; }
+                    "/theme" => { tui.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL)); continue; }
+                    "/cancel" => { let _ = cancel.send(true); continue; }
+                    "/approve" | "/deny" => {
+                        if let Some((id, answer)) = pending.take() {
+                            let allowed = command == "/approve";
+                            let delivered = answer.send(allowed).is_ok();
+                            tui.log.push(Message::System { text: format!("Decision for {id}: {}", if delivered { if allowed {"approved once"} else {"denied"} } else {"expired"}), kind: SystemKind::Info });
+                        } else { tui.log.push(Message::System { text: "No action is waiting for approval.".into(), kind: SystemKind::Warning }); }
                         continue;
                     }
-                    if text.trim() == "/help" || text.trim() == "/?" {
-                        tui.show_help = true;
-                        continue;
-                    }
-                    // Otherwise: the caller's agent task picks this up via the channel.
-                    // (For the standalone TUI without an agent task, we echo a system note.)
-                    if !text.starts_with('/') {
-                        // No agent backend in standalone mode; note it.
+                    "/setup" => {
+                        let path = chimera_config::config_file_path()
+                            .map(|path| path.display().to_string())
+                            .unwrap_or_else(|| "Set CHIMERA_CONFIG to a settings file.".into());
                         tui.log.push(Message::System {
-                            text: "No agent backend connected. Run via `chimera run --interactive` to connect the agent loop.".into(),
-                            kind: crate::message::SystemKind::Warning,
+                            text: format!("Model settings file: {path}\nSet provider.base_url to your model service address and provider.model to its model name. A remote service also needs provider.api_key. Keep keys in the settings file, never in chat.\nRun chimera init in another terminal to create a missing file. Save changes, then use /reload here. Existing environment settings override file values; changing those needs a restart."),
+                            kind: SystemKind::Info,
                         });
+                        continue;
                     }
+                    "/reload" => {
+                        if active.is_some() {
+                            tui.log.push(Message::System { text: "Cancel or finish the current request before reloading settings.".into(), kind: SystemKind::Warning });
+                        } else {
+                            match settings.load() {
+                                Ok(loaded) => {
+                                    config = loaded;
+                                    tui.status.model = config.provider.model.clone();
+                                    tui.status.provider = config.provider.name.clone();
+                                    tui.status.max_iterations = config.agent.max_iterations;
+                                    tui.status.mode = if profile.as_deref() == Some("read-only") { "PLAN" } else { "RUN" }.into();
+                                    tui.log.push(Message::System { text: "Model settings reloaded. Send your request when ready.".into(), kind: SystemKind::Success });
+                                }
+                                Err(_) => {
+                                    tui.log.push(Message::System { text: "Could not reload model settings. Fix the settings file, then use /reload.".into(), kind: SystemKind::Warning });
+                                    show_setup_needed(&mut tui);
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                    "/model" => {
+                        if argument.is_empty() { tui.log.push(Message::System { text: config.provider.model.clone(), kind: SystemKind::Info }); }
+                        else if active.is_some() { tui.log.push(Message::System { text: "Cancel or finish the current request before changing the model.".into(), kind: SystemKind::Warning }); }
+                        else if !settings.ready(&config) { show_setup_needed(&mut tui); }
+                        else {
+                            let mut changed = config.clone();
+                            changed.provider.model = argument.trim().into();
+                            if changed.validate().is_ok() { config = changed; tui.status.model = config.provider.model.clone(); }
+                            else { tui.log.push(Message::System { text: "That model setting is not valid. The previous model is unchanged.".into(), kind: SystemKind::Warning }); }
+                        }
+                        continue;
+                    }
+                    "/tools" => {
+                        let tools = chimera_tools::DefaultToolRouter::new(Some(root.clone())).list().await?;
+                        tui.log.push(Message::System { text: tools.iter().map(|t| format!("{}: {}", t.name, t.description)).collect::<Vec<_>>().join("\n"), kind: SystemKind::Info });
+                        continue;
+                    }
+                    "/sessions" => {
+                        let ids = chimera_session::FileSessionStore::new(root.clone()).list().await?;
+                        tui.log.push(Message::System { text: ids.iter().map(ToString::to_string).collect::<Vec<_>>().join("\n"), kind: SystemKind::Info });
+                        continue;
+                    }
+                    "/run" => argument.to_string(),
+                    "/plan" => { plan = true; argument.to_string() }
+                    _ if command.starts_with('/') => { tui.log.push(Message::System { text: format!("Unknown command {command}. Use /help."), kind: SystemKind::Warning }); continue; }
+                    _ => text,
+                };
+                if objective.trim().is_empty() { continue; }
+                if active.is_some() {
+                    tui.input.buffer = objective.clone(); tui.input.cursor = objective.len();
+                    tui.log.push(Message::System { text: "A request is already running. Finish it or use /cancel; your new text remains in the input.".into(), kind: SystemKind::Warning });
+                    continue;
                 }
-                TuiEvent::AgentMessage(u) => tui.apply_agent_update(u),
-                TuiEvent::AgentDone => {
-                    tui.status.running = false;
-                    tui.log.push(Message::System {
-                        text: "Agent run complete.".into(),
-                        kind: crate::message::SystemKind::Success,
-                    });
+                if !settings.ready(&config) {
+                    tui.input.buffer = unsent;
+                    tui.input.cursor = tui.input.buffer.len();
+                    show_setup_needed(&mut tui);
+                    continue;
                 }
-                TuiEvent::Tick => {}
+                tui.objective = objective.clone();
+                tui.status.mode = if plan { "PLAN" } else { "RUN" }.into();
+                tui.log.push(Message::User { text: objective.clone() });
+                tui.status.running = true;
+                cancel.send_replace(false);
+                let cancellation = cancel.subscribe();
+                let provider = config.build_provider();
+                let model = config.provider.model.clone();
+                let agent_config = AgentConfig { max_iterations: config.agent.max_iterations, temperature: Some(config.provider.temperature), max_tokens: Some(config.provider.max_tokens), ..Default::default() };
+                let policy = if plan { chimera_tools::ToolPolicy::read_only() } else { chimera_tools::ToolPolicy::supervised() };
+                let tools = Arc::new(chimera_tools::DefaultToolRouter::with_policy(Some(root.clone()), policy));
+                let events = events.clone();
+                let mut saved = session.take().context("saved conversation unavailable")?;
+                active = Some(tokio::spawn(async move {
+                    let result = saved.run(&provider, tools, &model, &objective, &agent_config, chimera_core::runtime::RunChannels { events, cancellation }).await;
+                    (saved, result)
+                }));
             }
-        }
-
-        // Poll terminal keyboard events.
-        if event::poll(timeout)? {
-            match event::read()? {
-                Event::Key(key) => {
-                    tui.handle_key(key);
+            if tui.should_quit { break; }
+            if let Ok(size) = terminal.size() {
+                tui.width = size.width as usize;
+                tui.height = size.height as usize;
+                if tui.show_help {
+                    tui.help_scroll = tui.help_scroll.min(crate::help::scroll_limit(
+                        ratatui::layout::Rect::new(0, 0, size.width, size.height), &tui.styles,
+                    ));
                 }
-                Event::Resize(_, _) => {
-                    // Will be handled next frame.
-                }
-                _ => {}
             }
+            terminal.draw(|frame| tui.render(frame))?;
+            if event::poll(Duration::from_millis(1))? {
+                match event::read()? {
+                    Event::Key(key) => tui.handle_key(key),
+                    Event::Paste(text) => for character in text.chars() { tui.input.insert_char(character); },
+                    _ => {},
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
-
-        if tui.should_quit {
-            break;
-        }
-
-        last_render = Instant::now();
+        Ok(())
+    }.await;
+    cancel.send_replace(true);
+    if let Some(task) = active {
+        let _ = task.await.context("could not stop the running request")?;
     }
-
     drop(restore);
-    Ok(())
+    result
 }
 
-/// RAII guard to ensure terminal restoration.
-struct ScopeGuard<F: FnOnce()> {
-    f: Option<F>,
+/// Restores an active terminal when its owning scope exits, including on error.
+/// Create this before `init_terminal`. It must remain on the terminal's thread.
+#[derive(Default)]
+pub struct TerminalGuard {
+    _owner_thread: PhantomData<Rc<()>>,
 }
 
-impl<F: FnOnce()> ScopeGuard<F> {
-    fn new(f: F) -> Self {
-        Self { f: Some(f) }
+impl TerminalGuard {
+    pub fn new() -> Self {
+        Self::default()
     }
 }
 
-impl<F: FnOnce()> Drop for ScopeGuard<F> {
+impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        if let Some(f) = self.f.take() {
-            f();
+        if TERMINAL_ACTIVE.try_with(Cell::get).unwrap_or(false) {
+            let _ = restore_terminal();
         }
     }
 }
@@ -473,6 +789,57 @@ impl<F: FnOnce()> Drop for ScopeGuard<F> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_settings_never_allow_default_or_previous_config_to_run() {
+        let mut state = ScreenSettings::new(None);
+        let mut local = chimera_config::Config::default();
+        local.provider.base_url = "http://127.0.0.1:12434/v1".into();
+        let valid = state.accept(Ok(local.clone())).unwrap();
+        assert!(state.ready(&valid));
+        let error = state
+            .accept(Err(anyhow::anyhow!("secret-sentinel")))
+            .unwrap_err();
+        assert!(!error.to_string().contains("secret-sentinel"));
+        assert!(!state.ready(&valid));
+        assert!(state.accept(Ok(chimera_config::Config::default())).is_err());
+        assert!(!state.ready(&valid));
+        let recovered = state.accept(Ok(local)).unwrap();
+        assert!(state.ready(&recovered));
+    }
+
+    #[test]
+    fn explicit_model_and_provider_survive_settings_reload() {
+        let mut state =
+            ScreenSettings::new(Some(("chosen-model".into(), "chosen-provider".into())));
+        let mut local = chimera_config::Config::default();
+        local.provider.base_url = "http://127.0.0.1:12434/v1".into();
+        for _ in 0..2 {
+            let config = state.accept(Ok(local.clone())).unwrap();
+            assert_eq!(config.provider.model, "chosen-model");
+            assert_eq!(config.provider.name, "chosen-provider");
+            assert!(state.ready(&config));
+        }
+    }
+
+    #[test]
+    fn help_scroll_preserves_input_and_normal_q_is_text() {
+        let mut tui = Tui::new(String::new(), "test".into(), "test".into());
+        tui.width = 40;
+        tui.height = 15;
+        tui.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
+        tui.handle_key(KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE));
+        for _ in 0..20 {
+            tui.handle_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+        }
+        assert!(tui.help_scroll > 0);
+        tui.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(!tui.show_help);
+        assert!(!tui.should_quit);
+        assert_eq!(tui.input.text(), "q");
+        tui.handle_key(KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE));
+        assert_eq!(tui.help_scroll, 0);
+    }
 
     #[test]
     fn tui_initial_state() {
@@ -487,5 +854,159 @@ mod tests {
     fn short_id_is_8_chars() {
         let id = short_id();
         assert_eq!(id.len(), 8);
+    }
+
+    #[test]
+    fn normal_typing_paste_history_and_tool_controls() {
+        let mut tui = Tui::new(
+            "edit a file".into(),
+            "configured-model".into(),
+            "provider".into(),
+        );
+        for c in "why? café 🦋".chars() {
+            tui.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        assert_eq!(tui.input.text(), "why? café 🦋");
+        assert!(!tui.show_help);
+        tui.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT));
+        assert_eq!(tui.input.text(), "why? café 🦋\n");
+        tui.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(
+            matches!(tui.rx.try_recv().unwrap(),TuiEvent::Submit(text) if text=="why? café 🦋\n")
+        );
+        tui.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(tui.input.text(), "why? café 🦋\n");
+        tui.apply_agent_update(AgentUpdate::ToolCallStart {
+            name: "read_file".into(),
+            arguments: "{}".into(),
+        });
+        tui.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert!(matches!(
+            tui.log.messages.back(),
+            Some(Message::ToolCall { expanded: true, .. })
+        ));
+    }
+
+    #[test]
+    fn approved_tool_result_survives_intervening_status_messages() {
+        let mut tui = Tui::new("edit".into(), "test".into(), "test".into());
+        tui.apply_agent_update(AgentUpdate::ToolCallStart {
+            name: "write_file".into(),
+            arguments: "{\"path\":\"sample.txt\"}".into(),
+        });
+        tui.log.push(Message::System {
+            text: "Review this action".into(),
+            kind: SystemKind::Warning,
+        });
+        tui.log.push(Message::System {
+            text: "Approved once".into(),
+            kind: SystemKind::Info,
+        });
+        tui.apply_agent_update(AgentUpdate::ToolCallResult {
+            name: "write_file".into(),
+            result: "{\"bytes\":19,\"path\":\"sample.txt\"}".into(),
+            ok: true,
+            duration_ms: 7,
+        });
+        tui.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        let Some(Message::ToolCall {
+            result,
+            ok,
+            duration_ms,
+            expanded,
+            ..
+        }) = tui.log.messages.front()
+        else {
+            panic!("tool card missing")
+        };
+        assert_eq!(
+            result.as_deref(),
+            Some("{\"bytes\":19,\"path\":\"sample.txt\"}")
+        );
+        assert_eq!(*ok, Some(true));
+        assert_eq!(*duration_ms, Some(7));
+        assert!(*expanded);
+    }
+
+    #[test]
+    fn a_long_single_message_can_scroll_to_its_beginning_and_back() {
+        use ratatui::backend::TestBackend;
+        let mut tui = Tui::new("long answer".into(), "test".into(), "test".into());
+        let text = (1..=60)
+            .map(|n| format!("row {n:03} café 世界 🦋"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        tui.log.push(Message::Assistant {
+            text,
+            streaming: false,
+        });
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        let screen = |terminal: &Terminal<TestBackend>| {
+            terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>()
+        };
+        terminal.draw(|frame| tui.render(frame)).unwrap();
+        assert!(screen(&terminal).contains("row 060"));
+        for _ in 0..20 {
+            tui.handle_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE));
+        }
+        terminal.draw(|frame| tui.render(frame)).unwrap();
+        assert!(screen(&terminal).contains("row 001"));
+        for _ in 0..20 {
+            tui.handle_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+        }
+        terminal.draw(|frame| tui.render(frame)).unwrap();
+        assert!(screen(&terminal).contains("row 060"));
+    }
+
+    #[test]
+    fn long_international_input_fits_all_supported_terminal_sizes() {
+        use ratatui::backend::TestBackend;
+        let mut tui = Tui::new(
+            "Edit café 🦋".repeat(30),
+            "test-model".into(),
+            "provider".into(),
+        );
+        for c in "café 世界 🦋".repeat(200).chars() {
+            tui.input.insert_char(c);
+        }
+        for (width, height) in [(80, 24), (100, 30), (160, 45)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            for styles in [Styles::dark(), Styles::new(Palette::light())] {
+                tui.styles = styles;
+                terminal.draw(|frame| tui.render(frame)).unwrap();
+                let cursor = terminal.get_cursor_position().unwrap();
+                assert!(cursor.x < width && cursor.y < height);
+                tui.show_help = true;
+                terminal.draw(|frame| tui.render(frame)).unwrap();
+                tui.show_help = false;
+            }
+        }
+    }
+
+    #[test]
+    fn both_themes_paint_chat_and_help_backgrounds() {
+        use ratatui::backend::TestBackend;
+        let mut tui = Tui::new("theme check".into(), "test".into(), "test".into());
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        for palette in [Palette::dark(), Palette::light()] {
+            tui.styles = Styles::new(palette);
+            for help in [false, true] {
+                tui.show_help = help;
+                terminal.draw(|frame| tui.render(frame)).unwrap();
+                for position in [(79, 0), (79, 10), (2, 20)] {
+                    assert_eq!(
+                        terminal.backend().buffer()[position].bg,
+                        palette.bg,
+                        "background at {position:?}, help={help}"
+                    );
+                }
+            }
+        }
     }
 }

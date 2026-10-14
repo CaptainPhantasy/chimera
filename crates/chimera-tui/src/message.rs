@@ -56,7 +56,12 @@ impl Message {
         let text_len = match self {
             Message::User { text } | Message::Assistant { text, .. } => text.len(),
             Message::System { text, .. } => text.len(),
-            Message::ToolCall { name, arguments, result, .. } => {
+            Message::ToolCall {
+                name,
+                arguments,
+                result,
+                ..
+            } => {
                 let r = result.as_deref().unwrap_or("");
                 name.len() + arguments.len() + r.len() + 20
             }
@@ -75,10 +80,7 @@ impl Message {
                     Span::styled("you", styles.role_user()),
                 ])];
                 for wrap in wrap_text(text, width.saturating_sub(2)) {
-                    lines.push(Line::from(Span::styled(
-                        format!("  {wrap}"),
-                        styles.text(),
-                    )));
+                    lines.push(Line::from(Span::styled(format!("  {wrap}"), styles.text())));
                 }
                 lines
             }
@@ -93,10 +95,7 @@ impl Message {
                     },
                 ])];
                 for wrap in wrap_text(text, width.saturating_sub(2)) {
-                    lines.push(Line::from(Span::styled(
-                        format!("  {wrap}"),
-                        styles.text(),
-                    )));
+                    lines.push(Line::from(Span::styled(format!("  {wrap}"), styles.text())));
                 }
                 lines
             }
@@ -119,15 +118,10 @@ impl Message {
                     Some(false) => styles.error(),
                     None => styles.warning(),
                 };
-                let dur_str = duration_ms
-                    .map(|d| format!(" {d}ms"))
-                    .unwrap_or_default();
+                let dur_str = duration_ms.map(|d| format!(" {d}ms")).unwrap_or_default();
 
                 let header = Line::from(vec![
-                    Span::styled(
-                        format!("  {icon} ", ),
-                        status_style,
-                    ),
+                    Span::styled(format!("  {icon} ",), status_style),
                     Span::styled(name.clone(), styles.info()),
                     Span::styled(dur_str, styles.text_subtle()),
                     Span::styled(" [tab to expand]", styles.text_faint()),
@@ -171,23 +165,14 @@ impl Message {
                     SystemKind::Error => ("✗", styles.error()),
                 };
                 let mut lines: Vec<Line<'static>> = Vec::new();
-                for wrap in wrap_text(text, width.saturating_sub(4)).into_iter().take(1) {
+                for wrap in wrap_text(text, width.saturating_sub(4)).into_iter() {
                     lines.push(Line::from(vec![
                         Span::styled(format!("  {icon} "), s),
                         Span::styled(wrap, s),
                     ]));
                 }
                 if lines.is_empty() {
-                    lines.push(Line::from(Span::styled(
-                        format!("  {icon} "),
-                        s,
-                    )));
-                }
-                for wrap in wrap_text(text, width.saturating_sub(4)).into_iter().skip(1) {
-                    lines.push(Line::from(Span::styled(
-                        format!("    {wrap}"),
-                        s,
-                    )));
+                    lines.push(Line::from(Span::styled(format!("  {icon} "), s)));
                 }
                 lines
             }
@@ -195,10 +180,7 @@ impl Message {
                 vec![Line::from(vec![
                     Span::styled("─".repeat(3), styles.text_faint()),
                     Span::styled(format!(" {label} "), styles.text_subtle()),
-                    Span::styled(
-                        "─".repeat(3),
-                        styles.text_faint(),
-                    ),
+                    Span::styled("─".repeat(3), styles.text_faint()),
                 ])]
             }
         }
@@ -207,33 +189,21 @@ impl Message {
 
 /// Word-wrap text to a max character width.
 fn wrap_text(text: &str, max_width: usize) -> Vec<String> {
-    if max_width == 0 {
-        return vec![text.to_string()];
-    }
+    let max_width = max_width.max(1);
     let mut result = Vec::new();
     for paragraph in text.split('\n') {
-        if paragraph.is_empty() {
-            result.push(String::new());
-            continue;
-        }
-        let mut current = String::new();
-        for word in paragraph.split_whitespace() {
-            if current.is_empty() {
-                current = word.to_string();
-            } else if current.len() + 1 + word.len() <= max_width {
-                current.push(' ');
-                current.push_str(word);
-            } else {
-                result.push(std::mem::take(&mut current));
-                current = word.to_string();
+        let mut line = String::new();
+        let mut columns = 0;
+        for c in paragraph.chars() {
+            let width = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
+            if columns + width > max_width && !line.is_empty() {
+                result.push(std::mem::take(&mut line));
+                columns = 0;
             }
+            line.push(c);
+            columns += width;
         }
-        if !current.is_empty() {
-            result.push(current);
-        }
-    }
-    if result.is_empty() {
-        result.push(String::new());
+        result.push(line);
     }
     result
 }
@@ -272,9 +242,9 @@ impl MessageLog {
     }
 
     /// Scroll up (toward older messages).
-    pub fn scroll_up(&mut self) {
-        let len = self.messages.len();
-        if self.scroll_offset < len.saturating_sub(1) {
+    pub fn scroll_up(&mut self, max_offset: usize) {
+        self.scroll_offset = self.scroll_offset.min(max_offset);
+        if self.scroll_offset < max_offset {
             self.scroll_offset += 1;
         }
     }
@@ -369,10 +339,12 @@ mod tests {
     fn message_log_scrolls() {
         let mut log = MessageLog::new(100);
         for i in 0..10 {
-            log.push(Message::User { text: format!("msg {i}") });
+            log.push(Message::User {
+                text: format!("msg {i}"),
+            });
         }
         assert!(log.at_bottom());
-        log.scroll_up();
+        log.scroll_up(9);
         assert!(!log.at_bottom());
         assert_eq!(log.scroll_offset, 1);
         log.scroll_down();
@@ -382,7 +354,9 @@ mod tests {
     #[test]
     fn user_message_renders_with_label() {
         let styles = Styles::dark();
-        let msg = Message::User { text: "hello".into() };
+        let msg = Message::User {
+            text: "hello".into(),
+        };
         let lines = msg.to_lines(&styles, 80);
         assert!(lines.len() >= 2);
     }
@@ -390,7 +364,10 @@ mod tests {
     #[test]
     fn assistant_streaming_shows_cursor() {
         let styles = Styles::dark();
-        let msg = Message::Assistant { text: "thinking".into(), streaming: true };
+        let msg = Message::Assistant {
+            text: "thinking".into(),
+            streaming: true,
+        };
         let lines = msg.to_lines(&styles, 80);
         // Header line should contain the cursor block
         let header_str = format!("{:?}", lines[0]);
@@ -434,7 +411,9 @@ mod tests {
     #[test]
     fn divider_renders_dashes() {
         let styles = Styles::dark();
-        let msg = Message::Divider { label: "Iteration 2".into() };
+        let msg = Message::Divider {
+            label: "Iteration 2".into(),
+        };
         let lines = msg.to_lines(&styles, 80);
         assert_eq!(lines.len(), 1);
     }
@@ -442,9 +421,34 @@ mod tests {
     #[test]
     fn system_message_renders_icon() {
         let styles = Styles::dark();
-        let msg = Message::System { text: "done".into(), kind: SystemKind::Success };
+        let msg = Message::System {
+            text: "done".into(),
+            kind: SystemKind::Success,
+        };
         let lines = msg.to_lines(&styles, 80);
         assert!(!lines.is_empty());
+    }
+
+    #[test]
+    fn long_error_continuations_are_rendered_once() {
+        let message = Message::System {
+            text: "first error line\nsecond error line\nthird error line".into(),
+            kind: SystemKind::Error,
+        };
+        let lines = message.to_lines(&Styles::dark(), 80);
+        let text = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(text.matches("second error line").count(), 1, "{text}");
+        assert_eq!(text.matches("third error line").count(), 1, "{text}");
+        assert_eq!(lines.len(), 3);
     }
 
     #[test]

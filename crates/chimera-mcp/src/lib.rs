@@ -1,3 +1,6 @@
+pub mod stdio;
+pub use stdio::{StdioMcpClient, StdioOptions};
+
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
@@ -14,8 +17,10 @@ pub struct McpServer {
     /// Command to start the server (for stdio transport).
     pub command: Option<String>,
     /// Arguments for the command.
+    #[serde(default)]
     pub args: Vec<String>,
     /// Environment variables for the server process.
+    #[serde(default)]
     pub env: std::collections::HashMap<String, String>,
 }
 
@@ -60,8 +65,10 @@ pub struct McpResource {
     /// Resource name.
     pub name: String,
     /// MIME type.
+    #[serde(default, rename = "mimeType", alias = "mime_type")]
     pub mime_type: Option<String>,
     /// Description.
+    #[serde(default)]
     pub description: Option<String>,
 }
 
@@ -88,6 +95,23 @@ pub enum McpContent {
     Image { data: String, mime_type: String },
     /// Resource reference.
     Resource { uri: String },
+    Audio { data: String, mime_type: String },
+    EmbeddedResource { resource: McpResourceContents },
+    ResourceBundle { contents: Vec<McpResourceContents> },
+    ResourceLink { uri: String, name: String, metadata: serde_json::Value },
+    Structured { data: serde_json::Value },
+}
+
+/// Resource content preserves its URI, media type, and either text or base64 data.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpResourceContents {
+    pub uri: String,
+    #[serde(default, rename = "mimeType", alias = "mime_type")]
+    pub mime_type: Option<String>,
+    #[serde(default)]
+    pub text: Option<String>,
+    #[serde(default)]
+    pub blob: Option<String>,
 }
 
 // ---------------------------------------------------------------------------

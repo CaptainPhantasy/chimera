@@ -9,3 +9,9 @@ _archive/
 
 .env
 node_modules/
+
+# Local conversations, credentials and recoverable working copies
+.chimera/
+.env.*
+!.env.example
+__pycache__/

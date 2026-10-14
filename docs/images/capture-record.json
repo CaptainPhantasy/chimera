@@ -29,5 +29,13 @@
       "input": "/setup<Enter>",
       "transcript_sha256": "7b77bc2712b93fbfe5fe1f976f16bd259fea67a0043ec06e6b2579a6c1a62f35"
     }
-  ]
+  ],
+  "workflow_update": {
+    "image": "chimera-connect.png",
+    "source_base_commit": "5b1672f70bcd758e38d24c04818176f0c7eec2fc",
+    "source_manifest": ".floyd/workflow-checks/feature1.json",
+    "binary_sha256": "2f94fef9b0e7e97531f452a98e72a41473fd5ae3e8de8aa3b370322f4b7c8b8b",
+    "image_sha256": "c4944da8311fc77fde390573bce16a588cd0becff55d5c337e7abf2cf80a852a",
+    "method": "Real provider chooser in the built app, captured from terminal output. No model inference request."
+  }
 }

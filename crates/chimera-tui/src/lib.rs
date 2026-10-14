@@ -11,6 +11,8 @@
 
 pub mod app;
 pub mod chat;
+mod connect;
+pub mod dialog;
 pub mod help;
 pub mod input;
 pub mod message;

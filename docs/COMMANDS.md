@@ -28,7 +28,7 @@ Type these in CHIMERA, not at your shell prompt.
 | Command | What it does |
 | --- | --- |
 | `/help` or `/?` | Open help. |
-| `/setup` | Show setup guidance and your settings-file path. |
+| `/connect` or `/setup` | Choose a provider, enter a masked key, check its connection, and save a model. |
 | `/reload` | Reload saved settings when no request is running. |
 | `/model` | Show the selected model. |
 | `/model NAME` | Change the model for this open chat; does not save it to the settings file. |
@@ -53,7 +53,8 @@ Plain text sends a normal request. A saved read-only policy still applies to `/r
 | Alt+Left / Alt+Right | Move by word. |
 | PageUp / PageDown | Scroll the conversation. |
 | Tab | Expand the latest tool result. |
-| F1 / Escape | Open / close help. |
+| F1 / Escape | Open / close help; Escape cancels an open chooser. |
+| F2 | Open provider setup while keeping your draft. |
 | Ctrl+L | Switch theme. |
 | Ctrl+C | Stop work and leave chat; cancel active work in ordinary terminal mode. |
 

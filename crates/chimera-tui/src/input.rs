@@ -315,10 +315,11 @@ impl InputBar {
 
 /// The known slash commands (name, short description).
 pub const SLASH_COMMANDS: &[(&str, &str)] = &[
+    ("connect", "choose and connect a provider"),
     ("help", "show keyboard shortcuts and commands"),
     ("run", "execute an objective"),
     ("plan", "plan without write side effects"),
-    ("setup", "show model setup help"),
+    ("setup", "choose and connect a provider"),
     ("reload", "reload saved model settings"),
     ("model", "show or change the active model"),
     ("tools", "list available tools"),

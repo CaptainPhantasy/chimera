@@ -42,7 +42,7 @@ chimera tui
 
 Replace the example project path. Settings normally live in `~/.chimera/config.json`. `init` creates a missing settings file and preserves an existing one. It does not install or start a model service.
 
-An interactive screen can remain open while you fix missing settings. `/setup` shows the selected settings file; `/reload` reads it again. Ordinary `run` and `plan` commands require valid model settings before starting work.
+An interactive screen can remain open while you fix missing settings. `/connect` (also `/setup` or F2) opens guided provider setup; `/reload` reads saved settings again. Ordinary `run` and `plan` commands require valid model settings before starting work.
 
 ### Installing a local release package
 
@@ -57,7 +57,9 @@ Put `$HOME/.local/bin` on your shell's command search path if needed. Use `updat
 
 ## Model settings
 
-CHIMERA uses a service that accepts OpenAI-compatible chat requests. That means the service understands the request format CHIMERA sends; the service can run locally or be hosted elsewhere. A provider name is a display label, not a preset that supplies an address or key.
+CHIMERA uses a service that accepts OpenAI-compatible chat requests. That means the service understands the request format CHIMERA sends; the service can run locally or be hosted elsewhere. The provider chooser supplies addresses for common services, asks for a masked key, checks the service, and lists its models. Choosing a model saves the connection and returns to chat. Saved providers remain available in the chooser. Escape cancels; F2 preserves an unsent draft. The check reads the model list without sending a chat request.
+
+For advanced manual settings, a provider name in the file remains a display label. The file format below is still supported.
 
 This example is for a service on your own computer:
 
@@ -336,7 +338,7 @@ Inspect destinations with `notify destinations`; disable one with `notify disabl
 | Symptom | What to check |
 | --- | --- |
 | `chimera` is not found | Use the executable's full path, or add its installation folder to your shell's command search path. |
-| “Model setup needed” | Use `/setup`, correct the file, save, then `/reload`. |
+| “Model setup needed” | Use `/connect`, choose the service, and correct its address or key. |
 | Settings cannot be parsed | Check JSON syntax, recognized fields, and the file selected by `CHIMERA_CONFIG`. |
 | Changes to settings seem ignored | Environment values override the file. Restart after changing environment values. |
 | Connection refused | Start the configured model service and check the address and port. |

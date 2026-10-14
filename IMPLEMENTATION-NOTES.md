@@ -58,3 +58,11 @@ The supplied guide was adapted to this existing workspace: no `cargo init`, no d
 There is no unresolved documentation gap for the interfaces changed here. A live model account, physical keyboard behavior in every native terminal, other operating systems, forced-kill recovery, full-workspace diagnostics, and overall beta readiness were not tested by this task. The controlled test service and browser wrapper do not prove those results. The knowledgebase's source-level lifecycle note predates the final runtime tests; the passing runtime evidence is linked above.
 
 The [final evidence check](.floyd/ratatui-refresh/final-verification.json) ties the passing reports to the unchanged final source, executable, library, documents, and saved screenshots. The blueprint retains its original review state as history and identifies the review that was completed before implementation.
+
+## 2026-10-14: Guided provider setup
+
+Feature 1 of the ten requested workflow changes: `/connect`, `/setup`, and F2 open the provider chooser. Presets supply service addresses; custom services use the same form. Key input is masked, stays out of conversation/history, and is saved with owner-only permissions. A cancellable background check reads the service's models, handles rejected keys and unavailable/empty services, and saves the chosen connection and model atomically while preserving previous settings. Existing settings, environment overrides, chat layout and exact-action approvals remain supported. No dependency versions changed; existing reqwest/uuid workspace packages are reused.
+
+Verification: 363 workspace tests, 84 targeted config/interface tests, strict targeted Clippy, package formatting, 18 actual-terminal provider checks and 78 existing setup/reload checks passed. These use isolated local services; no paid model or hosted account was called. Rendered terminal output was inspected for masking and layout. Temporary harness observations are retained: differential screen output needed terminal-cell parsing, and the test must drain output while waiting between Escape and the next command.
+
+Evidence: `.floyd/workflow-checks/` and retained workflow reports under the operating-system temporary directory. Final feature verification receipts identify the source and executable.

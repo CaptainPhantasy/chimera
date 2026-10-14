@@ -68,3 +68,25 @@ Independent source review completed before implementation. Accepted corrections:
 - The panic hook uses thread-local active ownership, set by terminal setup and cleared by restoration. Only a panic on the active terminal owner restores before reporting. Other threads and later non-terminal panics use the previous reporter without terminal cleanup. The ordinary returned-error guard still restores when the UI exits because a worker task failed.
 - Replace the private generic cleanup closure with a small public `TerminalGuard` used by the actual runner and isolated lifecycle probe. Create it before setup so partial setup and early errors are covered. Do not claim forced-kill recovery.
 - Bound each channel-update batch before returning to drawing and keyboard handling. Preserve update order and process remaining updates on later frames.
+
+## 2026-10-14: Ten everyday workflows
+
+User objective: modernize the ten compared features, commit each completed feature separately, then stop. Work on current main; preserve previous interface work, terminal controls, stored data, and exact-action approvals. No dependency upgrades or paid model requests.
+
+Use the existing Ratatui 0.29.0 / Crossterm 0.28.1 screen. Add reusable searchable lists and editable forms as overlays. The main loop continues drawing while connection checks run in a worker. Keys update overlay state, confirmed choices produce explicit actions, storage services persist them, and the screen reports the real result. Escape cancels and returns the untouched chat draft. Use masked key fields, bounded responses, private atomic storage, and useful retry states.
+
+Screen: existing chat underneath a centered panel with title, search or fields, scrollable choices, error/status text and key hints. At narrow sizes use the full available width; keep selection visible and wrap details. Check dark/light themes and 40x15, 80x24, 120x32 terminals.
+
+Ordered milestones and exit criteria (one tested commit each):
+1. Provider chooser: presets plus custom addresses, masked key input, connection test, saved profiles, cancellation and useful errors.
+2. Model chooser: fetch available models, search, switch saved provider, persist selected default and honor explicit process overrides visibly.
+3. Conversation chooser: titles, dates, search, preview and resume in current screen, preserving unsent text.
+4. Rewind: automatic per-turn snapshots of agent-edited files, selectable history, exact restore preview and confirmation, preservation of displaced contents.
+5. Permissions: unified in-chat controls for mode and tool access using existing policy enforcement.
+6. Memory: conversational explicit remembering plus browse/edit/archive in chat, preserving history and not guessing consent to remember.
+7. Reusable tasks: discover saved procedures, create from current work, invoke by slash name in current conversation.
+8. External tools: saved guided connection setup, status, supported sign-in, attachment to interactive agent with existing approvals.
+9. Background work: in-chat task list, details, create/start/pause/resume/stop using actual scheduler.
+10. Long prompts: configured external editor round trip with correct terminal restoration, draft preservation on error and no automatic submission.
+
+Verification: targeted Rust tests and real terminal flows per milestone, strict Clippy, formatting of affected modules, then full workspace tests and final rendered screen inspection. Build output stays under .floyd/build-cache/beta-target because the machine-wide target points outside this workspace. Preserve failed logs. Source: OpenCode provider/model/session/editor documentation and Claude Code checkpoint/permissions/memory/skills/tool/task documentation inspected in this conversation; existing version-matched knowledgebase supplies widget and lifecycle rules.

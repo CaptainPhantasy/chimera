@@ -10,3 +10,5 @@ tracing = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 chimera-llm = { workspace = true }
+reqwest.workspace = true
+uuid.workspace = true

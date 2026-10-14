@@ -34,62 +34,32 @@ chimera tui
 
 Replace `/path/to/your/project` with the folder you want CHIMERA to work in. `init` creates the settings file if needed and preserves existing settings. The screen can open even when model setup is incomplete.
 
-Type `/setup` and press Enter. It shows the exact settings-file location. The usual location is `~/.chimera/config.json`; `CHIMERA_CONFIG` can select another file.
+Press F2 or type `/connect` and press Enter. `/setup` opens the same chooser.
 
-![Actual CHIMERA setup guidance](images/chimera-setup.png)
-
-*This demonstration uses a separate settings file. Your `/setup` output gives your own path.*
+![Provider chooser in the running CHIMERA app](images/chimera-connect.png)
 
 ## 3. Connect a model
 
-Edit the settings file in your text editor. Keep any existing settings you need. Choose one of these paths.
+1. Choose OpenAI, OpenRouter, Groq, LM Studio, Ollama, or Custom. Type to narrow the list; use the arrow keys and Enter to select.
+2. Keep the supplied address or enter your own. Local services must already be running with a model loaded.
+3. Paste the access key into the masked key field. Local services can usually leave it blank. Press Enter to check the connection.
+4. Choose from the models returned by the service. CHIMERA saves the connection and selected model, then returns to chat.
 
-### A model running on your computer
+Tab moves between fields. Ctrl+U clears a field. Escape cancels without changing your saved settings. Pressing F2 while composing a request preserves the draft.
 
-Start your model service and load a model in that service first. Copy its service address and exact model name into the file. For example:
+The check fetches model names; it does not send a chat request. A rejected key, unavailable service, or empty model list appears in the form so you can correct it and retry. Keys never enter the conversation or input history. Saved settings and their previous copies are readable only by your account.
 
-```json
-{
-  "provider": {
-    "name": "local",
-    "base_url": "http://127.0.0.1:1234/v1",
-    "model": "YOUR_LOADED_MODEL",
-    "api_key": ""
-  }
-}
-```
-
-Replace the example address if your service uses a different port. Replace `YOUR_LOADED_MODEL` with its actual model name. The address must accept the OpenAI-compatible chat format: the request format CHIMERA uses to talk to a model. A provider name such as `local` is only a label; it does not set the address for you.
-
-### A hosted model service
-
-Use the service's compatible base address, exact model name, and access key:
-
-```json
-{
-  "provider": {
-    "name": "my-provider",
-    "base_url": "https://YOUR_PROVIDER_HOST/v1",
-    "model": "YOUR_MODEL_NAME",
-    "api_key": "YOUR_PRIVATE_KEY"
-  }
-}
-```
-
-These are placeholders, not working credentials. Keep the key in your private settings or `CHIMERA_API_KEY`, never in chat or the repository. Hosted requests use your service account and may cost money.
-
-Save the file. In CHIMERA, type `/reload`. After a successful reload, send your request. If you changed environment settings instead of the file, restart CHIMERA; `/reload` cannot change the environment of an already running app.
+Saved connections appear at the top of `/connect`. Advanced file and environment settings remain available in the [manual](USER_MANUAL.md#model-settings). Explicit environment settings still apply on a later launch or `/reload`.
 
 ## 4. Check the connection
 
-In another terminal, from the same project:
+Send a short request in the same chat:
 
-```sh
-chimera doctor
-chimera run "Reply with a short greeting. Do not use tools."
+```text
+Reply with a short greeting. Do not use tools.
 ```
 
-`doctor` checks local settings and saved records. The greeting checks whether the configured model actually answers. If it cannot connect, confirm that the service is running, the address is right, and the named model is loaded. The [manual's troubleshooting section](USER_MANUAL.md#when-something-goes-wrong) covers other common errors.
+The provider chooser checks the model list. This greeting checks whether the selected model can answer. If needed, `chimera doctor` checks local settings and saved records. See [troubleshooting](USER_MANUAL.md#when-something-goes-wrong) for connection errors.
 
 ## 5. Do one small job
 

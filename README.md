@@ -34,7 +34,7 @@ cargo build --locked --release -p chimera-cli
 ./target/release/chimera tui
 ```
 
-The chat screen can open before a model is configured. Type `/setup` for the settings-file location. Follow the [quick start](docs/QUICKSTART.md) to connect your local model or hosted service, then use `/reload`.
+The chat screen can open before a model is configured. Type `/connect` or press F2, choose your provider, enter its key, and select a model. CHIMERA checks the connection and saves it. See the [quick start](docs/QUICKSTART.md).
 
 Run CHIMERA **from the project you want it to work on**. Conversations and project records live in that project's `.chimera/` folder.
 

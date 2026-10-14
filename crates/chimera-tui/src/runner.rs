@@ -107,6 +107,8 @@ pub enum TuiEvent {
     AgentDone,
     /// A user-submitted objective or command.
     Submit(String),
+    DialogAction(String, Vec<String>),
+    DialogClosed,
 }
 
 /// Updates pushed from the agent loop into the TUI.
@@ -149,6 +151,7 @@ pub struct Tui {
     pub objective: String,
     pub should_quit: bool,
     pub show_help: bool,
+    pub dialog: Option<crate::dialog::Dialog>,
     pub help_scroll: usize,
     /// Receiver for user-submit events.
     pub rx: mpsc::Receiver<TuiEvent>,
@@ -184,6 +187,7 @@ impl Tui {
             objective: objective.clone(),
             should_quit: false,
             show_help: false,
+            dialog: None,
             help_scroll: 0,
             rx,
             tx,
@@ -198,15 +202,20 @@ impl Tui {
             crate::help::render_scrolled(f, &self.styles, self.help_scroll);
             return;
         }
+        let mut visible_input = self.input.clone();
+        visible_input.focused = self.dialog.is_none();
         chat::render(
             f,
             &self.styles,
             &self.log,
             &self.status,
-            &self.input,
+            &visible_input,
             &self.objective,
             self.width,
         );
+        if let Some(dialog) = &self.dialog {
+            dialog.render(f, &self.styles);
+        }
     }
 
     /// Handle a keyboard event.
@@ -237,6 +246,19 @@ impl Tui {
             }
         }
 
+        if let Some(dialog) = &mut self.dialog {
+            match dialog.key(key) {
+                crate::dialog::Outcome::Stay => {}
+                crate::dialog::Outcome::Close => {
+                    self.dialog = None;
+                    let _ = self.tx.try_send(TuiEvent::DialogClosed);
+                }
+                crate::dialog::Outcome::Action(action, values) => {
+                    let _ = self.tx.try_send(TuiEvent::DialogAction(action, values));
+                }
+            }
+            return;
+        }
         // Help overlay.
         if self.show_help {
             match key.code {
@@ -271,6 +293,9 @@ impl Tui {
                 if !text.trim().is_empty() {
                     let _ = self.tx.try_send(TuiEvent::Submit(text));
                 }
+            }
+            KeyCode::F(2) => {
+                let _ = self.tx.try_send(TuiEvent::Submit("/connect".into()));
             }
             KeyCode::F(1) => {
                 self.show_help = true;
@@ -498,7 +523,7 @@ fn show_setup_needed(tui: &mut Tui) {
     tui.status.running = false;
     tui.status.mode = "SETUP".into();
     tui.log.push(Message::System {
-        text: "Model setup needed. Use /setup for the settings file and /reload after saving it. Your request has not been sent.".into(),
+        text: "Model setup needed. Use /connect to choose a provider and enter its key. Your request has not been sent.".into(),
         kind: SystemKind::Warning,
     });
 }
@@ -558,6 +583,7 @@ async fn run_screen(
     let (cancel, _) = tokio::sync::watch::channel(false);
     let (events, mut updates) = chimera_core::runtime::event_channel();
     let mut pending: Option<(uuid::Uuid, tokio::sync::oneshot::Sender<bool>)> = None;
+    let mut connections = crate::connect::Connections::default();
     let restore = TerminalGuard::new();
     let mut terminal = init_terminal()?;
     if let Some(objective) = initial.filter(|s| !s.trim().is_empty()) {
@@ -567,6 +593,7 @@ async fn run_screen(
     }
     let result: Result<()> = async {
         loop {
+            connections.poll(&mut tui.dialog).await;
             // A busy stream must still leave time for keys and drawing.
             for _ in 0..128 {
                 let Ok(update) = updates.try_recv() else { break };
@@ -624,7 +651,25 @@ async fn run_screen(
                 tui.log.push(Message::System { text, kind });
             }
             while let Ok(input) = tui.rx.try_recv() {
-                let TuiEvent::Submit(text) = input else { continue };
+                let text = match input {
+                    TuiEvent::DialogClosed => { connections.cancel(); continue; },
+                    TuiEvent::DialogAction(action, values) => {
+                        match connections.action(&action, &values, &config, &mut tui.dialog).await {
+                            Ok(Some(saved)) => {
+                                config = settings.accept(Ok(saved))?;
+                                tui.status.model = config.provider.model.clone();
+                                tui.status.provider = config.provider.name.clone();
+                                tui.status.mode = if profile.as_deref() == Some("read-only") { "PLAN" } else { "RUN" }.into();
+                                tui.log.push(Message::System { text: format!("Connected to {}. {} is saved as your default model. Your draft is ready to send.", config.provider.name, config.provider.model), kind: SystemKind::Success });
+                            },
+                            Ok(None) => {},
+                            Err(error) => if let Some(dialog) = &mut tui.dialog { dialog.note = error.to_string(); }
+                        }
+                        continue;
+                    },
+                    TuiEvent::Submit(text) => text,
+                    _ => continue,
+                };
                 let unsent = text.clone();
                 let trimmed = text.trim();
                 let (command, argument) = trimmed.split_once(' ').unwrap_or((trimmed, ""));
@@ -643,14 +688,9 @@ async fn run_screen(
                         } else { tui.log.push(Message::System { text: "No action is waiting for approval.".into(), kind: SystemKind::Warning }); }
                         continue;
                     }
-                    "/setup" => {
-                        let path = chimera_config::config_file_path()
-                            .map(|path| path.display().to_string())
-                            .unwrap_or_else(|| "Set CHIMERA_CONFIG to a settings file.".into());
-                        tui.log.push(Message::System {
-                            text: format!("Model settings file: {path}\nSet provider.base_url to your model service address and provider.model to its model name. A remote service also needs provider.api_key. Keep keys in the settings file, never in chat.\nRun chimera init in another terminal to create a missing file. Save changes, then use /reload here. Existing environment settings override file values; changing those needs a restart."),
-                            kind: SystemKind::Info,
-                        });
+                    "/setup" | "/connect" => {
+                        if active.is_some() { tui.log.push(Message::System { text: "Finish or cancel the current request before connecting a provider.".into(), kind: SystemKind::Warning }); }
+                        else { tui.dialog = Some(connections.open(&config)); }
                         continue;
                     }
                     "/reload" => {
@@ -745,7 +785,7 @@ async fn run_screen(
             if event::poll(Duration::from_millis(1))? {
                 match event::read()? {
                     Event::Key(key) => tui.handle_key(key),
-                    Event::Paste(text) => for character in text.chars() { tui.input.insert_char(character); },
+                    Event::Paste(text) => if let Some(dialog) = &mut tui.dialog { dialog.paste(&text); } else { for character in text.chars() { tui.input.insert_char(character); } },
                     _ => {},
                 }
             }

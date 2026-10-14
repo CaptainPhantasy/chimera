@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 // ---------------------------------------------------------------------------
 
 /// Top-level CHIMERA configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     #[serde(default)]
@@ -234,14 +234,6 @@ impl Config {
     }
 }
 
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            provider: ProviderConfig::default(),
-            agent: AgentConfig::default(),
-        }
-    }
-}
 
 /// Resolve the config file path: `$CHIMERA_CONFIG` or `~/.chimera/config.json`.
 pub fn config_file_path() -> Option<PathBuf> {

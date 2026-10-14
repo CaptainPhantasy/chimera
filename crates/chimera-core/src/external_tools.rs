@@ -529,8 +529,7 @@ for line in sys.stdin:
                 "test",
                 "use external echo",
                 &AgentConfig::default(),
-                events,
-                stopped,
+                crate::runtime::RunChannels { events, cancellation: stopped },
             ),
         )
         .await
@@ -579,8 +578,7 @@ for line in sys.stdin:
                 "test",
                 "deny external echo",
                 &AgentConfig::default(),
-                events,
-                stopped,
+                crate::runtime::RunChannels { events, cancellation: stopped },
             ),
         )
         .await

@@ -189,6 +189,7 @@ pub struct AgentRunResult {
 /// it calls the provider. If the model emits tool calls, it executes them via
 /// the router and appends tool-result messages. If the model emits only text,
 /// the loop ends with [`DoneReason::FinalAnswer`].
+#[allow(clippy::too_many_arguments)]
 pub async fn run_agent_loop<F>(
     provider: &dyn LlmProvider,
     tools: &dyn ToolRouter,
@@ -202,8 +203,14 @@ pub async fn run_agent_loop<F>(
 where
     F: FnMut(String, serde_json::Value) + Send,
 {
-    run_agent_loop_with_history(provider, tools, model, objective, creature_id, config,
-        available_tools, &[], stream_callback).await
+    run_agent_loop_with_history(provider, tools, model, objective, AgentLoopContext { creature_id, config, available_tools }, &[], stream_callback).await
+}
+
+/// Per-run identity, limits, and available tool definitions.
+pub struct AgentLoopContext<'a> {
+    pub creature_id: CreatureId,
+    pub config: &'a AgentConfig,
+    pub available_tools: &'a [ToolDefinition],
 }
 
 /// Resume a conversation and append `objective` exactly once. The current system
@@ -214,15 +221,14 @@ pub async fn run_agent_loop_with_history<F>(
     tools: &dyn ToolRouter,
     model: &str,
     objective: &str,
-    creature_id: CreatureId,
-    config: &AgentConfig,
-    available_tools: &[ToolDefinition],
+    context: AgentLoopContext<'_>,
     prior_messages: &[Message],
     stream_callback: &mut F,
 ) -> anyhow::Result<AgentRunResult>
 where
     F: FnMut(String, serde_json::Value) + Send,
 {
+    let AgentLoopContext { creature_id, config, available_tools } = context;
     anyhow::ensure!(!objective.trim().is_empty(), "objective must not be empty");
     anyhow::ensure!(config.max_iterations <= 1000, "max_iterations must be at most 1000");
     anyhow::ensure!(config.max_tokens != Some(0), "max_tokens must be positive when specified");
@@ -524,10 +530,7 @@ mod tests {
             _req: &CompletionRequest,
         ) -> Result<CompletionResponse, LlmError> {
             let mut guard = self.responses.lock().await;
-            guard
-                .pop()
-                .ok_or(LlmError::StreamEnd)
-                .map(|r| r)
+            guard.pop().ok_or(LlmError::StreamEnd)
         }
         async fn stream(
             &self,
@@ -795,8 +798,7 @@ mod tests {
         let router = FakeRouter { calls: tokio::sync::Mutex::new(vec![]) };
         let history = vec![Message::system("old system"), Message::user("old question"), Message::assistant("old answer")];
         let mut snapshots = Vec::new();
-        let result = run_agent_loop_with_history(&provider, &router, "test", "new question", Uuid::new_v4(),
-            &AgentConfig::default(), &[], &history, &mut |kind, value| {
+        let result = run_agent_loop_with_history(&provider, &router, "test", "new question", AgentLoopContext { creature_id: Uuid::new_v4(), config: &AgentConfig::default(), available_tools: &[] }, &history, &mut |kind, value| {
                 if kind == "messages" { snapshots.push(value); }
             }).await.unwrap();
         assert_eq!(result.messages.len(), 5);
@@ -925,7 +927,7 @@ mod tests {
             assert!(run_agent_loop(&provider,&router,"test","read",Uuid::new_v4(),&config,&[],&mut|_,_|{}).await.is_err());
         }
         let history=vec![Message::assistant("x".repeat(MAX_CONVERSATION_BYTES))];
-        assert!(run_agent_loop_with_history(&provider,&router,"test","read",Uuid::new_v4(),&AgentConfig::default(),&[],&history,&mut|_,_|{}).await.is_err());
+        assert!(run_agent_loop_with_history(&provider,&router,"test","read",AgentLoopContext { creature_id: Uuid::new_v4(), config: &AgentConfig::default(), available_tools: &[] },&history,&mut|_,_|{}).await.is_err());
         assert_eq!(provider.responses.lock().await.len(),1);
     }
 
@@ -942,7 +944,7 @@ mod tests {
         let provider=ScriptedProvider::new(vec![CompletionResponse{content:None,tool_calls:calls,finish_reason:Some("tool_calls".into()),usage:None}]);
         let tools=Results(tokio::sync::Mutex::new(0));
         let history=vec![Message::assistant("x".repeat(MAX_CONVERSATION_BYTES-40_000))];
-        let result=run_agent_loop_with_history(&provider,&tools,"test","read",Uuid::new_v4(),&AgentConfig::default(),&[],&history,&mut|_,_|{}).await.unwrap();
+        let result=run_agent_loop_with_history(&provider,&tools,"test","read",AgentLoopContext { creature_id: Uuid::new_v4(), config: &AgentConfig::default(), available_tools: &[] },&history,&mut|_,_|{}).await.unwrap();
         assert!(matches!(result.done_reason,DoneReason::Error));assert!(result.error.unwrap().contains("remaining conversation limit"));
         assert_eq!(*tools.0.lock().await,1);assert!(serde_json::to_vec(&result.messages).unwrap().len()<=MAX_CONVERSATION_BYTES);
     }

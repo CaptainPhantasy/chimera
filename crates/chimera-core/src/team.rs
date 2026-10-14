@@ -583,8 +583,7 @@ impl TeamRegistry {
             &model,
             &objective,
             &config,
-            out,
-            stopped,
+            crate::runtime::RunChannels { events: out, cancellation: stopped },
         );
         tokio::pin!(run);
         let result = loop {

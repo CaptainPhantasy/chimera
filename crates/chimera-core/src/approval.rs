@@ -100,6 +100,30 @@ fn validate(policy:&ProjectPolicy)->Result<()> {
     Ok(())
 }
 
+/// Hide configured credentials on screens and in command output. Exact approval
+/// binding continues to use the original action in private project storage.
+pub fn display_value(mut value: serde_json::Value) -> serde_json::Value {
+    fn visit(value: &mut serde_json::Value) {
+        match value {
+            serde_json::Value::Object(fields) => for (key, value) in fields {
+                let key=key.to_ascii_lowercase();
+                if key=="env" || key=="environment" {
+                    if let Some(vars)=value.as_object_mut() {
+                        for value in vars.values_mut() { *value=serde_json::json!("[private configured value]"); }
+                    } else { *value=serde_json::json!("[private configured value]"); }
+                } else if key.contains("password") || key.contains("secret") || key.contains("api_key") || key.contains("apikey") || key=="authorization" || key=="token" || key.ends_with("_token") {
+                    *value=serde_json::json!("[private configured value]");
+                } else { visit(value); }
+            },
+            serde_json::Value::Array(items) => for item in items {visit(item)},
+            _=>(),
+        }
+    }
+    visit(&mut value);
+    value
+}
+
+
 #[cfg(test)] mod tests {
     use super::*;
     #[test] fn display_masks_credentials_without_changing_exact_action() {
@@ -140,26 +164,3 @@ fn validate(policy:&ProjectPolicy)->Result<()> {
         assert!(second.change(|p|{p.autonomy="full".into();Ok(())}).is_err());assert_eq!(first.get().unwrap().autonomy,"low");
     }
 }
-/// Hide configured credentials on screens and in command output. Exact approval
-/// binding continues to use the original action in private project storage.
-pub fn display_value(mut value: serde_json::Value) -> serde_json::Value {
-    fn visit(value: &mut serde_json::Value) {
-        match value {
-            serde_json::Value::Object(fields) => for (key, value) in fields {
-                let key=key.to_ascii_lowercase();
-                if key=="env" || key=="environment" {
-                    if let Some(vars)=value.as_object_mut() {
-                        for value in vars.values_mut() { *value=serde_json::json!("[private configured value]"); }
-                    } else { *value=serde_json::json!("[private configured value]"); }
-                } else if key.contains("password") || key.contains("secret") || key.contains("api_key") || key.contains("apikey") || key=="authorization" || key=="token" || key.ends_with("_token") {
-                    *value=serde_json::json!("[private configured value]");
-                } else { visit(value); }
-            },
-            serde_json::Value::Array(items) => for item in items {visit(item)},
-            _=>(),
-        }
-    }
-    visit(&mut value);
-    value
-}
-

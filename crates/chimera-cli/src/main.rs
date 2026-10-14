@@ -782,7 +782,7 @@ async fn run_objective_with_tools(objective: String, mode: ExecutionMode, format
     let mut prompt_cancel=cancel.subscribe();
     let mut cancelled_prompts=Vec::new();
     let result = {
-        let run = session.run(&provider, tools, &cfg.provider.model, &objective, &config, events, cancellation);
+        let run = session.run(&provider, tools, &cfg.provider.model, &objective, &config, chimera_core::runtime::RunChannels { events, cancellation });
         tokio::pin!(run);
         let result = loop {
             tokio::select! {
@@ -1323,7 +1323,7 @@ mod tests {
             let (events,mut receive)=chimera_core::runtime::event_channel();let (cancel,cancelled)=tokio::sync::watch::channel(false);
             let config=AgentConfig::default();let mut held=Vec::new();let mut action=None;
             let outcome={
-                let run=session.run(&PromptModel,tools,"test","request a reviewed write",&config,events,cancelled);tokio::pin!(run);
+                let run=session.run(&PromptModel,tools,"test","request a reviewed write",&config,chimera_core::runtime::RunChannels { events, cancellation: cancelled });tokio::pin!(run);
                 tokio::time::timeout(std::time::Duration::from_secs(5),async {
                     loop {tokio::select! {
                         result=&mut run=>break result,

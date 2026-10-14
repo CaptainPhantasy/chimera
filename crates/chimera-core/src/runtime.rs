@@ -16,6 +16,12 @@ pub enum RunEvent {
     Approval { id: Uuid, call: ToolCall, answer: oneshot::Sender<bool> },
 }
 
+/// Event delivery and cancellation for a saved run.
+pub struct RunChannels {
+    pub events: mpsc::Sender<RunEvent>,
+    pub cancellation: watch::Receiver<bool>,
+}
+
 /// The queue is bounded. A stalled display stops the run instead of losing events.
 pub fn event_channel() -> (mpsc::Sender<RunEvent>, mpsc::Receiver<RunEvent>) {
     mpsc::channel(256)
@@ -97,9 +103,9 @@ impl SavedSession {
 
     pub async fn run(
         &mut self, provider: &dyn LlmProvider, tools: Arc<dyn ToolRouter>, model: &str,
-        objective: &str, config: &AgentConfig, events: mpsc::Sender<RunEvent>,
-        mut cancellation: watch::Receiver<bool>,
+        objective: &str, config: &AgentConfig, channels: RunChannels,
     ) -> Result<AgentRunResult> {
+        let RunChannels { events, mut cancellation } = channels;
         anyhow::ensure!(!objective.trim().is_empty(), "the request is empty");
         let _lease = self.store.claim_run(self.id)?;
         let current = self.store.load(self.id).await?;
@@ -172,7 +178,7 @@ impl SavedSession {
         };
         let outcome = {
             let run = agent::run_agent_loop_with_history(provider, &guarded, model, objective,
-                self.id, &effective_config, &definitions, &self.messages, &mut callback);
+                agent::AgentLoopContext { creature_id: self.id, config: &effective_config, available_tools: &definitions }, &self.messages, &mut callback);
             tokio::pin!(run);
             tokio::select! {
                 biased;
@@ -333,12 +339,12 @@ mod tests {
         let mut saved = SavedSession::create(root.clone(),"remember apricot").await.unwrap();
         let (events, _receive) = event_channel();
         let (_cancel,cancelled) = watch::channel(false);
-        let first = saved.run(&Answer,tools.clone(),"test","remember apricot",&AgentConfig::default(),events.clone(),cancelled.clone()).await.unwrap();
+        let first = saved.run(&Answer,tools.clone(),"test","remember apricot",&AgentConfig::default(),RunChannels { events: events.clone(), cancellation: cancelled.clone() }).await.unwrap();
         assert!(matches!(first.done_reason,agent::DoneReason::FinalAnswer));
         let id = saved.id;
         drop(saved);
         let mut reopened = SavedSession::resume(root.clone(),id).await.unwrap();
-        let second = reopened.run(&Answer,tools,"what fruit?", "what fruit?",&AgentConfig::default(),events,cancelled).await.unwrap();
+        let second = reopened.run(&Answer,tools,"what fruit?", "what fruit?",&AgentConfig::default(),RunChannels { events, cancellation: cancelled }).await.unwrap();
         assert!(second.final_answer.unwrap().contains("remember apricot + what fruit?"));
         assert_eq!(reopened.messages.iter().filter(|m|m.content.as_deref()==Some("remember apricot")).count(),1);
         let child = reopened.store.fork(id).await.unwrap();
@@ -362,7 +368,7 @@ mod tests {
         let (events,_receive) = event_channel();
         let (cancel,cancelled) = watch::channel(false);
         let stopper = tokio::spawn(async move { tokio::task::yield_now().await; cancel.send_replace(true); });
-        let result = saved.run(&Stalled,tools,"test","cancel me",&AgentConfig::default(),events,cancelled).await;
+        let result = saved.run(&Stalled,tools,"test","cancel me",&AgentConfig::default(),RunChannels { events, cancellation: cancelled }).await;
         stopper.await.unwrap();
         assert!(result.unwrap_err().to_string().contains("cancelled"));
         let state = saved.store.load(saved.id).await.unwrap();
@@ -407,7 +413,7 @@ mod tests {
         let mut saved=SavedSession::create(project.clone(),"first request").await.unwrap();
         let id=saved.id;let (events,_receive)=event_channel();let (_cancel,cancelled)=watch::channel(false);
         let absent=vec!["other-session-secret","other-creature-secret","nonsemantic-secret","unrelated-project-secret","metadata must stay outside"];
-        saved.run(&InspectMemory {expected:"The project mascot is an amber heron.",absent:absent.clone()},tools.clone(),"test","first request",&cfg,events.clone(),cancelled.clone()).await.unwrap();
+        saved.run(&InspectMemory {expected:"The project mascot is an amber heron.",absent:absent.clone()},tools.clone(),"test","first request",&cfg,RunChannels { events: events.clone(), cancellation: cancelled.clone() }).await.unwrap();
         drop(saved);
         let restarted=FileMemoryStore::new(project.clone());
         restarted.forget(first_id).await.unwrap();
@@ -415,7 +421,7 @@ mod tests {
         drop(restarted);
         let mut saved=SavedSession::resume(project,id).await.unwrap();
         let mut absent=absent;absent.push("amber heron");
-        let result=saved.run(&InspectMemory {expected:"The project mascot is now a violet otter.",absent},tools,"test","second request",&cfg,events,cancelled).await.unwrap();
+        let result=saved.run(&InspectMemory {expected:"The project mascot is now a violet otter.",absent},tools,"test","second request",&cfg,RunChannels { events, cancellation: cancelled }).await.unwrap();
         assert!(matches!(result.done_reason,agent::DoneReason::FinalAnswer));
         for objective in ["first request","second request"] {assert_eq!(saved.messages.iter().filter(|m|m.content.as_deref()==Some(objective)).count(),1);}
         assert_eq!(cfg.system_prompt,"Preserve this configured system prompt.");
@@ -440,7 +446,7 @@ mod tests {
         let mut saved=SavedSession::create(project.clone(),"memory failure").await.unwrap();
         let tools=Arc::new(chimera_tools::DefaultToolRouter::new(Some(project)));
         let (events,_receive)=event_channel();let (_cancel,cancelled)=watch::channel(false);
-        let result=tokio::time::timeout(std::time::Duration::from_secs(2),saved.run(&Stalled,tools,"test","memory failure",&AgentConfig::default(),events,cancelled)).await.unwrap();
+        let result=tokio::time::timeout(std::time::Duration::from_secs(2),saved.run(&Stalled,tools,"test","memory failure",&AgentConfig::default(),RunChannels { events, cancellation: cancelled })).await.unwrap();
         assert!(result.unwrap_err().to_string().contains("saved project facts"));
         let state=saved.store.load(saved.id).await.unwrap();assert!(!state.active);
         assert!(state.events.iter().any(|event|matches!(event,SessionEvent::Custom {key,payload} if key=="run_outcome" && payload["outcome"]=="failed")));
@@ -463,7 +469,7 @@ mod tests {
         let tools=Arc::new(chimera_tools::DefaultToolRouter::new(Some(project.clone())));
         let (events,mut receive)=event_channel();let (_cancel,cancelled)=watch::channel(false);
         let decisions=tokio::spawn(async move {let mut count=0;while let Some(event)=receive.recv().await {if let RunEvent::Approval{call,answer,..}=event {assert_eq!(call.tool,"write_file");count+=1;answer.send(false).unwrap();}}count});
-        let result=saved.run(&SuggestWrite,tools,"test","deny write",&AgentConfig::default(),events,cancelled).await.unwrap();
+        let result=saved.run(&SuggestWrite,tools,"test","deny write",&AgentConfig::default(),RunChannels { events, cancellation: cancelled }).await.unwrap();
         assert!(matches!(result.done_reason,agent::DoneReason::Error));assert_eq!(decisions.await.unwrap(),1);assert!(!project.join("forbidden.txt").exists());
     }
 }

@@ -833,17 +833,37 @@ mod tests {
         socket.flush().await.unwrap();
     }
 
+    async fn read_http_request(socket: &mut tokio::net::TcpStream) {
+        use tokio::io::AsyncReadExt;
+        let mut request = Vec::new();
+        loop {
+            let mut chunk = [0; 1024];
+            let count = socket.read(&mut chunk).await.unwrap();
+            assert!(count > 0, "connection closed before the complete request");
+            request.extend_from_slice(&chunk[..count]);
+            assert!(request.len() <= 65536, "test request exceeded its size limit");
+            if let Some(end) = request.windows(4).position(|part| part == b"\r\n\r\n") {
+                let headers = std::str::from_utf8(&request[..end]).unwrap();
+                let length = headers.lines().find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().unwrap())
+                }).unwrap_or(0);
+                if request.len() >= end + 4 + length { return; }
+            }
+        }
+    }
+
     #[tokio::test]
     async fn network_stream_delivers_before_server_finishes_and_stops_at_done_marker() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::io::AsyncWriteExt;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let (first_tx, first_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = tokio::sync::oneshot::channel();
         let server = tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
-            let mut request = vec![0; 8192];
-            socket.read(&mut request).await.unwrap();
+            read_http_request(&mut socket).await;
             socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n").await.unwrap();
             send_chunk(&mut socket, &text_event("first")).await;
             first_rx.await.unwrap(); // The second event cannot exist until the first reached the caller.
@@ -872,8 +892,7 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
-            let mut request = vec![0; 8192];
-            socket.read(&mut request).await.unwrap();
+            read_http_request(&mut socket).await;
             let mut byte = [0];
             while socket.read(&mut byte).await.unwrap_or(0) != 0 {}
         });
@@ -885,14 +904,13 @@ mod tests {
 
 
     async fn fixed_http_server(status: &str, body: Vec<u8>) -> (String, tokio::task::JoinHandle<()>) {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::io::AsyncWriteExt;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let header = format!("HTTP/1.1 {status}\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
         let server = tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
-            let mut request = [0; 8192];
-            socket.read(&mut request).await.unwrap();
+            read_http_request(&mut socket).await;
             socket.write_all(header.as_bytes()).await.unwrap();
             socket.write_all(&body).await.unwrap();
         });

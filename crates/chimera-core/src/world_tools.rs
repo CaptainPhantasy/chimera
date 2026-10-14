@@ -267,14 +267,12 @@ impl ToolRouter for WorldTools {
         let watchdog = async {
             loop {
                 tokio::time::sleep(Duration::from_millis(30)).await;
-                if let Err(error) = self.check_state().await {
-                    return Err::<(), _>(error);
-                }
+                self.check_state().await?;
             }
         };
         let result = tokio::select! {
             result = self.inner.call(local) => result,
-            stopped = watchdog => { stopped?; anyhow::bail!("selected world stopped") },
+            stopped = watchdog => { let stopped: Result<()> = stopped; stopped?; anyhow::bail!("selected world stopped") },
         };
         // A close can be saved while a bounded synchronous file call finishes.
         // Keep ownership until that decision has also been observed.
@@ -459,8 +457,7 @@ mod tests {
                 "test",
                 "world work",
                 &AgentConfig::default(),
-                events,
-                stopped,
+                crate::runtime::RunChannels { events, cancellation: stopped },
             )
             .await
             .unwrap();

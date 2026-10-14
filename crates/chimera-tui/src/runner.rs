@@ -727,7 +727,7 @@ async fn run_screen(
                 let events = events.clone();
                 let mut saved = session.take().context("saved conversation unavailable")?;
                 active = Some(tokio::spawn(async move {
-                    let result = saved.run(&provider, tools, &model, &objective, &agent_config, events, cancellation).await;
+                    let result = saved.run(&provider, tools, &model, &objective, &agent_config, chimera_core::runtime::RunChannels { events, cancellation }).await;
                     (saved, result)
                 }));
             }

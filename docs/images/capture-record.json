@@ -1,0 +1,33 @@
+{
+  "captured_at": "2026-10-14T20:49:58.128871+00:00",
+  "app_version": "chimera 0.1.0",
+  "source_commit": "8d86ead1ddb7b4e816fad07a5b1ef0bed599250b",
+  "binary_sha256": "723614f4a308e136425c50019a495ab979c67a0d464be208919b1306014f981e",
+  "capture_method": "Actual built executable in a 120 by 32 terminal. Raw output rendered with xterm and captured in Chrome. No generated interface or fabricated model responses.",
+  "model_requests": 0,
+  "scope": "Real local tool-list, help and setup use. These pictures do not show or certify a model conversation. Isolated demonstration settings; no private conversations or credentials.",
+  "quit_exit_code": 0,
+  "images": [
+    {
+      "file": "chimera-tools.png",
+      "sha256": "27841fb655acfdebcbd4725820d514f923a5cca76984bca7b5a53bfdcfcb591e",
+      "caption": "Built-in tool list in the running terminal app.",
+      "input": "/tools<Enter>",
+      "transcript_sha256": "b20476962efb507568e79fc8f67f68dc2396098aa8be960e89214c13834f88f9"
+    },
+    {
+      "file": "chimera-help.png",
+      "sha256": "e83d25426311ac8a3369b09200213c9730910485cb5e03e65c13e2cd8cacb4ad",
+      "caption": "The running app help screen.",
+      "input": "/help<Enter>",
+      "transcript_sha256": "090a2fbacf477ea88422d99d3c435e0a64bc44a1eb3c4feb85cb62fc3fd10221"
+    },
+    {
+      "file": "chimera-setup.png",
+      "sha256": "a6b442d601c687920457badcbcb380dd49e64dbac6011ae38b2a97d980e632a5",
+      "caption": "Setup guidance in the running app with no provider credentials.",
+      "input": "/setup<Enter>",
+      "transcript_sha256": "7b77bc2712b93fbfe5fe1f976f16bd259fea67a0043ec06e6b2579a6c1a62f35"
+    }
+  ]
+}

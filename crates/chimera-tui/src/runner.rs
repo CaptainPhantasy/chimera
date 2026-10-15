@@ -599,6 +599,7 @@ async fn run_screen(
     let mut rewind = crate::rewind::Rewind::default();
     let mut permissions = crate::permissions::Permissions::default();
     let mut memory = crate::memory::Memory::default();
+    let mut skills = crate::skills::Skills::default();
     let restore = TerminalGuard::new();
     let mut terminal = init_terminal()?;
     if let Some(objective) = initial.filter(|s| !s.trim().is_empty()) {
@@ -614,6 +615,7 @@ async fn run_screen(
             rewind.poll(&mut tui.dialog).await;
             permissions.poll(&mut tui.dialog).await;
             memory.poll(&mut tui.dialog).await;
+            skills.poll(&mut tui.dialog).await;
             // A busy stream must still leave time for keys and drawing.
             for _ in 0..128 {
                 let Ok(update) = updates.try_recv() else { break };
@@ -679,6 +681,7 @@ async fn run_screen(
                         rewind.cancel();
                         permissions.cancel();
                         memory.cancel();
+                        skills.cancel();
                         continue;
                     },
                     TuiEvent::DialogAction(action, _values) if action.starts_with("models:") => {
@@ -771,6 +774,14 @@ async fn run_screen(
                     TuiEvent::DialogAction(action, _values) if action.starts_with("permissions:") => {
                         match permissions.action(&action, &mut tui.dialog).await {
                             Ok(Some(report)) => tui.log.push(report),
+                            Ok(None) => {},
+                            Err(error) => if let Some(dialog) = &mut tui.dialog { dialog.note = error.to_string(); }
+                        }
+                        continue;
+                    },
+                    TuiEvent::DialogAction(action, values) if action.starts_with("skills:") => {
+                        match skills.action(&action, &values, &mut tui.dialog).await {
+                            Ok(Some(objective)) => { tui.tx.try_send(TuiEvent::Submit(objective))?; },
                             Ok(None) => {},
                             Err(error) => if let Some(dialog) = &mut tui.dialog { dialog.note = error.to_string(); }
                         }
@@ -893,6 +904,24 @@ async fn run_screen(
                         if active.is_some() { tui.log.push(Message::System { text: "Cancel or finish the current request before saving a fact.".into(), kind: SystemKind::Warning }); }
                         else { tui.dialog = Some(memory.remember_form(root.clone(), argument)); }
                         continue;
+                    }
+                    "/skills" => {
+                        let requested = argument.trim();
+                        if active.is_some() {
+                            tui.log.push(Message::System { text: "Cancel or finish the current request before using saved procedures.".into(), kind: SystemKind::Warning });
+                            continue;
+                        }
+                        if requested.is_empty() {
+                            tui.dialog = Some(skills.open(root.clone(), session.as_ref().map(|saved| saved.id)));
+                            continue;
+                        }
+                        match crate::skills::Skills::objective(root.clone(), requested).await {
+                            Ok(objective) => objective,
+                            Err(error) => {
+                                tui.log.push(Message::System { text: format!("Could not run the saved procedure '{requested}': {error:#}"), kind: SystemKind::Warning });
+                                continue;
+                            }
+                        }
                     }
                     "/run" => argument.to_string(),
                     "/plan" => { plan = true; argument.to_string() }

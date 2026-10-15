@@ -52,20 +52,23 @@ class Service(http.server.BaseHTTPRequestHandler):
         self.send_response(200); self.send_header('Content-Type', 'application/json'); self.end_headers()
         self.wfile.write(b'{"data":[{"id":"model-beta"},{"id":"model-alpha"}]}')
     def do_POST(self):
-        body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
-        calls.append({'method': 'POST', 'path': self.path})
+        calls.append({'method': 'POST', 'path': self.path,
+                      'authorized': self.headers.get('Authorization') == 'Bearer UI_TEST_KEY'})
         if self.headers.get('Authorization') != 'Bearer UI_TEST_KEY':
             self.send_response(401); self.end_headers(); self.wfile.write(b'{"error":"do not echo service secrets"}'); return
+        if not self.path.endswith('/chat/completions'):
+            self.send_response(500); self.end_headers(); return
+        body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
         last = body['messages'][-1]
         prompt = next((m['content'] for m in reversed(body['messages']) if m['role'] == 'user'), '')
         reply = None
-        if self.path.endswith('/chat/completions') and last['role'] == 'tool' and 'matches' in str(last['content']):
+        if last['role'] == 'tool' and 'matches' in str(last['content']):
             reply = {'choices': [{'delta': {'content': 'GLOB RAN AFTER THE OVERLAY APPROVAL'}, 'finish_reason': None}]}
-        elif self.path.endswith('/chat/completions') and last['role'] == 'tool' and 'denied' in str(last['content']):
+        elif last['role'] == 'tool' and 'denied' in str(last['content']):
             reply = {'choices': [{'delta': {'content': 'THE OVERLAY DENIED THIS WRITE'}, 'finish_reason': None}]}
-        elif self.path.endswith('/chat/completions') and prompt == 'find the project files':
+        elif prompt == 'find the project files':
             reply = {'choices': [{'delta': {'tool_calls': [{'index': 0, 'id': 'glob-1', 'type': 'function', 'function': {'name': 'glob', 'arguments': json.dumps({'pattern': '*', 'path': '.'})}}]}, 'finish_reason': 'tool_calls'}]}
-        elif self.path.endswith('/chat/completions') and prompt == 'write the overlay file':
+        elif prompt == 'write the overlay file':
             reply = {'choices': [{'delta': {'tool_calls': [{'index': 0, 'id': 'write-1', 'type': 'function', 'function': {'name': 'write_file', 'arguments': json.dumps({'path': 'overlay-denied.txt', 'content': 'must stay absent\n'})}}]}, 'finish_reason': 'tool_calls'}]}
         if reply is not None:
             self.send_response(200); self.send_header('Content-Type', 'text/event-stream'); self.end_headers()
@@ -80,7 +83,7 @@ class Service(http.server.BaseHTTPRequestHandler):
         with completion_lock:
             completions.append([m.get('role') for m in body.get('messages', [])])
             index = len(completions) - 1
-        events = SCRIPTED_COMPLETIONS[index] if index < len(SCRIPTED_COMPLETIONS) else text_events('unexpected extra completion')
+        events = SCRIPTED_COMPLETIONS[index] if index < len(SCRIPTED_COMPLETIONS) else text_events('Fixture reply for the smoke check.')
         self.send_response(200); self.send_header('Content-Type', 'text/event-stream'); self.end_headers()
         for item in events:
             self.wfile.write(('data: ' + json.dumps(item) + '\n\n').encode())
@@ -392,6 +395,45 @@ try:
     screen.wait_for('No saved project facts yet.')
     check('reopening project memory shows the archived-out empty list', True)
     send('\x1b')
+    # A completed request is the source for capture-from-current-conversation.
+    send('summarize the smoke check\r', 'Answer saved.')
+    check('the chat request reached the fixture service', any(
+        c['method'] == 'POST' and c['path'].endswith('/chat/completions') and c['authorized']
+        for c in calls))
+    # /skills — an empty project explains itself and offers capture; Esc
+    # returns to the untouched chat input.
+    send('/skills\r', 'No saved procedures yet')
+    send('\x1b')
+    screen.wait_for('Describe a task')
+    check('closing the procedure list returns to the chat input', True)
+    # Capture this conversation under an explicit name and description.
+    send('/skills\r', 'Saved procedures')
+    screen.wait_for('No saved procedures yet')
+    send('\r', 'Name the procedure')
+    send('smoke-check\r')
+    send('Checks the smoke path end to end\r', "Saved 'smoke-check'")
+    screen.wait_for('Checks the smoke path end to end')
+    send('\x1b')
+    # The saved procedure survives reopening the overlay from disk.
+    send('/skills\r', 'Saved procedures')
+    screen.wait_for('smoke-check')
+    check('the saved procedure is offered after reopening /skills', True)
+    # Search, confirm, and run it as an ordinary request in this conversation.
+    send('smoke')
+    screen.wait_for('Search: smoke')
+    send('\r', "Run 'smoke-check'")
+    send('\r', "Run the saved workflow 'smoke-check'")
+    screen.wait_for('Answer saved.')
+    check('running a procedure sends a real request with approvals', sum(
+        1 for c in calls
+        if c['method'] == 'POST' and c['path'].endswith('/chat/completions')) >= 2)
+    # An unknown procedure name is refused by name, with nothing sent.
+    send('/skills smoke-check\r', "Run the saved workflow 'smoke-check'")
+    screen.wait_for('Answer saved.')
+    send('/skills no-such-procedure\r', 'Could not run the saved procedure')
+    check('an unknown procedure name is refused without sending', sum(
+        1 for c in calls
+        if c['method'] == 'POST' and c['path'].endswith('/chat/completions')) == 3)
     screen.finish()
 except BaseException as error:
     report['error'] = repr(error)

@@ -230,6 +230,16 @@ impl FileSkillCapture {
         let skill = self.resolve(name).await?;
         Ok(format!("Run the saved workflow '{}' (version {}). Apply current permissions and report actual results.\n\nObjective:\n{}\n\nRequired tools: {}\nPre-run checks (require current approval): {}\nPost-run checks (require current approval): {}",skill.spec.name,skill.spec.version,skill.spec.objective_template,skill.spec.required_tools.join(", "),skill.spec.pre_hooks.join("; "),skill.spec.post_hooks.join("; ")))
     }
+
+    /// Every captured skill with its full specification, newest capture first.
+    /// Interactive choosers use this to show details; `SkillCapture::list`
+    /// stays name-only for scripts.
+    pub async fn list_skills(&self) -> anyhow::Result<Vec<CapturedSkill>> {
+        let records: SkillRecords = self.records.read("captured")?;
+        let mut skills: Vec<CapturedSkill> = records.skills.into_values().collect();
+        skills.sort_by_key(|skill| std::cmp::Reverse((skill.captured_at, skill.id)));
+        Ok(skills)
+    }
 }
 
 fn validate_skill(skill: &CapturedSkill) -> anyhow::Result<()> {
@@ -305,6 +315,7 @@ impl SkillCapture for FileSkillCapture {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
 
     fn make_skill(name: &str) -> CapturedSkill {
         CapturedSkill {
@@ -346,6 +357,48 @@ mod tests {
         let mut names = store.list().await.unwrap();
         names.sort();
         assert_eq!(names, vec!["a", "b"]);
+    }
+
+    #[tokio::test]
+    async fn list_skills_returns_full_specs_newest_first() {
+        use chimera_session::{SessionEvent, SessionStore};
+        let root = root();
+        let sessions = chimera_session::FileSessionStore::new(&root);
+        let source = sessions
+            .create(chimera_session::SessionMeta {
+                label: "source".into(),
+                objective: "inspect a sample".into(),
+                created_at: Utc::now(),
+            })
+            .await
+            .unwrap();
+        sessions
+            .append_event_sync(
+                source,
+                SessionEvent::ToolCalled {
+                    tool: "read_file".into(),
+                    args: serde_json::json!({"path":"sample.txt"}),
+                },
+            )
+            .unwrap();
+        sessions.close(source, "completed").await.unwrap();
+        let store = FileSkillCapture::new(&root);
+        let mut older = make_skill("older-skill");
+        older.source_session = source;
+        older.captured_at = Utc.with_ymd_and_hms(2026, 3, 10, 8, 30, 0).unwrap();
+        let mut newer = make_skill("newer-skill");
+        newer.source_session = source;
+        newer.captured_at = Utc.with_ymd_and_hms(2026, 6, 15, 12, 0, 0).unwrap();
+        store.capture(older).await.unwrap();
+        store.capture(newer).await.unwrap();
+        let listed = store.list_skills().await.unwrap();
+        let names: Vec<String> = listed.iter().map(|s| s.spec.name.clone()).collect();
+        assert_eq!(names, vec!["newer-skill", "older-skill"]);
+        assert_eq!(listed[0].spec.description, "newer-skill skill");
+        assert_eq!(listed[0].spec.required_tools, vec!["bash", "git"]);
+        assert_eq!(listed[0].source_session, source);
+        // The plain name listing keeps working alongside the detailed one.
+        assert_eq!(store.list().await.unwrap().len(), 2);
     }
 
     #[tokio::test]

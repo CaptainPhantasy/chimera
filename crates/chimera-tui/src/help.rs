@@ -23,7 +23,10 @@ const CONTROLS: &[(&str, &str)] = &[
     ("/connect /setup F2", "choose and connect a provider"),
     ("/reload", "reload saved settings"),
     ("/model [NAME]", "show, choose or change model"),
-    ("/tools /sessions", "show tools or saved sessions"),
+    (
+        "/tools /sessions",
+        "show tools or browse and switch sessions",
+    ),
     ("/approve /deny", "decide the displayed action once"),
     ("/clear", "clear screen; retain saved context"),
     ("/cancel", "stop current work"),

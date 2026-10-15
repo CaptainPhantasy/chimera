@@ -88,6 +88,25 @@ try:
     check('keys never appear in terminal output', b'UI_TEST_KEY' not in screen.output and b'bad-key' not in screen.output)
     send('/connect\r', 'Fixture')
     send('\x1b')
+    # /sessions — browse, search and resume a conversation without leaving chat.
+    seed_row = {}
+    seed = setup.Screen(binary, project, config, ['tui'], check, seed_row); screens.append(seed)
+    seed.wait_for('model-beta', seconds=20)
+    seed.finish()
+    states = {path.stem: json.loads(path.read_text())['data']
+              for path in (project/'.chimera'/'sessions').glob('*.json')}
+    check('two saved conversations exist for the chooser', len(states) == 2)
+    newest = max(states, key=lambda key: states[key]['meta']['created_at'])
+    send('/sessions\r', 'Switch conversation')
+    screen.wait_for('Interactive conversation')
+    send('interactive')
+    screen.wait_for('Search: interactive')
+    send('\r')
+    screen.wait_for('session ' + newest[:7])
+    screen.wait_for('ready to send')
+    check('resume opens the newest conversation in place', True)
+    send('/sessions\r', 'Switch conversation')
+    send('\x1b')
     screen.finish()
 except BaseException as error:
     report['error'] = repr(error)

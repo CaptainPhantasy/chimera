@@ -324,7 +324,7 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("model", "show or change the active model"),
     ("models", "choose a model and save it as your default"),
     ("tools", "list available tools"),
-    ("sessions", "list sessions"),
+    ("sessions", "browse and switch sessions"),
     ("clear", "clear the screen; keep saved context"),
     ("theme", "switch between dark and light themes"),
     ("approve", "allow the displayed action once"),

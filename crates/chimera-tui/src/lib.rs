@@ -18,6 +18,7 @@ pub mod input;
 pub mod message;
 mod models;
 pub mod runner;
+mod sessions;
 pub mod status;
 pub mod theme;
 pub mod views;

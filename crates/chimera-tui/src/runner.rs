@@ -596,6 +596,7 @@ async fn run_screen(
     let mut connections = crate::connect::Connections::default();
     let mut models = crate::models::Models::default();
     let mut sessions = crate::sessions::Sessions::default();
+    let mut skills = crate::skills::Skills::default();
     let restore = TerminalGuard::new();
     let mut terminal = init_terminal()?;
     if let Some(objective) = initial.filter(|s| !s.trim().is_empty()) {
@@ -608,6 +609,7 @@ async fn run_screen(
             connections.poll(&mut tui.dialog).await;
             models.poll(&mut tui.dialog).await;
             sessions.poll(&mut tui.dialog).await;
+            skills.poll(&mut tui.dialog).await;
             // A busy stream must still leave time for keys and drawing.
             for _ in 0..128 {
                 let Ok(update) = updates.try_recv() else { break };
@@ -666,7 +668,7 @@ async fn run_screen(
             }
             while let Ok(input) = tui.rx.try_recv() {
                 let text = match input {
-                    TuiEvent::DialogClosed => { connections.cancel(); models.cancel(); sessions.cancel(); continue; },
+                    TuiEvent::DialogClosed => { connections.cancel(); models.cancel(); sessions.cancel(); skills.cancel(); continue; },
                     TuiEvent::DialogAction(action, _values) if action.starts_with("models:") => {
                         match models.action(&action, &config, &mut tui.dialog).await {
                             Ok(Some(saved)) => {
@@ -708,6 +710,14 @@ async fn run_screen(
                                 session = Some(resumed);
                                 tui.log.push(Message::System { text: "Conversation opened in this screen. Your unsent text is ready to send.".into(), kind: SystemKind::Success });
                             },
+                            Ok(None) => {},
+                            Err(error) => if let Some(dialog) = &mut tui.dialog { dialog.note = error.to_string(); }
+                        }
+                        continue;
+                    },
+                    TuiEvent::DialogAction(action, values) if action.starts_with("skills:") => {
+                        match skills.action(&action, &values, &mut tui.dialog).await {
+                            Ok(Some(objective)) => { tui.tx.try_send(TuiEvent::Submit(objective))?; },
                             Ok(None) => {},
                             Err(error) => if let Some(dialog) = &mut tui.dialog { dialog.note = error.to_string(); }
                         }
@@ -804,6 +814,24 @@ async fn run_screen(
                         if active.is_some() { tui.log.push(Message::System { text: "Cancel or finish the current request before switching conversations.".into(), kind: SystemKind::Warning }); }
                         else { tui.dialog = Some(sessions.open(root.clone())); }
                         continue;
+                    }
+                    "/skills" => {
+                        let requested = argument.trim();
+                        if active.is_some() {
+                            tui.log.push(Message::System { text: "Cancel or finish the current request before using saved procedures.".into(), kind: SystemKind::Warning });
+                            continue;
+                        }
+                        if requested.is_empty() {
+                            tui.dialog = Some(skills.open(root.clone(), session.as_ref().map(|saved| saved.id)));
+                            continue;
+                        }
+                        match crate::skills::Skills::objective(root.clone(), requested).await {
+                            Ok(objective) => objective,
+                            Err(error) => {
+                                tui.log.push(Message::System { text: format!("Could not run the saved procedure '{requested}': {error:#}"), kind: SystemKind::Warning });
+                                continue;
+                            }
+                        }
                     }
                     "/run" => argument.to_string(),
                     "/plan" => { plan = true; argument.to_string() }

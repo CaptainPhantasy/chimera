@@ -154,6 +154,15 @@ pub struct RestorePreview {
     pub restored_files: Vec<FileSnapshot>,
 }
 
+/// A checkpoint listed for rewind: identity, time and captured paths only.
+/// File contents stay in storage until a restore preview asks for them.
+#[derive(Debug, Clone)]
+pub struct CheckpointSummary {
+    pub id: CheckpointId,
+    pub created_at: DateTime<Utc>,
+    pub files: Vec<PathBuf>,
+}
+
 impl SessionState {
     /// Effective conversation/task events, following any state restore. The full
     /// events field remains an append-only audit history of abandoned work too.
@@ -338,6 +347,31 @@ impl FileSessionStore {
         });
         self.write_state(&state)?;
         Ok(cp.id)
+    }
+
+    /// Every checkpoint of one session, newest first, without pulling file
+    /// contents into the listing.
+    pub async fn list_checkpoints(
+        &self,
+        session: SessionId,
+    ) -> anyhow::Result<Vec<CheckpointSummary>> {
+        let _lock = self.lock()?;
+        let state = self.read_state(session)?;
+        let mut summaries = Vec::new();
+        for id in state.checkpoints {
+            let checkpoint = self.read_checkpoint(session, id)?;
+            summaries.push(CheckpointSummary {
+                id: checkpoint.id,
+                created_at: checkpoint.created_at,
+                files: checkpoint
+                    .files
+                    .iter()
+                    .map(|file| file.path.clone())
+                    .collect(),
+            });
+        }
+        summaries.sort_by(|a, b| b.created_at.cmp(&a.created_at).then(b.id.cmp(&a.id)));
+        Ok(summaries)
     }
 
     pub async fn preview_restore(
@@ -1114,6 +1148,36 @@ mod file_tests {
             .checkpoint_with_files(id, &[PathBuf::from("large.txt")])
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn list_checkpoints_is_newest_first_with_paths_not_bytes() {
+        let root = unique_root();
+        let store = FileSessionStore::new(&root);
+        let id = store.create(sample_meta()).await.unwrap();
+        std::fs::write(root.join("older.txt"), b"OLDER_CAPTURED_BYTES").unwrap();
+        let first = store
+            .checkpoint_with_files(id, &[PathBuf::from("older.txt")])
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        std::fs::write(root.join("newer.txt"), b"NEWER_CAPTURED_BYTES").unwrap();
+        let second = store
+            .checkpoint_with_files(id, &[PathBuf::from("newer.txt")])
+            .await
+            .unwrap();
+        let summaries = store.list_checkpoints(id).await.unwrap();
+        assert_eq!(
+            summaries.iter().map(|s| s.id).collect::<Vec<_>>(),
+            vec![second, first]
+        );
+        assert_eq!(summaries[0].files, vec![PathBuf::from("newer.txt")]);
+        assert_eq!(summaries[1].files, vec![PathBuf::from("older.txt")]);
+        // The listing carries paths only — CheckpointSummary has no bytes
+        // field, so captured contents stay in storage until a preview asks.
+        // Another session never sees this session's checkpoints.
+        let stranger = store.create(sample_meta()).await.unwrap();
+        assert!(store.list_checkpoints(stranger).await.unwrap().is_empty());
     }
 
     #[cfg(unix)]

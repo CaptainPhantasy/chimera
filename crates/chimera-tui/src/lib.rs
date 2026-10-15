@@ -17,6 +17,7 @@ pub mod help;
 pub mod input;
 pub mod message;
 mod models;
+mod rewind;
 pub mod runner;
 mod sessions;
 pub mod status;

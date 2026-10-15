@@ -596,6 +596,7 @@ async fn run_screen(
     let mut connections = crate::connect::Connections::default();
     let mut models = crate::models::Models::default();
     let mut sessions = crate::sessions::Sessions::default();
+    let mut rewind = crate::rewind::Rewind::default();
     let restore = TerminalGuard::new();
     let mut terminal = init_terminal()?;
     if let Some(objective) = initial.filter(|s| !s.trim().is_empty()) {
@@ -608,6 +609,7 @@ async fn run_screen(
             connections.poll(&mut tui.dialog).await;
             models.poll(&mut tui.dialog).await;
             sessions.poll(&mut tui.dialog).await;
+            rewind.poll(&mut tui.dialog).await;
             // A busy stream must still leave time for keys and drawing.
             for _ in 0..128 {
                 let Ok(update) = updates.try_recv() else { break };
@@ -666,7 +668,7 @@ async fn run_screen(
             }
             while let Ok(input) = tui.rx.try_recv() {
                 let text = match input {
-                    TuiEvent::DialogClosed => { connections.cancel(); models.cancel(); sessions.cancel(); continue; },
+                    TuiEvent::DialogClosed => { connections.cancel(); models.cancel(); sessions.cancel(); rewind.cancel(); continue; },
                     TuiEvent::DialogAction(action, _values) if action.starts_with("models:") => {
                         match models.action(&action, &config, &mut tui.dialog).await {
                             Ok(Some(saved)) => {
@@ -707,6 +709,37 @@ async fn run_screen(
                                 tui.status.session_id = resumed.id.to_string();
                                 session = Some(resumed);
                                 tui.log.push(Message::System { text: "Conversation opened in this screen. Your unsent text is ready to send.".into(), kind: SystemKind::Success });
+                            },
+                            Ok(None) => {},
+                            Err(error) => if let Some(dialog) = &mut tui.dialog { dialog.note = error.to_string(); }
+                        }
+                        continue;
+                    },
+                    TuiEvent::DialogAction(action, _values) if action.starts_with("rewind:") => {
+                        match rewind.action(&action, &mut tui.dialog).await {
+                            Ok(Some(messages)) => {
+                                match session.as_mut() {
+                                    Some(current) => {
+                                        current.messages = messages.clone();
+                                        tui.log = MessageLog::new(100);
+                                        for message in &messages {
+                                            match message.role {
+                                                chimera_llm::Role::User => tui.log.push(Message::User {
+                                                    text: message.content.clone().unwrap_or_default(),
+                                                }),
+                                                chimera_llm::Role::Assistant => tui.log.push(Message::Assistant {
+                                                    text: message.content.clone().unwrap_or_default(),
+                                                    streaming: false,
+                                                }),
+                                                _ => {}
+                                            }
+                                        }
+                                        tui.log.push(Message::System { text: "Files restored from the snapshot. The displaced versions were preserved in a private archive, and the conversation returned to the point right after that turn.".into(), kind: SystemKind::Success });
+                                    }
+                                    None => {
+                                        tui.log.push(Message::System { text: "Files were restored from the snapshot, but no conversation is open in this screen; it will show the restored history when you reopen it.".into(), kind: SystemKind::Warning });
+                                    }
+                                }
                             },
                             Ok(None) => {},
                             Err(error) => if let Some(dialog) = &mut tui.dialog { dialog.note = error.to_string(); }
@@ -803,6 +836,17 @@ async fn run_screen(
                     "/sessions" => {
                         if active.is_some() { tui.log.push(Message::System { text: "Cancel or finish the current request before switching conversations.".into(), kind: SystemKind::Warning }); }
                         else { tui.dialog = Some(sessions.open(root.clone())); }
+                        continue;
+                    }
+                    "/rewind" => {
+                        if active.is_some() {
+                            tui.log.push(Message::System { text: "Cancel or finish the current request before rewinding files.".into(), kind: SystemKind::Warning });
+                        } else {
+                            match session.as_ref() {
+                                Some(current) => tui.dialog = Some(rewind.open(root.clone(), current.id, profile.as_deref() == Some("read-only"))),
+                                None => tui.log.push(Message::System { text: "No conversation is open in this screen; use /sessions to open one first.".into(), kind: SystemKind::Warning }),
+                            }
+                        }
                         continue;
                     }
                     "/run" => argument.to_string(),

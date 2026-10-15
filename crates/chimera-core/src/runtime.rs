@@ -1,5 +1,5 @@
 //! Shared, saved execution for the command line and terminal screen.
-use std::{path::PathBuf, sync::{Arc, Mutex}};
+use std::{path::{Component, Path, PathBuf}, sync::{Arc, Mutex}};
 use anyhow::{Context, Result};
 use chrono::Utc;
 use serde_json::{json, Value};
@@ -118,7 +118,9 @@ impl SavedSession {
         self.store.append_event(self.id, SessionEvent::Custom {
             key: "run_started".into(), payload: json!({"objective": objective, "model": model}),
         }).await?;
-        let guarded = SavedRouter { inner: tools, events: events.clone(), store: self.store.clone(), session: self.id, root:self.root.clone() };
+        // The relative paths of files this turn edits, for the rewind snapshot.
+        let edited = Arc::new(Mutex::new(Vec::new()));
+        let guarded = SavedRouter { inner: tools, events: events.clone(), store: self.store.clone(), session: self.id, root:self.root.clone(), edited: edited.clone() };
         let setup = async {
             Ok::<_, anyhow::Error>((config_with_project_memory(&self.root, config).await?, agent::build_tool_definitions(&guarded).await?))
         }.await;
@@ -199,6 +201,7 @@ impl SavedSession {
                 self.store.append_event(self.id, SessionEvent::Custom {
                     key: "run_result".into(), payload: serde_json::to_value(&result)?,
                 }).await?;
+                checkpoint_edited_files(&self.store, self.id, &edited).await;
                 self.store.close(self.id, match result.done_reason {
                     agent::DoneReason::FinalAnswer => "completed",
                     agent::DoneReason::MaxIterations => "unfinished",
@@ -217,6 +220,7 @@ impl SavedSession {
                 self.store.append_event(self.id, SessionEvent::Custom {
                     key: "run_error".into(), payload: json!({"error":format!("{error:#}")}),
                 }).await?;
+                checkpoint_edited_files(&self.store, self.id, &edited).await;
                 self.store.close(self.id, if *cancellation.borrow() { "cancelled" } else { "failed" }).await?;
                 Err(error)
             }
@@ -228,6 +232,7 @@ struct SavedRouter {
     inner: Arc<dyn ToolRouter>, events: mpsc::Sender<RunEvent>,
     store: Arc<FileSessionStore>, session: Uuid,
     root:PathBuf,
+    edited: Arc<Mutex<Vec<PathBuf>>>,
 }
 
 struct CancelApproval { store:crate::approval::ApprovalStore,id:Uuid }
@@ -293,6 +298,12 @@ impl ToolRouter for SavedRouter {
             tool: call.tool.clone(), args: call.args.clone(),
         }).await?;
         let result = self.inner.call(call.clone()).await;
+        if result.is_ok() && matches!(call.tool.as_str(), "write_file" | "edit_file") {
+            if let Some(path) = edited_relative_path(&call.args) {
+                let mut edited = self.edited.lock().unwrap();
+                if !edited.contains(&path) { edited.push(path); }
+            }
+        }
         self.store.append_event(self.session, SessionEvent::Custom {
             key: "tool_result".into(), payload: match &result {
                 Ok(result) => json!({"call":call,"result":result}),
@@ -312,6 +323,35 @@ fn close_pending_tools(messages: &mut Vec<Message>) {
     }
     for id in pending {
         messages.push(Message::tool_result(id, r#"{"ok":false,"error":"interrupted before a result was saved; inspect the files before retrying"}"#));
+    }
+}
+
+/// The relative path a successful file edit touched, for the rewind snapshot.
+/// Missing, absolute and `..`-containing values are skipped, not failures; a
+/// leading `./` is dropped so the stored path stays strictly relative.
+fn edited_relative_path(args: &Value) -> Option<PathBuf> {
+    let raw = args.get("path")?.as_str()?;
+    let mut relative = PathBuf::new();
+    for component in Path::new(raw).components() {
+        match component {
+            Component::CurDir => {}
+            Component::Normal(name) => relative.push(name),
+            _ => return None,
+        }
+    }
+    if relative.as_os_str().is_empty() { None } else { Some(relative) }
+}
+
+/// One rewind checkpoint per turn: exactly the files this turn edited. A
+/// snapshot failure must never fail the run, so it is only logged.
+async fn checkpoint_edited_files(store: &FileSessionStore, session: Uuid, edited: &Mutex<Vec<PathBuf>>) {
+    let paths = {
+        let mut edited = edited.lock().unwrap();
+        if edited.is_empty() { return; }
+        std::mem::take(&mut *edited)
+    };
+    if let Err(error) = store.checkpoint_with_files(session, &paths).await {
+        tracing::error!("could not snapshot this turn's edited files for rewind: {error:#}");
     }
 }
 
@@ -452,6 +492,58 @@ mod tests {
         assert!(state.events.iter().any(|event|matches!(event,SessionEvent::Custom {key,payload} if key=="run_outcome" && payload["outcome"]=="failed")));
         assert_eq!(saved.messages.iter().filter(|m|m.content.as_deref()==Some("memory failure")).count(),1);
     }
+    #[tokio::test]
+    async fn a_turn_that_edits_files_is_snapshotted_for_rewind() {
+        struct WriteThenFinish;
+        #[async_trait::async_trait]
+        impl LlmProvider for WriteThenFinish {
+            fn name(&self) -> &str { "controlled-write-test" }
+            async fn complete(&self, request: &CompletionRequest) -> std::result::Result<CompletionResponse,LlmError> {
+                if request.messages.iter().any(|m| m.role == chimera_llm::Role::Tool) {
+                    Ok(CompletionResponse { content: Some("the note file is written".into()), tool_calls: vec![], finish_reason: Some("stop".into()), usage: None })
+                } else {
+                    Ok(CompletionResponse { content: None, tool_calls: vec![chimera_llm::ToolCall { id: "write-1".into(), kind: "function".into(), function: chimera_llm::FunctionCall { name: "write_file".into(), arguments: json!({"path":"rewind-me.txt","content":"snapshot me"}).to_string() } }], finish_reason: Some("tool_calls".into()), usage: None })
+                }
+            }
+        }
+        let project = root();
+        let mut saved = SavedSession::create(project.clone(), "write a file").await.unwrap();
+        let tools = Arc::new(chimera_tools::DefaultToolRouter::new(Some(project.clone())));
+        let (events, mut receive) = event_channel();
+        let (_cancel, cancelled) = watch::channel(false);
+        let decisions = tokio::spawn(async move {
+            let mut count = 0;
+            while let Some(event) = receive.recv().await {
+                if let RunEvent::Approval { call, answer, .. } = event {
+                    assert_eq!(call.tool, "write_file");
+                    count += 1;
+                    answer.send(true).unwrap();
+                }
+            }
+            count
+        });
+        let result = saved.run(&WriteThenFinish, tools, "test", "write a file", &AgentConfig::default(), RunChannels { events, cancellation: cancelled }).await.unwrap();
+        assert!(matches!(result.done_reason, agent::DoneReason::FinalAnswer));
+        assert_eq!(decisions.await.unwrap(), 1);
+        assert_eq!(std::fs::read(project.join("rewind-me.txt")).unwrap(), b"snapshot me");
+        let summaries = saved.store.list_checkpoints(saved.id).await.unwrap();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].files, vec![PathBuf::from("rewind-me.txt")]);
+    }
+
+    #[test]
+    fn edited_paths_are_relative_deduplicated_or_skipped() {
+        let args = |path: Value| json!({"path": path});
+        assert_eq!(edited_relative_path(&args(json!("note.txt"))), Some(PathBuf::from("note.txt")));
+        assert_eq!(edited_relative_path(&args(json!("./note.txt"))), Some(PathBuf::from("note.txt")));
+        assert_eq!(edited_relative_path(&args(json!("a/b.txt"))), Some(PathBuf::from("a/b.txt")));
+        // Missing, absolute, traversal and non-string values are skipped.
+        assert_eq!(edited_relative_path(&json!({})), None);
+        assert_eq!(edited_relative_path(&args(json!("/etc/hosts"))), None);
+        assert_eq!(edited_relative_path(&args(json!("../outside"))), None);
+        assert_eq!(edited_relative_path(&args(json!(7))), None);
+    }
+
     #[tokio::test]
     async fn stored_permission_claim_cannot_authorize_a_denied_write() {
         struct SuggestWrite;

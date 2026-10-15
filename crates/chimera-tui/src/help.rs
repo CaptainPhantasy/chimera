@@ -27,6 +27,7 @@ const CONTROLS: &[(&str, &str)] = &[
         "/tools /sessions",
         "show tools or browse and switch sessions",
     ),
+    ("/permissions", "review and change project permissions"),
     ("/approve /deny", "decide the displayed action once"),
     ("/clear", "clear screen; retain saved context"),
     ("/cancel", "stop current work"),

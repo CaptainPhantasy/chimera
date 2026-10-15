@@ -597,6 +597,7 @@ async fn run_screen(
     let mut models = crate::models::Models::default();
     let mut sessions = crate::sessions::Sessions::default();
     let mut rewind = crate::rewind::Rewind::default();
+    let mut permissions = crate::permissions::Permissions::default();
     let restore = TerminalGuard::new();
     let mut terminal = init_terminal()?;
     if let Some(objective) = initial.filter(|s| !s.trim().is_empty()) {
@@ -610,6 +611,7 @@ async fn run_screen(
             models.poll(&mut tui.dialog).await;
             sessions.poll(&mut tui.dialog).await;
             rewind.poll(&mut tui.dialog).await;
+            permissions.poll(&mut tui.dialog).await;
             // A busy stream must still leave time for keys and drawing.
             for _ in 0..128 {
                 let Ok(update) = updates.try_recv() else { break };
@@ -668,7 +670,14 @@ async fn run_screen(
             }
             while let Ok(input) = tui.rx.try_recv() {
                 let text = match input {
-                    TuiEvent::DialogClosed => { connections.cancel(); models.cancel(); sessions.cancel(); rewind.cancel(); continue; },
+                    TuiEvent::DialogClosed => {
+                        connections.cancel();
+                        models.cancel();
+                        sessions.cancel();
+                        rewind.cancel();
+                        permissions.cancel();
+                        continue;
+                    },
                     TuiEvent::DialogAction(action, _values) if action.starts_with("models:") => {
                         match models.action(&action, &config, &mut tui.dialog).await {
                             Ok(Some(saved)) => {
@@ -741,6 +750,14 @@ async fn run_screen(
                                     }
                                 }
                             },
+                            Ok(None) => {},
+                            Err(error) => if let Some(dialog) = &mut tui.dialog { dialog.note = error.to_string(); }
+                        }
+                        continue;
+                    },
+                    TuiEvent::DialogAction(action, _values) if action.starts_with("permissions:") => {
+                        match permissions.action(&action, &mut tui.dialog).await {
+                            Ok(Some(report)) => tui.log.push(report),
                             Ok(None) => {},
                             Err(error) => if let Some(dialog) = &mut tui.dialog { dialog.note = error.to_string(); }
                         }
@@ -847,6 +864,11 @@ async fn run_screen(
                                 None => tui.log.push(Message::System { text: "No conversation is open in this screen; use /sessions to open one first.".into(), kind: SystemKind::Warning }),
                             }
                         }
+                        continue;
+                    }
+                    "/permissions" => {
+                        if active.is_some() { tui.log.push(Message::System { text: "Cancel or finish the current request before changing permissions.".into(), kind: SystemKind::Warning }); }
+                        else { tui.dialog = Some(permissions.open(root.clone(), plan)); }
                         continue;
                     }
                     "/run" => argument.to_string(),

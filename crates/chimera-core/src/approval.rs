@@ -163,4 +163,19 @@ pub fn display_value(mut value: serde_json::Value) -> serde_json::Value {
         second.change(|p|{p.read_only=true;Ok(())}).unwrap();assert!(first.check("write_file",false).is_err());
         assert!(second.change(|p|{p.autonomy="full".into();Ok(())}).is_err());assert_eq!(first.get().unwrap().autonomy,"low");
     }
+    #[test] fn overlay_policy_change_path_round_trips_and_stays_validated() {
+        let root=root();let screen=PolicyStore::new(root.clone());let later=PolicyStore::new(root);
+        screen.change(|p|{p.disabled_tools.insert("bash".into());Ok(())}).unwrap();
+        screen.change(|p|{p.read_only=true;Ok(())}).unwrap();
+        screen.change(|p|{p.autonomy="none".into();Ok(())}).unwrap();
+        let saved=later.get().unwrap();
+        assert!(saved.disabled_tools.contains("bash")&&saved.read_only&&saved.autonomy=="none");
+        assert!(later.check("read_file",true).is_err());
+        assert!(screen.change(|p|{p.autonomy="full".into();Ok(())}).is_err());
+        assert!(screen.change(|p|{p.disabled_tools.insert(String::new());Ok(())}).is_err());
+        assert!(screen.change(|p|{p.disabled_tools.insert("x".repeat(129));Ok(())}).is_err());
+        assert_eq!(later.get().unwrap().autonomy,"none");
+        screen.change(|p|{p.disabled_tools.clear();p.read_only=false;p.autonomy="medium".into();Ok(())}).unwrap();
+        assert!(!later.check("read_file",true).unwrap());
+    }
 }

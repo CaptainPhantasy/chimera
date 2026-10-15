@@ -34,7 +34,7 @@ class ObservationTimeout(Exception):
 
 
 class Screen:
-    def __init__(self, binary, cwd, config, arguments, check, row):
+    def __init__(self, binary, cwd, config, arguments, check, row, profile='read-only'):
         self.check, self.row = check, row
         self.master, slave = pty.openpty()
         self.original = termios.tcgetattr(self.master)
@@ -48,7 +48,7 @@ class Screen:
             os.setsid()
             fcntl.ioctl(0, termios.TIOCSCTTY, 0)
 
-        self.argv = [str(binary), '--profile', 'read-only', *arguments]
+        self.argv = [str(binary), '--profile', profile, *arguments]
         self.process = subprocess.Popen(self.argv, cwd=cwd, env=env,
                                         stdin=slave, stdout=slave, stderr=slave,
                                         preexec_fn=control)

@@ -327,6 +327,8 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("sessions", "browse and switch sessions"),
     ("rewind", "restore files edited by earlier turns"),
     ("permissions", "review and change permissions in one place"),
+    ("memory", "browse, edit and archive saved project facts"),
+    ("remember", "save a project fact after you confirm it"),
     ("clear", "clear the screen; keep saved context"),
     ("theme", "switch between dark and light themes"),
     ("approve", "allow the displayed action once"),

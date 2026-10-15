@@ -474,6 +474,7 @@ dependencies = [
  "chimera-core",
  "chimera-creatures",
  "chimera-llm",
+ "chimera-memory",
  "chimera-session",
  "chimera-tools",
  "chimera-trace",

@@ -598,6 +598,7 @@ async fn run_screen(
     let mut sessions = crate::sessions::Sessions::default();
     let mut rewind = crate::rewind::Rewind::default();
     let mut permissions = crate::permissions::Permissions::default();
+    let mut memory = crate::memory::Memory::default();
     let restore = TerminalGuard::new();
     let mut terminal = init_terminal()?;
     if let Some(objective) = initial.filter(|s| !s.trim().is_empty()) {
@@ -612,6 +613,7 @@ async fn run_screen(
             sessions.poll(&mut tui.dialog).await;
             rewind.poll(&mut tui.dialog).await;
             permissions.poll(&mut tui.dialog).await;
+            memory.poll(&mut tui.dialog).await;
             // A busy stream must still leave time for keys and drawing.
             for _ in 0..128 {
                 let Ok(update) = updates.try_recv() else { break };
@@ -676,6 +678,7 @@ async fn run_screen(
                         sessions.cancel();
                         rewind.cancel();
                         permissions.cancel();
+                        memory.cancel();
                         continue;
                     },
                     TuiEvent::DialogAction(action, _values) if action.starts_with("models:") => {
@@ -749,6 +752,16 @@ async fn run_screen(
                                         tui.log.push(Message::System { text: "Files were restored from the snapshot, but no conversation is open in this screen; it will show the restored history when you reopen it.".into(), kind: SystemKind::Warning });
                                     }
                                 }
+                            },
+                            Ok(None) => {},
+                            Err(error) => if let Some(dialog) = &mut tui.dialog { dialog.note = error.to_string(); }
+                        }
+                        continue;
+                    },
+                    TuiEvent::DialogAction(action, values) if action.starts_with("memory:") => {
+                        match memory.action(&action, &values, &mut tui.dialog).await {
+                            Ok(Some(message)) => {
+                                tui.log.push(Message::System { text: message, kind: SystemKind::Success });
                             },
                             Ok(None) => {},
                             Err(error) => if let Some(dialog) = &mut tui.dialog { dialog.note = error.to_string(); }
@@ -869,6 +882,16 @@ async fn run_screen(
                     "/permissions" => {
                         if active.is_some() { tui.log.push(Message::System { text: "Cancel or finish the current request before changing permissions.".into(), kind: SystemKind::Warning }); }
                         else { tui.dialog = Some(permissions.open(root.clone(), plan)); }
+                        continue;
+                    }
+                    "/memory" => {
+                        if active.is_some() { tui.log.push(Message::System { text: "Cancel or finish the current request before browsing saved facts.".into(), kind: SystemKind::Warning }); }
+                        else { tui.dialog = Some(memory.open(root.clone())); }
+                        continue;
+                    }
+                    "/remember" => {
+                        if active.is_some() { tui.log.push(Message::System { text: "Cancel or finish the current request before saving a fact.".into(), kind: SystemKind::Warning }); }
+                        else { tui.dialog = Some(memory.remember_form(root.clone(), argument)); }
                         continue;
                     }
                     "/run" => argument.to_string(),

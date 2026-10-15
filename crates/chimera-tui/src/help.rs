@@ -29,6 +29,7 @@ const CONTROLS: &[(&str, &str)] = &[
     ),
     ("/rewind", "restore files edited by earlier turns"),
     ("/permissions", "review and change project permissions"),
+    ("/memory /remember", "browse, edit or save project facts"),
     ("/approve /deny", "decide the displayed action once"),
     ("/clear", "clear screen; retain saved context"),
     ("/cancel", "stop current work"),

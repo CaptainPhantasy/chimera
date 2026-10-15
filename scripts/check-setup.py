@@ -34,7 +34,7 @@ class ObservationTimeout(Exception):
 
 
 class Screen:
-    def __init__(self, binary, cwd, config, arguments, check, row):
+    def __init__(self, binary, cwd, config, arguments, check, row, profile='read-only', extra_env=None):
         self.check, self.row = check, row
         self.master, slave = pty.openpty()
         self.original = termios.tcgetattr(self.master)
@@ -43,12 +43,14 @@ class Screen:
                if not k.startswith('CHIMERA_') and k not in
                ('OPENAI_API_KEY', 'ANTHROPIC_API_KEY', 'NO_COLOR')}
         env.update(CHIMERA_CONFIG=str(config), TERM='xterm-256color', COLORTERM='truecolor')
+        if extra_env:
+            env.update(extra_env)
 
         def control():
             os.setsid()
             fcntl.ioctl(0, termios.TIOCSCTTY, 0)
 
-        self.argv = [str(binary), '--profile', 'read-only', *arguments]
+        self.argv = [str(binary), '--profile', profile, *arguments]
         self.process = subprocess.Popen(self.argv, cwd=cwd, env=env,
                                         stdin=slave, stdout=slave, stderr=slave,
                                         preexec_fn=control)

@@ -325,6 +325,7 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("models", "choose a model and save it as your default"),
     ("tools", "list available tools"),
     ("sessions", "browse and switch sessions"),
+    ("mcp", "connect external tool servers for chat"),
     ("clear", "clear the screen; keep saved context"),
     ("theme", "switch between dark and light themes"),
     ("approve", "allow the displayed action once"),

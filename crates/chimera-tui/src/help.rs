@@ -32,6 +32,7 @@ const CONTROLS: &[(&str, &str)] = &[
     ("/memory /remember", "browse, edit or save project facts"),
     ("/skills [NAME]", "list, capture or run saved procedures"),
     ("/mcp", "external tool connections for chat"),
+    ("/jobs", "list, inspect and control background work"),
     ("/approve /deny", "decide the displayed action once"),
     ("/clear", "clear screen; retain saved context"),
     ("/cancel", "stop current work"),

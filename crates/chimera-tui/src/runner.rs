@@ -601,6 +601,7 @@ async fn run_screen(
     let mut memory = crate::memory::Memory::default();
     let mut skills = crate::skills::Skills::default();
     let mut external = crate::external::External::default();
+    let mut jobs = crate::jobs::Jobs::default();
     let restore = TerminalGuard::new();
     let mut terminal = init_terminal()?;
     if let Some(objective) = initial.filter(|s| !s.trim().is_empty()) {
@@ -618,6 +619,7 @@ async fn run_screen(
             memory.poll(&mut tui.dialog).await;
             skills.poll(&mut tui.dialog).await;
             external.poll(&mut tui.dialog).await;
+            jobs.poll(&mut tui.dialog).await;
             // A busy stream must still leave time for keys and drawing.
             for _ in 0..128 {
                 let Ok(update) = updates.try_recv() else { break };
@@ -685,6 +687,7 @@ async fn run_screen(
                         memory.cancel();
                         skills.cancel();
                         external.cancel();
+                        jobs.cancel();
                         continue;
                     },
                     TuiEvent::DialogAction(action, _values) if action.starts_with("models:") => {
@@ -793,6 +796,14 @@ async fn run_screen(
                     TuiEvent::DialogAction(action, values) if action.starts_with("external:") => {
                         match external.action(&action, &values, &root, profile.as_deref() == Some("read-only"), &mut tui.dialog).await {
                             Ok(Some(message)) => tui.log.push(Message::System { text: message, kind: SystemKind::Success }),
+                            Ok(None) => {},
+                            Err(error) => if let Some(dialog) = &mut tui.dialog { dialog.note = error.to_string(); }
+                        }
+                        continue;
+                    },
+                    TuiEvent::DialogAction(action, values) if action.starts_with("jobs:") => {
+                        match jobs.action(&action, &values, &mut tui.dialog).await {
+                            Ok(Some(report)) => tui.log.push(Message::System { text: report, kind: SystemKind::Success }),
                             Ok(None) => {},
                             Err(error) => if let Some(dialog) = &mut tui.dialog { dialog.note = error.to_string(); }
                         }
@@ -937,6 +948,11 @@ async fn run_screen(
                     "/mcp" => {
                         if active.is_some() { tui.log.push(Message::System { text: "Finish or cancel the current request before managing external tools.".into(), kind: SystemKind::Warning }); }
                         else { tui.dialog = Some(external.open(chimera_mcp::default_config_path())); }
+                        continue;
+                    }
+                    "/jobs" => {
+                        if active.is_some() { tui.log.push(Message::System { text: "Cancel or finish the current request before managing background jobs.".into(), kind: SystemKind::Warning }); }
+                        else { tui.dialog = Some(jobs.open(root.clone())); }
                         continue;
                     }
                     "/run" => argument.to_string(),

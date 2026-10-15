@@ -16,6 +16,7 @@ pub mod dialog;
 mod external;
 pub mod help;
 pub mod input;
+mod jobs;
 mod memory;
 pub mod message;
 mod models;

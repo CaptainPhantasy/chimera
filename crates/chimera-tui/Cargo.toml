@@ -7,6 +7,7 @@ edition.workspace = true
 chimera-core.workspace = true
 chimera-config.workspace = true
 chimera-llm.workspace = true
+chimera-mcp.workspace = true
 chimera-tools.workspace = true
 chimera-creatures.workspace = true
 chimera-trace.workspace = true

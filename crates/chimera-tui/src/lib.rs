@@ -13,6 +13,7 @@ pub mod app;
 pub mod chat;
 mod connect;
 pub mod dialog;
+mod external;
 pub mod help;
 pub mod input;
 mod memory;

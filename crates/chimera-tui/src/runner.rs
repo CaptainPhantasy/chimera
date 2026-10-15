@@ -600,6 +600,7 @@ async fn run_screen(
     let mut permissions = crate::permissions::Permissions::default();
     let mut memory = crate::memory::Memory::default();
     let mut skills = crate::skills::Skills::default();
+    let mut external = crate::external::External::default();
     let restore = TerminalGuard::new();
     let mut terminal = init_terminal()?;
     if let Some(objective) = initial.filter(|s| !s.trim().is_empty()) {
@@ -616,6 +617,7 @@ async fn run_screen(
             permissions.poll(&mut tui.dialog).await;
             memory.poll(&mut tui.dialog).await;
             skills.poll(&mut tui.dialog).await;
+            external.poll(&mut tui.dialog).await;
             // A busy stream must still leave time for keys and drawing.
             for _ in 0..128 {
                 let Ok(update) = updates.try_recv() else { break };
@@ -682,6 +684,7 @@ async fn run_screen(
                         permissions.cancel();
                         memory.cancel();
                         skills.cancel();
+                        external.cancel();
                         continue;
                     },
                     TuiEvent::DialogAction(action, _values) if action.starts_with("models:") => {
@@ -782,6 +785,14 @@ async fn run_screen(
                     TuiEvent::DialogAction(action, values) if action.starts_with("skills:") => {
                         match skills.action(&action, &values, &mut tui.dialog).await {
                             Ok(Some(objective)) => { tui.tx.try_send(TuiEvent::Submit(objective))?; },
+                            Ok(None) => {},
+                            Err(error) => if let Some(dialog) = &mut tui.dialog { dialog.note = error.to_string(); }
+                        }
+                        continue;
+                    },
+                    TuiEvent::DialogAction(action, values) if action.starts_with("external:") => {
+                        match external.action(&action, &values, &root, profile.as_deref() == Some("read-only"), &mut tui.dialog).await {
+                            Ok(Some(message)) => tui.log.push(Message::System { text: message, kind: SystemKind::Success }),
                             Ok(None) => {},
                             Err(error) => if let Some(dialog) = &mut tui.dialog { dialog.note = error.to_string(); }
                         }
@@ -923,6 +934,11 @@ async fn run_screen(
                             }
                         }
                     }
+                    "/mcp" => {
+                        if active.is_some() { tui.log.push(Message::System { text: "Finish or cancel the current request before managing external tools.".into(), kind: SystemKind::Warning }); }
+                        else { tui.dialog = Some(external.open(chimera_mcp::default_config_path())); }
+                        continue;
+                    }
                     "/run" => argument.to_string(),
                     "/plan" => { plan = true; argument.to_string() }
                     _ if command.starts_with('/') => { tui.log.push(Message::System { text: format!("Unknown command {command}. Use /help."), kind: SystemKind::Warning }); continue; }
@@ -950,7 +966,14 @@ async fn run_screen(
                 let model = config.provider.model.clone();
                 let agent_config = AgentConfig { max_iterations: config.agent.max_iterations, temperature: Some(config.provider.temperature), max_tokens: Some(config.provider.max_tokens), ..Default::default() };
                 let policy = if plan { chimera_tools::ToolPolicy::read_only() } else { chimera_tools::ToolPolicy::supervised() };
-                let tools = Arc::new(chimera_tools::DefaultToolRouter::with_policy(Some(root.clone()), policy));
+                let tools: Arc<dyn chimera_tools::ToolRouter> = match external.attached() {
+                    Some(attached) if !plan => attached,
+                    Some(_) => {
+                        tui.log.push(Message::System { text: "External tools are not used in plan mode; run without /plan to use them.".into(), kind: SystemKind::Warning });
+                        Arc::new(chimera_tools::DefaultToolRouter::with_policy(Some(root.clone()), policy))
+                    }
+                    None => Arc::new(chimera_tools::DefaultToolRouter::with_policy(Some(root.clone()), policy)),
+                };
                 let events = events.clone();
                 let mut saved = session.take().context("saved conversation unavailable")?;
                 active = Some(tokio::spawn(async move {
@@ -984,6 +1007,7 @@ async fn run_screen(
     if let Some(task) = active {
         let _ = task.await.context("could not stop the running request")?;
     }
+    external.shutdown().await;
     drop(restore);
     result
 }

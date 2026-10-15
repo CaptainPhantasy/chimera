@@ -70,6 +70,14 @@ class Service(http.server.BaseHTTPRequestHandler):
             reply = {'choices': [{'delta': {'tool_calls': [{'index': 0, 'id': 'glob-1', 'type': 'function', 'function': {'name': 'glob', 'arguments': json.dumps({'pattern': '*', 'path': '.'})}}]}, 'finish_reason': 'tool_calls'}]}
         elif prompt == 'write the overlay file':
             reply = {'choices': [{'delta': {'tool_calls': [{'index': 0, 'id': 'write-1', 'type': 'function', 'function': {'name': 'write_file', 'arguments': json.dumps({'path': 'overlay-denied.txt', 'content': 'must stay absent\n'})}}]}, 'finish_reason': 'tool_calls'}]}
+        elif prompt == 'use the echo tool':
+            with completion_lock:
+                echo_completions['count'] += 1
+                echo_n = echo_completions['count']
+            if echo_n == 1:
+                reply = {'choices': [{'delta': {'tool_calls': [{'index': 0, 'id': 'call-external-1', 'type': 'function', 'function': {'name': 'mcp__reachable-fixture__echo', 'arguments': '{"query":"hello"}'}}]}, 'finish_reason': 'tool_calls'}]}
+            else:
+                reply = {'choices': [{'delta': {'content': 'external echo answered hello'}, 'finish_reason': None}]}
         if reply is not None:
             self.send_response(200); self.send_header('Content-Type', 'text/event-stream'); self.end_headers()
             def data(value):
@@ -115,15 +123,42 @@ SCRIPTED_COMPLETIONS = [
     text_events('SECOND_FILE_IS_WRITTEN_FOR_REWIND'),
 ]
 completions, completion_lock = [], threading.Lock()
+echo_completions = {'count': 0}
 
 server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Service)
 server.daemon_threads = True
 threading.Thread(target=server.serve_forever, daemon=True).start()
 config = root/'settings.json'
 project = root/'project'; project.mkdir()
+# /mcp — external tool connections: one real stdio fixture server and one
+# broken command, both isolated inside the temporary workspace.
+mcp_fixture = root/'mcp-fixture.py'
+mcp_fixture.write_text(
+    "import json, sys\n"
+    "for line in sys.stdin:\n"
+    "    request = json.loads(line)\n"
+    "    if 'id' not in request: continue\n"
+    "    method = request['method']\n"
+    "    if method == 'initialize':\n"
+    "        result = {'protocolVersion': '2025-11-25', 'capabilities': {'tools': {}}, 'serverInfo': {'name': 'fixture', 'version': '1'}}\n"
+    "    elif method == 'tools/list':\n"
+    "        result = {'tools': [{'name': 'echo', 'description': 'Echo the query.', 'inputSchema': {'type': 'object', 'properties': {'query': {'type': 'string'}}, 'required': ['query'], 'additionalProperties': False}}]}\n"
+    "    elif method == 'ping':\n"
+    "        result = {}\n"
+    "    elif method == 'tools/call':\n"
+    "        result = {'content': [{'type': 'text', 'text': 'echo from fixture: ' + request['params']['arguments']['query']}]}\n"
+    "    else:\n"
+    "        print(json.dumps({'jsonrpc': '2.0', 'id': request['id'], 'error': {'code': -32601, 'message': 'not found'}}), flush=True); continue\n"
+    "    print(json.dumps({'jsonrpc': '2.0', 'id': request['id'], 'result': result}), flush=True)\n")
+mcp_config = root/'mcp.json'
+mcp_config.write_text(json.dumps([
+    {'name': 'broken', 'transport': {'type': 'stdio'}, 'command': '/nonexistent/chimera-missing-command', 'args': [], 'env': {}},
+    {'name': 'reachable-fixture', 'transport': {'type': 'stdio'}, 'command': sys.executable, 'args': ['-u', str(mcp_fixture)], 'env': {'FIXTURE_TOKEN': 'fixture-secret-value'}},
+]) + '\n')
 row = {}
 waiters = []
-screen = RenderedScreen(binary, project, config, ['tui'], check, row); screens.append(screen)
+screen = RenderedScreen(binary, project, config, ['tui'], check, row,
+                        extra_env={'CHIMERA_MCP_CONFIG': str(mcp_config)}); screens.append(screen)
 report = {'binary': str(binary), 'sha256': hashlib.sha256(binary.read_bytes()).hexdigest(), 'workspace': str(root), 'checks': checks, 'screen': row, 'calls': calls}
 def send(text, marker=None):
     offset = screen.send(text)
@@ -396,6 +431,9 @@ try:
     check('reopening project memory shows the archived-out empty list', True)
     send('\x1b')
     # A completed request is the source for capture-from-current-conversation.
+    skills_posts_before = sum(
+        1 for c in calls
+        if c['method'] == 'POST' and c['path'].endswith('/chat/completions'))
     send('summarize the smoke check\r', 'Answer saved.')
     check('the chat request reached the fixture service', any(
         c['method'] == 'POST' and c['path'].endswith('/chat/completions') and c['authorized']
@@ -433,7 +471,68 @@ try:
     send('/skills no-such-procedure\r', 'Could not run the saved procedure')
     check('an unknown procedure name is refused without sending', sum(
         1 for c in calls
-        if c['method'] == 'POST' and c['path'].endswith('/chat/completions')) == 3)
+        if c['method'] == 'POST' and c['path'].endswith('/chat/completions')) - skills_posts_before == 3)
+    # /mcp — external tool connections in read-only mode: real status rows, an
+    # honest refusal to start programs, and guided setup that appends one
+    # entry without touching the saved ones.
+    send('/mcp\r', 'External tool connections')
+    screen.wait_for('broken')
+    screen.wait_for('reachable-fixture')
+    send('\r', 'Read-only plan mode cannot start external programs')
+    check('read-only refusal keeps the connection list open', True)
+    send('\x1b[B\x1b[B')
+    send('\r', 'Connection name')
+    send('\r\r\r\r', 'Enter a connection name')
+    check('empty setup input is refused and changes nothing', True)
+    send('\x1b[Z\x1b[Z\x1b[Z')
+    send('saved-via-ui\t')
+    send('python3\t')
+    send(f'-u {mcp_fixture}\t')
+    send('UI_KEY=ui-secret-value\r', 'Save this connection?')
+    check('guided setup never displays the credential value', b'ui-secret-value' not in screen.output)
+    send('\r', 'Connection saved-via-ui saved')
+    entries = {server['name']: server for server in json.loads(mcp_config.read_text())}
+    check('guided setup appends exactly one new entry',
+          list(entries) == ['broken', 'reachable-fixture', 'saved-via-ui'])
+    check('setup preserves the saved broken entry',
+          entries['broken']['command'] == '/nonexistent/chimera-missing-command')
+    check('setup preserves the fixture entry credentials',
+          entries['reachable-fixture']['env'] == {'FIXTURE_TOKEN': 'fixture-secret-value'})
+    check('saved setup entry keeps its credential for the server process',
+          entries['saved-via-ui']['env'] == {'UI_KEY': 'ui-secret-value'})
+    send('\x1b')
+    send('/mcp\r', 'External tool connections')
+    send('\x1b')
+    screen.finish()
+    # A supervised screen attaches the checked fixture server and uses its
+    # echo tool inside a real request through the ordinary chat approval.
+    project_supervised = root/'project-supervised'; project_supervised.mkdir()
+    config_supervised = root/'settings-supervised.json'
+    config_supervised.write_text(json.dumps({'provider': {
+        'name': 'Fixture', 'base_url': f'http://127.0.0.1:{server.server_port}/v1',
+        'model': 'model-beta', 'api_key': 'UI_TEST_KEY',
+        'request_timeout_secs': 5, 'idle_timeout_secs': 3}}) + '\n')
+    screen = RenderedScreen(binary, project_supervised, config_supervised, ['tui'], check, row,
+                            profile='supervised', extra_env={'CHIMERA_MCP_CONFIG': str(mcp_config)})
+    screens.append(screen)
+    screen.wait_for('model-beta', seconds=20)
+    send('/mcp\r', 'External tool connections')
+    send('\x1b[B', 'reachable-fixture')
+    send('\r', 'reachable-fixture is reachable')
+    send('\r', 'Attach reachable-fixture to this chat?')
+    screen.wait_for('mcp_server_start')
+    check('attach confirmation masks the credential value', b'fixture-secret-value' not in screen.output)
+    check('attach confirmation names the exact startup program',
+          ('-u ' + str(mcp_fixture)) in bytes(screen.output).decode('utf8', 'replace'))
+    send('\r', 'reachable-fixture is attached with')
+    send('\x1b')
+    send('use the echo tool\r', 'Use /approve or /deny')
+    send('/approve\r', 'approved once')
+    send('\t', 'echo from fixture: hello')
+    screen.wait_for('external echo answered hello')
+    screen.wait_for('Answer saved.')
+    check('attached external tool ran through the ordinary approval and answered in chat',
+          echo_completions['count'] >= 2)
     screen.finish()
 except BaseException as error:
     report['error'] = repr(error)

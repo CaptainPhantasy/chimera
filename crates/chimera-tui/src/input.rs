@@ -332,6 +332,7 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("skills", "browse, capture and run saved procedures"),
     ("mcp", "connect external tool servers for chat"),
     ("jobs", "list and control background work"),
+    ("editor", "compose the draft in your editor"),
     ("clear", "clear the screen; keep saved context"),
     ("theme", "switch between dark and light themes"),
     ("approve", "allow the displayed action once"),

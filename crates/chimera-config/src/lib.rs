@@ -31,6 +31,10 @@ pub struct Config {
     /// Saved connections; the selected one remains in `provider` for compatibility.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub providers: std::collections::BTreeMap<String, ProviderConfig>,
+    /// External editor used by the chat screen to compose long prompts.
+    /// Empty falls back to `$VISUAL`, then `$EDITOR`, when the editor runs.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub editor: String,
 }
 
 /// LLM provider configuration.
@@ -153,6 +157,27 @@ impl ProviderConfig {
 }
 
 impl Config {
+    /// The editor used to compose long prompts: the saved `editor` value,
+    /// else `$VISUAL`, else `$EDITOR`. `None` when nothing is configured.
+    pub fn editor(&self) -> Option<String> {
+        self.editor_with(|key| std::env::var(key).ok())
+    }
+
+    /// [`Config::editor`] with an injectable environment for tests.
+    pub fn editor_with(&self, env: impl Fn(&str) -> Option<String>) -> Option<String> {
+        let configured = self.editor.trim();
+        if !configured.is_empty() {
+            return Some(configured.to_string());
+        }
+        for key in ["VISUAL", "EDITOR"] {
+            match env(key) {
+                Some(value) if !value.trim().is_empty() => return Some(value),
+                _ => {}
+            }
+        }
+        None
+    }
+
     /// Priority: CHIMERA_* environment, file values, defaults. OPENAI_API_KEY
     /// is a fallback only when neither CHIMERA_API_KEY nor a file key is set.
     pub fn load() -> Result<Self> {
@@ -531,5 +556,60 @@ mod tests {
         let mut cfg = Config::default();
         cfg.provider.api_key = "private-test-token".into();
         assert!(!format!("{cfg:?}").contains("private-test-token"));
+    }
+
+    #[test]
+    fn editor_resolution_prefers_visual_before_editor() {
+        let cfg = Config::default();
+        assert_eq!(cfg.editor_with(|_| None), None);
+        assert_eq!(
+            cfg.editor_with(|key| (key == "VISUAL").then(|| "visual-bin".into())),
+            Some("visual-bin".to_string())
+        );
+        // $EDITOR is used only when $VISUAL is unset or blank.
+        assert_eq!(
+            cfg.editor_with(|key| match key {
+                "EDITOR" => Some("editor-bin".into()),
+                _ => None,
+            }),
+            Some("editor-bin".to_string())
+        );
+        assert_eq!(
+            cfg.editor_with(|key| match key {
+                "VISUAL" => Some("   ".into()),
+                "EDITOR" => Some("editor-bin".into()),
+                _ => None,
+            }),
+            Some("editor-bin".to_string())
+        );
+    }
+
+    #[test]
+    fn saved_editor_setting_beats_the_environment() {
+        let cfg = Config {
+            editor: "  saved-bin  ".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            cfg.editor_with(|key| (key == "VISUAL").then(|| "visual-bin".into())),
+            Some("saved-bin".to_string())
+        );
+    }
+
+    #[test]
+    fn editor_setting_round_trips_through_the_settings_file() {
+        let path = std::env::temp_dir().join(format!("chimera-editor-{}.json", uuid_for_test()));
+        std::fs::write(&path, r#"{"provider":{"model":"m"},"editor":"code -w"}"#).unwrap();
+        let cfg = Config::from_file(&path).unwrap();
+        assert_eq!(cfg.editor, "code -w");
+        let written = serde_json::to_string(&cfg).unwrap();
+        assert!(written.contains(r#""editor":"code -w""#));
+        let reloaded = serde_json::from_str::<Config>(&written).unwrap();
+        assert_eq!(reloaded.editor, "code -w");
+        // Without a configured editor the key stays out of the file, so the
+        // settings of a CHIMERA without this feature remain byte-identical.
+        let plain = serde_json::to_string(&Config::default()).unwrap();
+        assert!(!plain.contains("editor"));
+        let _ = std::fs::remove_file(&path);
     }
 }

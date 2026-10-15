@@ -359,6 +359,11 @@ impl Tui {
                 // Clear screen
                 self.log = MessageLog::new(500);
             }
+            KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                // Compose the draft in the external editor; the command goes
+                // through the normal path so the running request is honored.
+                let _ = self.tx.try_send(TuiEvent::Submit("/editor".into()));
+            }
             KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.input.insert_char(c);
             }
@@ -912,6 +917,23 @@ async fn run_screen(
                         }
                         continue;
                     }
+                    "/editor" => {
+                        if active.is_some() {
+                            tui.log.push(Message::System { text: "Cancel or finish the current request before editing the draft in your editor.".into(), kind: SystemKind::Warning });
+                        } else {
+                            match crate::editor::suspend_and_edit(&mut terminal, &config, &tui.input.buffer) {
+                                Ok(outcome) => {
+                                    if let Some(draft) = outcome.draft {
+                                        tui.input.buffer = draft;
+                                        tui.input.cursor = tui.input.buffer.len();
+                                    }
+                                    tui.log.push(Message::System { text: outcome.message, kind: outcome.kind });
+                                }
+                                Err(error) => tui.log.push(Message::System { text: error.to_string(), kind: SystemKind::Warning }),
+                            }
+                        }
+                        continue;
+                    }
                     "/permissions" => {
                         if active.is_some() { tui.log.push(Message::System { text: "Cancel or finish the current request before changing permissions.".into(), kind: SystemKind::Warning }); }
                         else { tui.dialog = Some(permissions.open(root.clone(), plan)); }
@@ -1106,6 +1128,21 @@ mod tests {
         assert_eq!(tui.input.text(), "q");
         tui.handle_key(KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE));
         assert_eq!(tui.help_scroll, 0);
+    }
+
+    #[test]
+    fn ctrl_e_opens_the_editor_without_touching_the_draft() {
+        let mut tui = Tui::new(String::new(), "test".into(), "test".into());
+        for c in "long draft 世界".chars() {
+            tui.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        tui.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL));
+        assert!(matches!(
+            tui.rx.try_recv().unwrap(),
+            TuiEvent::Submit(text) if text == "/editor"
+        ));
+        assert_eq!(tui.input.text(), "long draft 世界");
+        assert!(!tui.should_quit);
     }
 
     #[test]

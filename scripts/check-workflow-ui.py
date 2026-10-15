@@ -157,6 +157,12 @@ mcp_config.write_text(json.dumps([
 ]) + '\n')
 row = {}
 waiters = []
+# Fixture editor for /editor: prepends a marker to whatever draft file it is
+# handed. The chat screen passes the file path as the final argument.
+editor_script = root/'fixture-editor.sh'
+editor_script.write_text('#!/bin/sh\nprintf \'EDITOR-WAS-HERE \' | cat - "$1" > "$1.new" && mv "$1.new" "$1"\n')
+editor_script.chmod(0o755)
+os.environ['VISUAL'] = str(editor_script)
 screen = RenderedScreen(binary, project, config, ['tui'], check, row,
                         extra_env={'CHIMERA_MCP_CONFIG': str(mcp_config)}); screens.append(screen)
 report = {'binary': str(binary), 'sha256': hashlib.sha256(binary.read_bytes()).hexdigest(), 'workspace': str(root), 'checks': checks, 'screen': row, 'calls': calls}
@@ -571,6 +577,24 @@ try:
     send('\x1b')
     screen.wait_for('ready to send')
     check('leaving the job panel keeps the conversation intact', True)
+    # /editor — the unsent draft round-trips through the external editor.
+    before = len(calls)
+    send('chat draft ')
+    send('\x05', 'EDITOR-WAS-HERE chat draft')  # Ctrl+E composes in the editor
+    check('editor round trip keeps the edited draft in the input', True)
+    check('editing the draft sends no model request', len(calls) == before)
+    # A configured editor that cannot start must preserve the draft exactly.
+    screen.clear_input('EDITOR-WAS-HERE chat draft ')
+    saved = json.loads(config.read_text())
+    saved['editor'] = '/chimera-no-such-editor-xyz'
+    config.write_text(json.dumps(saved))
+    send('/reload\r', 'Model settings reloaded')
+    before = len(calls)
+    send('chat draft ')
+    send('\x05', 'Could not start the editor')
+    screen.wait_for('chat draft')
+    check('a missing editor preserves the draft', len(calls) == before)
+    screen.clear_input('chat draft ')
     screen.finish()
 except BaseException as error:
     report['error'] = repr(error)

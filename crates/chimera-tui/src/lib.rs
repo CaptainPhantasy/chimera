@@ -15,6 +15,7 @@ mod connect;
 pub mod dialog;
 pub mod help;
 pub mod input;
+mod jobs;
 pub mod message;
 mod models;
 pub mod runner;

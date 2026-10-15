@@ -427,6 +427,34 @@ impl WorkflowScheduler for FileWorkflowScheduler {
     }
 }
 
+/// Parse the command-line schedule words shared by the CLI and the TUI:
+/// hourly, daily, every:<seconds>, once:<RFC 3339 date and time>,
+/// cron:<five numeric UTC fields>.
+pub fn parse_frequency(text: &str) -> anyhow::Result<ScheduleFrequency> {
+    let value = text.trim();
+    Ok(match value {
+        "hourly" => ScheduleFrequency::Interval { every_secs: 3600 },
+        "daily" => ScheduleFrequency::Interval { every_secs: 86400 },
+        other if other.starts_with("every:") => ScheduleFrequency::Interval {
+            every_secs: other[6..]
+                .parse()
+                .context("every: must be followed by seconds")?,
+        },
+        other if other.starts_with("once:") => ScheduleFrequency::Once {
+            at: chrono::DateTime::parse_from_rfc3339(&other[5..])
+                .context("once: must be followed by an RFC 3339 date and time")?
+                .with_timezone(&Utc),
+        },
+        other if other.starts_with("cron:") => ScheduleFrequency::Cron {
+            expression: other[5..].into(),
+        },
+        _ => anyhow::bail!(
+            "schedule must be hourly, daily, every:<seconds>, once:<date with time zone>, \
+             or cron:<five numeric UTC fields>"
+        ),
+    })
+}
+
 fn next_run(
     frequency: &ScheduleFrequency,
     now: DateTime<Utc>,
@@ -774,6 +802,32 @@ mod tests {
             stdout: "actual output".into(),
             stderr: String::new(),
             output_truncated: false,
+        }
+    }
+    #[test]
+    fn parse_frequency_matches_the_command_line_words() {
+        assert!(matches!(
+            parse_frequency("hourly").unwrap(),
+            ScheduleFrequency::Interval { every_secs: 3600 }
+        ));
+        assert!(matches!(
+            parse_frequency(" daily ").unwrap(),
+            ScheduleFrequency::Interval { every_secs: 86400 }
+        ));
+        assert!(matches!(
+            parse_frequency("every:90").unwrap(),
+            ScheduleFrequency::Interval { every_secs: 90 }
+        ));
+        assert!(matches!(
+            parse_frequency("once:2026-10-14T09:30:00Z").unwrap(),
+            ScheduleFrequency::Once { .. }
+        ));
+        assert!(matches!(
+            parse_frequency("cron:*/15 * * * *").unwrap(),
+            ScheduleFrequency::Cron { .. }
+        ));
+        for bad in ["sometimes", "every:", "once:not-a-date", ""] {
+            assert!(parse_frequency(bad).is_err(), "{bad} must be refused");
         }
     }
     #[tokio::test]

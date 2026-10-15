@@ -596,6 +596,7 @@ async fn run_screen(
     let mut connections = crate::connect::Connections::default();
     let mut models = crate::models::Models::default();
     let mut sessions = crate::sessions::Sessions::default();
+    let mut jobs = crate::jobs::Jobs::default();
     let restore = TerminalGuard::new();
     let mut terminal = init_terminal()?;
     if let Some(objective) = initial.filter(|s| !s.trim().is_empty()) {
@@ -608,6 +609,7 @@ async fn run_screen(
             connections.poll(&mut tui.dialog).await;
             models.poll(&mut tui.dialog).await;
             sessions.poll(&mut tui.dialog).await;
+            jobs.poll(&mut tui.dialog).await;
             // A busy stream must still leave time for keys and drawing.
             for _ in 0..128 {
                 let Ok(update) = updates.try_recv() else { break };
@@ -666,7 +668,7 @@ async fn run_screen(
             }
             while let Ok(input) = tui.rx.try_recv() {
                 let text = match input {
-                    TuiEvent::DialogClosed => { connections.cancel(); models.cancel(); sessions.cancel(); continue; },
+                    TuiEvent::DialogClosed => { connections.cancel(); models.cancel(); sessions.cancel(); jobs.cancel(); continue; },
                     TuiEvent::DialogAction(action, _values) if action.starts_with("models:") => {
                         match models.action(&action, &config, &mut tui.dialog).await {
                             Ok(Some(saved)) => {
@@ -708,6 +710,14 @@ async fn run_screen(
                                 session = Some(resumed);
                                 tui.log.push(Message::System { text: "Conversation opened in this screen. Your unsent text is ready to send.".into(), kind: SystemKind::Success });
                             },
+                            Ok(None) => {},
+                            Err(error) => if let Some(dialog) = &mut tui.dialog { dialog.note = error.to_string(); }
+                        }
+                        continue;
+                    },
+                    TuiEvent::DialogAction(action, values) if action.starts_with("jobs:") => {
+                        match jobs.action(&action, &values, &mut tui.dialog).await {
+                            Ok(Some(report)) => tui.log.push(Message::System { text: report, kind: SystemKind::Success }),
                             Ok(None) => {},
                             Err(error) => if let Some(dialog) = &mut tui.dialog { dialog.note = error.to_string(); }
                         }
@@ -803,6 +813,11 @@ async fn run_screen(
                     "/sessions" => {
                         if active.is_some() { tui.log.push(Message::System { text: "Cancel or finish the current request before switching conversations.".into(), kind: SystemKind::Warning }); }
                         else { tui.dialog = Some(sessions.open(root.clone())); }
+                        continue;
+                    }
+                    "/jobs" => {
+                        if active.is_some() { tui.log.push(Message::System { text: "Cancel or finish the current request before managing background jobs.".into(), kind: SystemKind::Warning }); }
+                        else { tui.dialog = Some(jobs.open(root.clone())); }
                         continue;
                     }
                     "/run" => argument.to_string(),

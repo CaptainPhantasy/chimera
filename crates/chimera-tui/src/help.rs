@@ -27,6 +27,7 @@ const CONTROLS: &[(&str, &str)] = &[
         "/tools /sessions",
         "show tools or browse and switch sessions",
     ),
+    ("/memory /remember", "browse, edit or save project facts"),
     ("/approve /deny", "decide the displayed action once"),
     ("/clear", "clear screen; retain saved context"),
     ("/cancel", "stop current work"),

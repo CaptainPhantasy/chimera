@@ -11,6 +11,7 @@ chimera-tools.workspace = true
 chimera-creatures.workspace = true
 chimera-trace.workspace = true
 chimera-session.workspace = true
+chimera-memory.workspace = true
 tokio.workspace = true
 anyhow.workspace = true
 tracing.workspace = true

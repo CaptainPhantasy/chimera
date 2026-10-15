@@ -107,6 +107,49 @@ try:
     check('resume opens the newest conversation in place', True)
     send('/sessions\r', 'Switch conversation')
     send('\x1b')
+    # /memory and /remember — browse, search, edit and archive saved project
+    # facts; remembering writes only after the explicit confirmation form.
+    send('/memory\r', 'Project memory')
+    screen.wait_for('No saved project facts yet.')
+    send('\x1b')
+    # Esc must close the overlay: the slash command can only reach a focused input.
+    send('/memory\r', 'No saved project facts yet.')
+    check('cancelling project memory returns to an interactive chat', True)
+    send('\x1b')
+    send('/remember check the deploy tags\r', 'Remember a fact')
+    memory_record = project/'.chimera'/'memory'/'items.json'
+    check('remember confirms before anything is written', not memory_record.exists())
+    send('deploy-tags\r')
+    send('\r', 'Remembered deploy-tags')
+    screen.wait_for('Search: ')
+    stored = json.loads(memory_record.read_text())['data']
+    check('confirmed remember writes a shared project fact',
+          len(stored['items']) == 1 and stored['items'][0]['key'] == 'deploy-tags'
+          and stored['items'][0]['content'] == 'check the deploy tags'
+          and stored['items'][0]['session_id'] is None)
+    send('\r', 'Edit text')
+    send('\r', 'Edit fact')
+    send('\t')
+    send(' v2')
+    send('\r', 'Saved deploy-tags')
+    screen.wait_for('check the deploy tags v2')
+    stored = json.loads(memory_record.read_text())['data']
+    check('editing persists the new text and keeps the previous version',
+          stored['items'][0]['content'] == 'check the deploy tags v2'
+          and any(entry['item']['content'] == 'check the deploy tags' for entry in stored['archived']))
+    send('\r', 'Edit text')
+    send('\x1b[B\r', 'Archive this fact?')
+    send('\r', 'Archived.')
+    screen.wait_for('No matches. Backspace to change the search.')
+    stored = json.loads(memory_record.read_text())['data']
+    check('archiving hides the fact but keeps its history',
+          len(stored['items']) == 0
+          and any(entry['item']['key'] == 'deploy-tags' for entry in stored['archived']))
+    send('\x1b')
+    send('/memory\r', 'Project memory')
+    screen.wait_for('No saved project facts yet.')
+    check('reopening project memory shows the archived-out empty list', True)
+    send('\x1b')
     screen.finish()
 except BaseException as error:
     report['error'] = repr(error)

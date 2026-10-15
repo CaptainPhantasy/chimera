@@ -400,11 +400,13 @@ struct MemoryRecords {
     items: Vec<MemoryItem>,
     archived: Vec<ArchivedMemory>,
 }
+/// A previous version kept when a fact was updated, edited or archived,
+/// with the reason and time it was displaced. History is never destroyed.
 #[derive(Serialize, Deserialize)]
-struct ArchivedMemory {
-    item: MemoryItem,
-    reason: String,
-    at: DateTime<Utc>,
+pub struct ArchivedMemory {
+    pub item: MemoryItem,
+    pub reason: String,
+    pub at: DateTime<Utc>,
 }
 
 /// Durable memory confined to a canonical project. A session view can see its
@@ -435,6 +437,51 @@ impl FileMemoryStore {
                 item.id == id && (item.session_id.is_none() || item.session_id == self.session)
             })
             .ok_or_else(|| anyhow::anyhow!("memory not found in current scope: {id}"))
+    }
+
+    /// Previous versions kept for history: facts displaced by updates, edits
+    /// and archives, with the reason and time they were displaced. A session
+    /// view sees only its own scope, like `retrieve`.
+    pub async fn archived(&self) -> anyhow::Result<Vec<ArchivedMemory>> {
+        let records: MemoryRecords = self.records.read("items")?;
+        Ok(records
+            .archived
+            .into_iter()
+            .filter(|entry| {
+                entry.item.session_id.is_none() || entry.item.session_id == self.session
+            })
+            .collect())
+    }
+
+    /// Replace a fact's key and text, keeping its identity, layer, metadata
+    /// and creation date. The previous version moves to history. Like
+    /// `forget`, this refuses ids outside the current scope.
+    pub async fn edit(
+        &self,
+        id: MemoryId,
+        key: String,
+        content: String,
+    ) -> anyhow::Result<MemoryItem> {
+        self.records.update("items", |records: &mut MemoryRecords| {
+            let index = records
+                .items
+                .iter()
+                .position(|item| item.id == id && item.session_id == self.session)
+                .ok_or_else(|| anyhow::anyhow!("memory not found in current scope"))?;
+            let mut updated = records.items[index].clone();
+            updated.key = key;
+            updated.content = content;
+            updated.last_accessed = Utc::now();
+            validate_item(&updated)?;
+            let previous = records.items.remove(index);
+            records.archived.push(ArchivedMemory {
+                item: previous,
+                reason: "edited".into(),
+                at: Utc::now(),
+            });
+            records.items.push(updated.clone());
+            Ok(updated)
+        })
     }
 }
 fn validate_item(item: &MemoryItem) -> anyhow::Result<()> {
@@ -915,6 +962,66 @@ mod tests {
         replacement.id = id;
         assert!(scoped.remember(replacement).await.is_err());
         assert_eq!(global.show(id).await.unwrap().key, "shared");
+    }
+    #[tokio::test]
+    async fn edit_replaces_text_keeps_identity_and_keeps_history_scoped() {
+        let root = root();
+        let store = FileMemoryStore::new(&root);
+        let item = make_item("deploy", MemoryLayer::Semantic, 0.9);
+        let id = store.remember(item.clone()).await.unwrap();
+        let updated = store
+            .edit(id, "deploy".into(), "check the deploy tags".into())
+            .await
+            .unwrap();
+        assert_eq!(updated.id, id);
+        assert_eq!(updated.layer, item.layer);
+        assert_eq!(updated.created_at, item.created_at);
+        assert_eq!(updated.content, "check the deploy tags");
+        let listed = store
+            .retrieve(MemoryQuery {
+                layer: Some(MemoryLayer::Semantic),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].content, "check the deploy tags");
+        let history = store.archived().await.unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].reason, "edited");
+        assert_eq!(history[0].item.content, item.content);
+        // Invalid replacements are refused and change nothing.
+        assert!(store.edit(id, "  ".into(), "x".into()).await.is_err());
+        assert!(store
+            .edit(id, "ok".into(), "x".repeat(1024 * 1024 + 1))
+            .await
+            .is_err());
+        assert_eq!(
+            store.show(id).await.unwrap().content,
+            "check the deploy tags"
+        );
+        assert_eq!(store.archived().await.unwrap().len(), 1);
+        // Unknown and out-of-scope ids are refused like `forget`.
+        assert!(store
+            .edit(Uuid::new_v4(), "k".into(), "v".into())
+            .await
+            .is_err());
+        // A session view reads shared history but cannot change shared facts,
+        // and its own history is invisible to the project view.
+        let scoped = FileMemoryStore::for_session(&root, Uuid::new_v4());
+        assert_eq!(scoped.archived().await.unwrap().len(), 1);
+        assert!(scoped.edit(id, "k".into(), "v".into()).await.is_err());
+        let own = make_item("private", MemoryLayer::Session, 0.5);
+        let own_id = own.id;
+        scoped.remember(own).await.unwrap();
+        let own_edited = scoped
+            .edit(own_id, "private".into(), "changed".into())
+            .await
+            .unwrap();
+        assert_eq!(own_edited.content, "changed");
+        assert_eq!(scoped.archived().await.unwrap().len(), 2);
+        assert_eq!(store.archived().await.unwrap().len(), 1);
+        assert_eq!(store.show(id).await.unwrap().key, "deploy");
     }
     #[cfg(unix)]
     #[test]

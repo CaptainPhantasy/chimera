@@ -188,6 +188,14 @@ Don't claim "the only coding agent" until item 25 has published evidence and a c
 | Works with no one at the keyboard | 20 | Unattended runs use only declared permissions and return clear exit codes. |
 | Evidence is public | 25 | Repeat-run and benchmark results are published with their logs. |
 
+### Keeping the claim from hurting the app or its users
+
+- **"Reproducible" means checkable, not identical.** Hosted models can return different output at temperature 0 and can change behind the same name, so no harness can guarantee identical model output. Replay should offer two modes: re-executing the recorded model responses, which repeats the tool steps exactly, and re-asking the model, which reports where results differ. Wording must promise that a run can be checked, never that it will come out the same.
+- **Strict must not mean slow to start.** Ship a standard policy preset that lets reads and edits inside the project pass by rule, and keep prompts for commands, network and anything outside the project. Strict presets stay opt-in. Otherwise the positioning brings back the approval fatigue item 7 is meant to fix.
+- **Manifests hold private data.** Tool results can contain source code and secrets. Store manifests under `.chimera/` with the same privacy rules as sessions, and redact them in exports, as `session export` already does.
+- **Overhead stays bounded.** Checkpoints need a retention limit, and gates run only the checks a project names. Manifests store hashes plus references to data already kept on disk, rather than second copies.
+- **The claim isn't the whole product.** Items 1–20 still decide whether people use CHIMERA every day. The positioning only helps once those basics are in place.
+
 ## Part 3 — Further gaps, not yet assessed in detail
 
 These were named during the review but haven't been checked against CHIMERA's code or competitor documentation yet. Each needs the same evidence review before it's prioritized.

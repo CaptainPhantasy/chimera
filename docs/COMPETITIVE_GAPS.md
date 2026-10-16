@@ -150,7 +150,7 @@ P0 makes CHIMERA usable day to day and establishes its distinctive position. P1 
 
 ## Part 2 — Harness guarantees that set CHIMERA apart
 
-These turn the existing supervision features into guarantees no competitor currently enforces.
+These turn the existing supervision features into guarantees the harness enforces by default. Some competitors let users build parts of this themselves (for example, a Claude Code Stop hook that blocks completion until tests pass). None known to this review ships it built in.
 
 ### 21. Single policy-as-code file
 Replace `policy`, `autonomy`, `leash` and `--profile` with one versioned file (for example `.chimera/policy.toml`) holding modes plus allow/deny rules. The harness evaluates it the same way every time and records its hash with each run. Items 7 and 8 depend on this.
@@ -170,6 +170,23 @@ Correct these before any public announcement.
 
 ### 25. Public reproducibility and benchmark results
 Publish repeat-run results (the same task N times, with and without items 21–23) and a public benchmark run, such as Terminal-Bench or SWE-bench with a local model, including the logs.
+
+## What the positioning claim requires
+
+The intended position is:
+
+> The coding agent whose rules are enforced by default, and whose runs carry a manifest you can re-run to check reproducibility.
+
+Don't claim "the only coding agent" until item 25 has published evidence and a current competitor check backs it up.
+
+| Requirement | Items | What must be true before claiming it |
+|---|---|---|
+| Rules enforced by the harness | 21, 7, 16 | Policy and hooks are evaluated in code on every tool call. A model or a hook can't bypass a deny rule. |
+| Edits are always recoverable | 14 | Every file-changing tool call creates a checkpoint without any operator action. |
+| Completion is verified | 22 | A run with a gate can't report success until the named `eval` passes. |
+| Runs are reproducible and checkable | 23 | Each run writes a manifest, and `replay` re-executes it and reports any differences. |
+| Works with no one at the keyboard | 20 | Unattended runs use only declared permissions and return clear exit codes. |
+| Evidence is public | 25 | Repeat-run and benchmark results are published with their logs. |
 
 ## Part 3 — Further gaps, not yet assessed in detail
 

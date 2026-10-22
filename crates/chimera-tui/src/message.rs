@@ -213,13 +213,23 @@ fn wrap_text(text: &str, max_width: usize) -> Vec<String> {
 // ---------------------------------------------------------------------------
 
 /// A bounded, scrollable log of conversation messages.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct MessageLog {
     pub messages: VecDeque<Message>,
     /// Maximum messages retained.
     pub capacity: usize,
     /// Scroll offset from the bottom (0 = pinned to latest).
     pub scroll_offset: usize,
+    /// Whether new messages snap the view back to the bottom.
+    pub follow: bool,
+    /// Last known render width, for line-height estimates while detached.
+    pub width: usize,
+}
+
+impl Default for MessageLog {
+    fn default() -> Self {
+        Self::new(100)
+    }
 }
 
 impl MessageLog {
@@ -228,21 +238,42 @@ impl MessageLog {
             messages: VecDeque::with_capacity(capacity),
             capacity,
             scroll_offset: 0,
+            follow: true,
+            width: 80,
         }
     }
 
     /// Push a message, evicting the oldest if over capacity.
     pub fn push(&mut self, msg: Message) {
+        // While detached, keep the reader's place: content added below shifts
+        // the window down, content evicted above shifts it back up.
+        let grow = if self.follow {
+            0
+        } else {
+            msg.estimated_lines(self.width)
+        };
+        let shrink = if self.follow || self.messages.len() < self.capacity {
+            0
+        } else {
+            self.messages
+                .front()
+                .map(|m| m.estimated_lines(self.width))
+                .unwrap_or(0)
+        };
         if self.messages.len() >= self.capacity {
             self.messages.pop_front();
         }
         self.messages.push_back(msg);
-        // Reset scroll to follow new messages.
-        self.scroll_offset = 0;
+        if self.follow {
+            self.scroll_offset = 0;
+        } else {
+            self.scroll_offset = self.scroll_offset.saturating_sub(shrink) + grow;
+        }
     }
 
     /// Scroll up (toward older messages).
     pub fn scroll_up(&mut self, max_offset: usize) {
+        self.follow = false;
         self.scroll_offset = self.scroll_offset.min(max_offset);
         if self.scroll_offset < max_offset {
             self.scroll_offset += 1;
@@ -254,11 +285,15 @@ impl MessageLog {
         if self.scroll_offset > 0 {
             self.scroll_offset -= 1;
         }
+        if self.scroll_offset == 0 {
+            self.follow = true;
+        }
     }
 
     /// Jump to the latest message.
     pub fn scroll_to_bottom(&mut self) {
         self.scroll_offset = 0;
+        self.follow = true;
     }
 
     /// Whether the view is pinned to the latest message.
@@ -349,6 +384,26 @@ mod tests {
         assert_eq!(log.scroll_offset, 1);
         log.scroll_down();
         assert!(log.at_bottom());
+    }
+
+    #[test]
+    fn scrolling_up_detaches_from_the_bottom_until_you_return() {
+        let mut log = MessageLog::new(100);
+        log.push(Message::User { text: "a".into() });
+        log.scroll_up(9);
+        log.push(Message::User { text: "b".into() });
+        // "b" renders two rough lines, so the offset grows by two to hold the
+        // reader's place instead of letting the view slide under them.
+        assert_eq!(log.scroll_offset, 3, "new messages must not yank the view");
+        assert!(!log.follow);
+        // Scrolling back down through the new content reattaches at the bottom.
+        for _ in 0..3 {
+            log.scroll_down();
+        }
+        assert!(log.follow);
+        log.scroll_up(9);
+        log.scroll_to_bottom();
+        assert!(log.follow && log.at_bottom());
     }
 
     #[test]

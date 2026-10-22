@@ -72,19 +72,38 @@ impl InputBar {
         self.history_path = Some(path);
     }
 
-    /// Load persisted history (newest last). Only the newest entries are kept.
+    /// Load persisted history (newest last). Only the newest entries are kept;
+    /// when the file has grown far past the limit it is compacted in place.
     fn load_history(&mut self, path: &Path) {
         let Ok(raw) = std::fs::read_to_string(path) else {
             return;
         };
+        let total = raw.lines().count();
         let newest: Vec<&str> = raw.lines().rev().take(HISTORY_LIMIT).collect();
-        for line in newest.into_iter().rev() {
+        for line in newest.iter().rev() {
             let entry = unescape_history(line);
             if entry.trim().is_empty() {
                 continue;
             }
             self.history.push_back(entry);
         }
+        // The file is append-only, so it needs a periodic trim to stay small.
+        if total > HISTORY_LIMIT * 2 {
+            let contents: String = self
+                .history
+                .iter()
+                .map(|entry| format!("{}\n", escape_history(entry)))
+                .collect();
+            let _ = std::fs::write(path, contents);
+        }
+    }
+
+    /// Assign the buffer and refresh command hints, so a popup can never go
+    /// stale against text that was replaced behind its back.
+    pub fn set_buffer(&mut self, text: &str) {
+        self.buffer = text.to_string();
+        self.cursor = self.buffer.len();
+        self.update_suggestions();
     }
 
     /// Record an entry into history and the history file (best-effort).

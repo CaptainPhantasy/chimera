@@ -944,8 +944,7 @@ async fn run_screen(
                             match crate::editor::suspend_and_edit(&mut terminal, &config, &tui.input.buffer) {
                                 Ok(outcome) => {
                                     if let Some(draft) = outcome.draft {
-                                        tui.input.buffer = draft;
-                                        tui.input.cursor = tui.input.buffer.len();
+                                        tui.input.set_buffer(&draft);
                                     }
                                     tui.log.push(Message::System { text: outcome.message, kind: outcome.kind });
                                 }
@@ -1004,13 +1003,12 @@ async fn run_screen(
                 };
                 if objective.trim().is_empty() { continue; }
                 if active.is_some() {
-                    tui.input.buffer = objective.clone(); tui.input.cursor = objective.len();
+                    tui.input.set_buffer(&objective);
                     tui.log.push(Message::System { text: "A request is already running. Finish it or use /cancel; your new text remains in the input.".into(), kind: SystemKind::Warning });
                     continue;
                 }
                 if !settings.ready(&config) {
-                    tui.input.buffer = unsent;
-                    tui.input.cursor = tui.input.buffer.len();
+                    tui.input.set_buffer(&unsent);
                     show_setup_needed(&mut tui);
                     continue;
                 }

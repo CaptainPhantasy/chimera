@@ -151,7 +151,11 @@ impl Dialog {
                             return Outcome::Action(row.action.clone(), vec![]);
                         }
                     }
-                    KeyCode::Char('d') => {
+                    KeyCode::Char('d')
+                        if filtered
+                            .get(*selected)
+                            .is_some_and(|row| row.alt_action.is_some()) =>
+                    {
                         if let Some(row) = filtered.get(*selected) {
                             if let Some(alt) = &row.alt_action {
                                 return Outcome::Action(alt.clone(), vec![]);

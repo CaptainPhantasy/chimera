@@ -302,11 +302,16 @@ impl FileSessionStore {
     /// Permanently remove a saved conversation and its file record.
     pub async fn delete(&self, id: SessionId) -> anyhow::Result<()> {
         let _lock = self.lock()?;
+        // An active runner holds this lease; refuse rather than delete mid-run.
+        let _run_lease = self.lock_run(id)?;
         let path = self.session_path(id)?;
         if !path.exists() {
             bail!("no saved conversation exists for that id");
         }
-        std::fs::remove_file(path)?;
+        std::fs::remove_file(&path)?;
+        // The crash-safe writer keeps a `.previous` copy beside the record;
+        // remove it too so the conversation is really gone.
+        let _ = std::fs::remove_file(PathBuf::from(format!("{}.previous", path.display())));
         sync_dir(&self.storage_dir()?)?;
         Ok(())
     }

@@ -1017,6 +1017,10 @@ async fn run_screen(
                 tui.status.mode = if plan { "PLAN" } else { "RUN" }.into();
                 tui.log.push(Message::User { text: objective.clone() });
                 tui.status.running = true;
+                // Clock the spinner and elapsed readout from submit, not from
+                // the first agent event, so a slow provider still shows time.
+                tui.status.run_started = Some(std::time::Instant::now());
+                tui.status.active_tool = None;
                 cancel.send_replace(false);
                 let cancellation = cancel.subscribe();
                 let provider = config.build_provider();

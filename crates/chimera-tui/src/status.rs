@@ -84,8 +84,11 @@ impl StatusInfo {
 
     /// The animated running readout: spinner, elapsed time, active tool.
     pub fn running_label(&self, now: std::time::Instant) -> String {
+        // Animate off the run's own clock: `now` is freshly created each draw,
+        // so animating off `now.elapsed()` would freeze the spinner on frame 0.
+        let started = self.run_started.unwrap_or(now);
         let frame =
-            SPINNER_FRAMES[(now.elapsed().as_millis() as usize / 120) % SPINNER_FRAMES.len()];
+            SPINNER_FRAMES[(started.elapsed().as_millis() as usize / 120) % SPINNER_FRAMES.len()];
         let mut label = format!("{frame} Working");
         if let Some(started) = self.run_started {
             label.push_str(&format!(" · {}", elapsed_str(now.duration_since(started))));

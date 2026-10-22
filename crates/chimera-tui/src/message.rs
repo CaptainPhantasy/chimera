@@ -207,7 +207,7 @@ fn markdown_lines(text: &str, styles: &Styles, width: usize) -> Vec<Line<'static
         let trimmed = raw.trim_start();
         if let Some(lang) = trimmed.strip_prefix("```") {
             in_code = !in_code;
-            if in_code && !lang.is_empty() {
+            if in_code && !lang.trim().is_empty() {
                 lines.push(Line::from(Span::styled(
                     format!("  ── {lang} "),
                     styles.text_faint(),
@@ -249,7 +249,7 @@ fn markdown_lines(text: &str, styles: &Styles, width: usize) -> Vec<Line<'static
             }
         }
         if let Some(inner) = trimmed.strip_prefix('`').and_then(|s| s.strip_suffix('`')) {
-            if inner.len() > 1 && !inner.contains('`') {
+            if !inner.is_empty() && !inner.contains('`') {
                 lines.push(Line::from(Span::styled(
                     format!("  {inner}"),
                     styles.code_block(),

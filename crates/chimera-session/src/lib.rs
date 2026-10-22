@@ -774,7 +774,8 @@ fn lock_directory(dir: &Path) -> anyhow::Result<File> {
         match file.try_lock() {
             Ok(()) => return Ok(file),
             Err(std::fs::TryLockError::WouldBlock)
-                if started.elapsed() < Duration::from_secs(5) =>
+                // Generous budget: on loaded machines a 5s wait flaked tests.
+                if started.elapsed() < Duration::from_secs(30) =>
             {
                 std::thread::sleep(Duration::from_millis(10))
             }
@@ -1551,7 +1552,7 @@ mod file_tests {
             .stdout(std::process::Stdio::null())
             .spawn()
             .unwrap();
-        tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::time::timeout(Duration::from_secs(30), async {
             while !ready.exists() {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }

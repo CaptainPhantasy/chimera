@@ -336,6 +336,14 @@ impl Tui {
                 self.log.scroll_offset = self.log.scroll_offset.min(self.scroll_limit());
                 self.log.scroll_down();
             }
+            KeyCode::BackTab => {
+                // Shift+Tab folds every tool card at once.
+                for message in &mut self.log.messages {
+                    if let Message::ToolCall { expanded, .. } = message {
+                        *expanded = false;
+                    }
+                }
+            }
             KeyCode::Up => {
                 self.input.history_prev();
             }
@@ -1335,6 +1343,34 @@ mod tests {
             "streamed lines must not yank a detached view"
         );
         assert!(!tui.log.follow);
+    }
+
+    #[test]
+    fn backtab_folds_every_tool_card() {
+        let mut tui = Tui::new("fold".into(), "test".into(), "test".into());
+        tui.apply_agent_update(AgentUpdate::ToolCallStart {
+            name: "one".into(),
+            arguments: "{}".into(),
+        });
+        tui.apply_agent_update(AgentUpdate::ToolCallStart {
+            name: "two".into(),
+            arguments: "{}".into(),
+        });
+        tui.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert!(tui
+            .log
+            .messages
+            .iter()
+            .filter_map(|m| match m {
+                Message::ToolCall { expanded, .. } => Some(*expanded),
+                _ => None,
+            })
+            .any(|expanded| expanded));
+        tui.handle_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
+        assert!(tui.log.messages.iter().all(|m| match m {
+            Message::ToolCall { expanded, .. } => !*expanded,
+            _ => true,
+        }));
     }
 
     #[test]

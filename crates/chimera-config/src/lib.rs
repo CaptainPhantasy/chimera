@@ -35,6 +35,40 @@ pub struct Config {
     /// Empty falls back to `$VISUAL`, then `$EDITOR`, when the editor runs.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub editor: String,
+    /// Interface preferences.
+    #[serde(default, skip_serializing_if = "UiConfig::is_default")]
+    pub ui: UiConfig,
+}
+
+/// Interface preferences stored alongside provider settings.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UiConfig {
+    /// Preferred terminal palette: "dark" or "light".
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub theme: String,
+}
+
+impl UiConfig {
+    fn is_default(&self) -> bool {
+        self.theme.is_empty()
+    }
+}
+
+/// Persist the preferred palette ("dark" or "light") to the config file.
+///
+/// A missing config file is created from defaults; an unreadable file is an
+/// error rather than a silent overwrite that could drop provider secrets.
+pub fn set_theme(theme: &str) -> Result<()> {
+    let path = config_file_path().context("no config file path is available")?;
+    let mut config = match std::fs::read(&path) {
+        Ok(bytes) => serde_json::from_slice::<Config>(&bytes)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Config::default(),
+        Err(error) => return Err(error).context("could not read the config file"),
+    };
+    config.ui.theme = theme.to_string();
+    let bytes = serde_json::to_vec_pretty(&config)?;
+    connections::save_private(&path, &bytes)
 }
 
 /// LLM provider configuration.
@@ -611,5 +645,21 @@ mod tests {
         let plain = serde_json::to_string(&Config::default()).unwrap();
         assert!(!plain.contains("editor"));
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn ui_theme_stays_out_of_the_file_until_it_is_set() {
+        let plain = serde_json::to_string(&Config::default()).unwrap();
+        assert!(!plain.contains("ui"));
+        let themed = Config {
+            ui: UiConfig {
+                theme: "light".into(),
+            },
+            ..Default::default()
+        };
+        let written = serde_json::to_string(&themed).unwrap();
+        assert!(written.contains(r#""theme":"light""#));
+        let reloaded: Config = serde_json::from_str(&written).unwrap();
+        assert_eq!(reloaded.ui.theme, "light");
     }
 }

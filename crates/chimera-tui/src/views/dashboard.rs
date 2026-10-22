@@ -1,13 +1,14 @@
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table};
 use ratatui::Frame;
 
 use crate::app::{App, TaskDisplayStatus};
+use crate::theme::Styles;
 
 /// Render the main dashboard view.
-pub fn render(f: &mut Frame, app: &App) {
+pub fn render(f: &mut Frame, app: &App, styles: &Styles) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -20,28 +21,23 @@ pub fn render(f: &mut Frame, app: &App) {
         ])
         .split(f.area());
 
-    render_header(f, app, chunks[0]);
+    render_header(f, app, styles, chunks[0]);
     render_objective(f, app, chunks[1]);
-    render_creatures(f, app, chunks[2]);
-    render_task_graph(f, app, chunks[3]);
-    render_feed(f, app, chunks[4]);
-    render_keys(f, chunks[5]);
+    render_creatures(f, app, styles, chunks[2]);
+    render_task_graph(f, app, styles, chunks[3]);
+    render_feed(f, app, styles, chunks[4]);
+    render_keys(f, styles, chunks[5]);
 }
 
-fn render_header(f: &mut Frame, app: &App, area: Rect) {
+fn render_header(f: &mut Frame, app: &App, styles: &Styles, area: Rect) {
     let text = vec![Line::from(vec![
-        Span::styled(
-            "chimera",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ),
+        Span::styled("chimera", styles.info().add_modifier(Modifier::BOLD)),
         Span::raw(" :: "),
         Span::raw(&app.session_label),
         Span::raw("    Mode: "),
-        Span::styled(&app.mode, Style::default().fg(Color::Yellow)),
+        Span::styled(&app.mode, styles.warning()),
         Span::raw("    Autonomy: "),
-        Span::styled(&app.autonomy, Style::default().fg(Color::Green)),
+        Span::styled(&app.autonomy, styles.success()),
     ])];
     let block = Block::default().borders(Borders::BOTTOM);
     let p = Paragraph::new(text).block(block);
@@ -54,7 +50,7 @@ fn render_objective(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(p, area);
 }
 
-fn render_creatures(f: &mut Frame, app: &App, area: Rect) {
+fn render_creatures(f: &mut Frame, app: &App, styles: &Styles, area: Rect) {
     let header = Row::new(vec![
         "ID",
         "Role",
@@ -71,16 +67,16 @@ fn render_creatures(f: &mut Frame, app: &App, area: Rect) {
         .creatures
         .iter()
         .map(|c| {
-            let state_color = match c.state.as_str() {
-                "running" => Color::Green,
-                "waiting" => Color::Yellow,
-                "idle" => Color::DarkGray,
-                _ => Color::White,
+            let state_style = match c.state.as_str() {
+                "running" => styles.success(),
+                "waiting" => styles.warning(),
+                "idle" => styles.text_faint(),
+                _ => styles.text(),
             };
             Row::new(vec![
                 Cell::from(c.id.clone()),
                 Cell::from(c.role.clone()),
-                Cell::from(c.state.clone()).style(Style::default().fg(state_color)),
+                Cell::from(c.state.clone()).style(state_style),
                 Cell::from(c.world.clone()),
                 Cell::from(format!("{:.2}", c.confidence)),
                 Cell::from(format!("{}k", c.tokens_used / 1000)),
@@ -107,7 +103,7 @@ fn render_creatures(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(table, area);
 }
 
-fn render_task_graph(f: &mut Frame, app: &App, area: Rect) {
+fn render_task_graph(f: &mut Frame, app: &App, styles: &Styles, area: Rect) {
     let lines: Vec<Line> = app
         .tasks
         .iter()
@@ -118,16 +114,13 @@ fn render_task_graph(f: &mut Frame, app: &App, area: Rect) {
                 TaskDisplayStatus::Pending => "[ ]",
                 TaskDisplayStatus::Failed => "[!]",
             };
-            let color = match t.status {
-                TaskDisplayStatus::Complete => Color::Green,
-                TaskDisplayStatus::InProgress => Color::Yellow,
-                TaskDisplayStatus::Pending => Color::DarkGray,
-                TaskDisplayStatus::Failed => Color::Red,
+            let style = match t.status {
+                TaskDisplayStatus::Complete => styles.success(),
+                TaskDisplayStatus::InProgress => styles.warning(),
+                TaskDisplayStatus::Pending => styles.text_faint(),
+                TaskDisplayStatus::Failed => styles.error(),
             };
-            Line::from(Span::styled(
-                format!(" {} {}", icon, t.description),
-                Style::default().fg(color),
-            ))
+            Line::from(Span::styled(format!(" {} {}", icon, t.description), style))
         })
         .collect();
 
@@ -136,7 +129,7 @@ fn render_task_graph(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(p, area);
 }
 
-fn render_feed(f: &mut Frame, app: &App, area: Rect) {
+fn render_feed(f: &mut Frame, app: &App, styles: &Styles, area: Rect) {
     let visible = if app.feed.len() > 6 {
         &app.feed[app.feed.len() - 6..]
     } else {
@@ -149,9 +142,9 @@ fn render_feed(f: &mut Frame, app: &App, area: Rect) {
             Line::from(vec![
                 Span::styled(
                     l.timestamp.format(" %H:%M:%S ").to_string(),
-                    Style::default().fg(Color::DarkGray),
+                    styles.text_faint(),
                 ),
-                Span::styled(&l.creature, Style::default().fg(Color::Cyan)),
+                Span::styled(&l.creature, styles.info()),
                 Span::raw(" "),
                 Span::raw(&l.message),
             ])
@@ -163,21 +156,21 @@ fn render_feed(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(p, area);
 }
 
-fn render_keys(f: &mut Frame, area: Rect) {
+fn render_keys(f: &mut Frame, styles: &Styles, area: Rect) {
     let keys = Line::from(vec![
-        Span::styled("[a]", Style::default().fg(Color::Green)),
+        Span::styled("[a]", styles.success()),
         Span::raw(" approve  "),
-        Span::styled("[d]", Style::default().fg(Color::Red)),
+        Span::styled("[d]", styles.error()),
         Span::raw(" deny  "),
-        Span::styled("[f]", Style::default().fg(Color::Yellow)),
+        Span::styled("[f]", styles.warning()),
         Span::raw(" fork  "),
-        Span::styled("[c]", Style::default().fg(Color::Blue)),
+        Span::styled("[c]", styles.info()),
         Span::raw(" checkpoint  "),
-        Span::styled("[r]", Style::default().fg(Color::Magenta)),
+        Span::styled("[r]", styles.brand_dim()),
         Span::raw(" replay  "),
-        Span::styled("[l]", Style::default().fg(Color::Cyan)),
+        Span::styled("[l]", styles.info()),
         Span::raw(" leash  "),
-        Span::styled("[q]", Style::default().fg(Color::DarkGray)),
+        Span::styled("[q]", styles.text_faint()),
         Span::raw(" quit"),
     ]);
     f.render_widget(Paragraph::new(keys), area);
@@ -192,14 +185,14 @@ mod tests {
     fn dashboard_renders_without_panic() {
         let app = sample_app();
         let mut terminal = test_terminal(120, 40);
-        terminal.draw(|f| render(f, &app)).unwrap();
+        terminal.draw(|f| render(f, &app, &Styles::dark())).unwrap();
     }
 
     #[test]
     fn dashboard_renders_empty_app() {
         let app = App::new("empty".into(), "nothing".into());
         let mut terminal = test_terminal(80, 24);
-        terminal.draw(|f| render(f, &app)).unwrap();
+        terminal.draw(|f| render(f, &app, &Styles::dark())).unwrap();
     }
 
     #[test]
@@ -209,6 +202,6 @@ mod tests {
             app.push_feed("C", &format!("msg {}", i));
         }
         let mut terminal = test_terminal(120, 40);
-        terminal.draw(|f| render(f, &app)).unwrap();
+        terminal.draw(|f| render(f, &app, &Styles::dark())).unwrap();
     }
 }

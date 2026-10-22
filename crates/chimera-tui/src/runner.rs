@@ -182,6 +182,8 @@ impl Tui {
                 session_id: short_id(),
                 tool_calls: 0,
                 running: false,
+                run_started: None,
+                active_tool: None,
             },
             objective: objective.clone(),
             should_quit: false,
@@ -232,13 +234,20 @@ impl Tui {
                     return;
                 }
                 KeyCode::Char('l') => {
-                    // Toggle dark/light by comparing ember color.
+                    // Toggle dark/light and remember the choice for next launch.
                     let is_dark = self.styles.palette.ember == Palette::dark().ember;
+                    let theme = if is_dark { "light" } else { "dark" };
                     self.styles = if is_dark {
                         Styles::new(Palette::light())
                     } else {
                         Styles::dark()
                     };
+                    if let Err(error) = chimera_config::set_theme(theme) {
+                        self.log.push(Message::System {
+                            text: format!("Theme applied, but it could not be saved: {error}"),
+                            kind: SystemKind::Warning,
+                        });
+                    }
                     return;
                 }
                 _ => {}
@@ -385,8 +394,12 @@ impl Tui {
     /// Apply an agent update to the message log.
     pub fn apply_agent_update(&mut self, update: AgentUpdate) {
         self.status.running = true;
+        if self.status.run_started.is_none() {
+            self.status.run_started = Some(std::time::Instant::now());
+        }
         match update {
             AgentUpdate::TextDelta(text) => {
+                self.status.active_tool = None;
                 // Append to the last assistant message if streaming, else create one.
                 if let Some(Message::Assistant {
                     text: existing,
@@ -408,6 +421,7 @@ impl Tui {
             }
             AgentUpdate::ToolCallStart { name, arguments } => {
                 self.status.tool_calls += 1;
+                self.status.active_tool = Some(name.clone());
                 self.log.push(Message::ToolCall {
                     id: format!("tc-{}", self.status.tool_calls),
                     name,
@@ -433,6 +447,7 @@ impl Tui {
                         *r = Some(result);
                         *o = Some(ok);
                         *d = Some(duration_ms);
+                        self.status.active_tool = None;
                     }
                 }
             }
@@ -574,6 +589,7 @@ async fn run_screen(
         config.provider.model.clone(),
         config.provider.name.clone(),
     );
+    tui.styles = crate::theme::styles_for_theme(&config.ui.theme);
     tui.status.session_id = session.id.to_string();
     tui.status.max_iterations = config.agent.max_iterations;
     for message in &session.messages {
@@ -665,6 +681,8 @@ async fn run_screen(
                 pending = None;
                 tui.apply_agent_update(AgentUpdate::TextDone);
                 tui.status.running = false;
+                tui.status.run_started = None;
+                tui.status.active_tool = None;
                 let (text, kind) = match result {
                     Ok(result) => {
                         tui.status.iteration = result.iterations;
@@ -861,6 +879,7 @@ async fn run_screen(
                             match settings.load() {
                                 Ok(loaded) => {
                                     config = loaded;
+                                    tui.styles = crate::theme::styles_for_theme(&config.ui.theme);
                                     tui.status.model = config.provider.model.clone();
                                     tui.status.provider = config.provider.name.clone();
                                     tui.status.max_iterations = config.agent.max_iterations;
@@ -998,6 +1017,10 @@ async fn run_screen(
                 tui.status.mode = if plan { "PLAN" } else { "RUN" }.into();
                 tui.log.push(Message::User { text: objective.clone() });
                 tui.status.running = true;
+                // Clock the spinner and elapsed readout from submit, not from
+                // the first agent event, so a slow provider still shows time.
+                tui.status.run_started = Some(std::time::Instant::now());
+                tui.status.active_tool = None;
                 cancel.send_replace(false);
                 let cancellation = cancel.subscribe();
                 let provider = config.build_provider();

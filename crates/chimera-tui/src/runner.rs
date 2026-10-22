@@ -404,17 +404,24 @@ impl Tui {
         match update {
             AgentUpdate::TextDelta(text) => {
                 // Append to the last assistant message if streaming, else create one.
+                let mut grow = 0usize;
                 if let Some(Message::Assistant {
                     text: existing,
                     streaming: true,
                 }) = self.log.last_mut()
                 {
+                    let before = existing.split('\n').count();
                     existing.push_str(&text);
+                    grow = existing.split('\n').count() - before;
                 } else {
                     self.log.push(Message::Assistant {
                         text,
                         streaming: true,
                     });
+                }
+                // A detached reader's place must survive streaming text.
+                if !self.log.follow {
+                    self.log.scroll_offset += grow;
                 }
             }
             AgentUpdate::TextDone => {
@@ -1038,6 +1045,7 @@ async fn run_screen(
             if tui.should_quit { break; }
             if let Ok(size) = terminal.size() {
                 tui.width = size.width as usize;
+                tui.log.width = tui.width;
                 tui.height = size.height as usize;
                 if tui.show_help {
                     tui.help_scroll = tui.help_scroll.min(crate::help::scroll_limit(
@@ -1050,17 +1058,19 @@ async fn run_screen(
                 match event::read()? {
                     Event::Key(key) => tui.handle_key(key),
                     Event::Paste(text) => if let Some(dialog) = &mut tui.dialog { dialog.paste(&text); } else { for character in text.chars() { tui.input.insert_char(character); } },
-                    Event::Mouse(mouse) => match mouse.kind {
-                        MouseEventKind::ScrollUp => {
-                            let limit = tui.scroll_limit();
-                            tui.log.scroll_up(limit);
+                    Event::Mouse(mouse) if !tui.show_help && tui.dialog.is_none() => {
+                        match mouse.kind {
+                            MouseEventKind::ScrollUp => {
+                                let limit = tui.scroll_limit();
+                                tui.log.scroll_up(limit);
+                            }
+                            MouseEventKind::ScrollDown => {
+                                tui.log.scroll_offset = tui.log.scroll_offset.min(tui.scroll_limit());
+                                tui.log.scroll_down();
+                            }
+                            _ => {}
                         }
-                        MouseEventKind::ScrollDown => {
-                            tui.log.scroll_offset = tui.log.scroll_offset.min(tui.scroll_limit());
-                            tui.log.scroll_down();
-                        }
-                        _ => {}
-                    },
+                    }
                     _ => {},
                 }
             }
@@ -1286,6 +1296,22 @@ mod tests {
             tui.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT));
         }
         assert!(tui.log.follow && tui.log.at_bottom());
+    }
+
+    #[test]
+    fn streaming_grows_the_offset_while_detached() {
+        let mut tui = Tui::new(String::new(), "test".into(), "test".into());
+        tui.log.push(Message::Assistant {
+            text: "one".into(),
+            streaming: true,
+        });
+        tui.log.scroll_up(50);
+        tui.apply_agent_update(AgentUpdate::TextDelta("\ntwo".into()));
+        assert_eq!(
+            tui.log.scroll_offset, 2,
+            "streamed lines must not yank a detached view"
+        );
+        assert!(!tui.log.follow);
     }
 
     #[test]

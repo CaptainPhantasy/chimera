@@ -222,6 +222,8 @@ pub struct MessageLog {
     pub scroll_offset: usize,
     /// Whether new messages snap the view back to the bottom.
     pub follow: bool,
+    /// Last known render width, for line-height estimates while detached.
+    pub width: usize,
 }
 
 impl Default for MessageLog {
@@ -237,18 +239,35 @@ impl MessageLog {
             capacity,
             scroll_offset: 0,
             follow: true,
+            width: 80,
         }
     }
 
     /// Push a message, evicting the oldest if over capacity.
     pub fn push(&mut self, msg: Message) {
+        // While detached, keep the reader's place: content added below shifts
+        // the window down, content evicted above shifts it back up.
+        let grow = if self.follow {
+            0
+        } else {
+            msg.estimated_lines(self.width)
+        };
+        let shrink = if self.follow || self.messages.len() < self.capacity {
+            0
+        } else {
+            self.messages
+                .front()
+                .map(|m| m.estimated_lines(self.width))
+                .unwrap_or(0)
+        };
         if self.messages.len() >= self.capacity {
             self.messages.pop_front();
         }
         self.messages.push_back(msg);
-        // Only snap to the latest when the reader has not scrolled away.
         if self.follow {
             self.scroll_offset = 0;
+        } else {
+            self.scroll_offset = self.scroll_offset.saturating_sub(shrink) + grow;
         }
     }
 
@@ -373,9 +392,14 @@ mod tests {
         log.push(Message::User { text: "a".into() });
         log.scroll_up(9);
         log.push(Message::User { text: "b".into() });
-        assert_eq!(log.scroll_offset, 1, "new messages must not yank the view");
+        // "b" renders two rough lines, so the offset grows by two to hold the
+        // reader's place instead of letting the view slide under them.
+        assert_eq!(log.scroll_offset, 3, "new messages must not yank the view");
         assert!(!log.follow);
-        log.scroll_down();
+        // Scrolling back down through the new content reattaches at the bottom.
+        for _ in 0..3 {
+            log.scroll_down();
+        }
         assert!(log.follow);
         log.scroll_up(9);
         log.scroll_to_bottom();

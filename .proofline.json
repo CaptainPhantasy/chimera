@@ -1,0 +1,40 @@
+{
+  "version": 1,
+  "gates": [
+    {
+      "name": "cargo-test",
+      "command": ["/bin/sh", "-c", "$HOME/.cargo/bin/cargo test --workspace"],
+      "required": true
+    },
+    {
+      "name": "cargo-clippy",
+      "command": ["/bin/sh", "-c", "$HOME/.cargo/bin/cargo clippy --workspace --all-targets -- -D warnings"],
+      "required": true
+    }
+  ],
+  "include": [
+    ".proofline.json",
+    ".gitignore",
+    "Cargo.toml",
+    "Cargo.lock",
+    "README.md",
+    "CHANGELOG.md",
+    "crates/**",
+    "docs/COMPLETENESS_MATRIX.md"
+  ],
+  "deny": [
+    ".env",
+    ".env.*",
+    "*.pem",
+    "*.key",
+    ".git/**",
+    ".harness/**",
+    ".pi/**",
+    ".omp/**",
+    ".supercache/**",
+    "target/**"
+  ],
+  "baseBranch": "main",
+  "publish": true,
+  "allowLocalRemote": false
+}

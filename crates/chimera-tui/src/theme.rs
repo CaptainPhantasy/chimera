@@ -254,6 +254,13 @@ impl Styles {
         Style::default().fg(self.palette.syntax_type)
     }
 
+    /// Text inside a rendered code block: syntax color on an elevated panel.
+    pub fn code_block(&self) -> Style {
+        Style::default()
+            .fg(self.palette.syntax_string)
+            .bg(self.palette.bg_elevated)
+    }
+
     // --- UI chrome ---
     pub fn border(&self) -> Style {
         Style::default().fg(self.palette.border)

@@ -311,6 +311,14 @@ impl Tui {
                     *expanded = !*expanded;
                 }
             }
+            KeyCode::BackTab => {
+                // Shift+Tab folds every tool card at once.
+                for message in &mut self.log.messages {
+                    if let Message::ToolCall { expanded, .. } = message {
+                        *expanded = false;
+                    }
+                }
+            }
             KeyCode::Up => {
                 self.input.history_prev();
             }
@@ -1230,6 +1238,34 @@ mod tests {
         assert_eq!(*ok, Some(true));
         assert_eq!(*duration_ms, Some(7));
         assert!(*expanded);
+    }
+
+    #[test]
+    fn backtab_folds_every_tool_card() {
+        let mut tui = Tui::new("fold".into(), "test".into(), "test".into());
+        tui.apply_agent_update(AgentUpdate::ToolCallStart {
+            name: "one".into(),
+            arguments: "{}".into(),
+        });
+        tui.apply_agent_update(AgentUpdate::ToolCallStart {
+            name: "two".into(),
+            arguments: "{}".into(),
+        });
+        tui.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert!(tui
+            .log
+            .messages
+            .iter()
+            .filter_map(|m| match m {
+                Message::ToolCall { expanded, .. } => Some(*expanded),
+                _ => None,
+            })
+            .any(|expanded| expanded));
+        tui.handle_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
+        assert!(tui.log.messages.iter().all(|m| match m {
+            Message::ToolCall { expanded, .. } => !*expanded,
+            _ => true,
+        }));
     }
 
     #[test]

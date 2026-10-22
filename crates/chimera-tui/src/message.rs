@@ -4,6 +4,7 @@
 //! assistant messages with streaming text, tool calls with results, and
 use std::collections::VecDeque;
 
+use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 
 use crate::theme::Styles;
@@ -94,9 +95,7 @@ impl Message {
                         Span::raw("")
                     },
                 ])];
-                for wrap in wrap_text(text, width.saturating_sub(2)) {
-                    lines.push(Line::from(Span::styled(format!("  {wrap}"), styles.text())));
-                }
+                lines.extend(markdown_lines(text, styles, width.saturating_sub(2)));
                 lines
             }
             Message::ToolCall {
@@ -124,7 +123,14 @@ impl Message {
                     Span::styled(format!("  {icon} ",), status_style),
                     Span::styled(name.clone(), styles.info()),
                     Span::styled(dur_str, styles.text_subtle()),
-                    Span::styled(" [tab to expand]", styles.text_faint()),
+                    Span::styled(
+                        if *expanded {
+                            " [tab to collapse]"
+                        } else {
+                            " [tab to expand]"
+                        },
+                        styles.text_faint(),
+                    ),
                 ]);
 
                 let mut lines = vec![header];
@@ -147,11 +153,15 @@ impl Message {
                             "    result:".to_string(),
                             styles.text_subtle(),
                         )));
-                        for w in wrap_text(r, width.saturating_sub(8)) {
-                            lines.push(Line::from(Span::styled(
-                                format!("      {w}"),
-                                styles.text_muted(),
-                            )));
+                        if looks_like_diff(r) {
+                            lines.extend(diff_lines(r, styles));
+                        } else {
+                            for w in wrap_text(r, width.saturating_sub(8)) {
+                                lines.push(Line::from(Span::styled(
+                                    format!("      {w}"),
+                                    styles.text_muted(),
+                                )));
+                            }
                         }
                     }
                 }
@@ -185,6 +195,128 @@ impl Message {
             }
         }
     }
+}
+
+/// Render assistant markdown: fenced code blocks, "- "/* " bullets,
+/// whole-line **bold** and `code` lines. Styling stays per source line so
+/// word wrap keeps working; richer inline spans are a later upgrade.
+fn markdown_lines(text: &str, styles: &Styles, width: usize) -> Vec<Line<'static>> {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut in_code = false;
+    for raw in text.split('\n') {
+        let trimmed = raw.trim_start();
+        if let Some(lang) = trimmed.strip_prefix("```") {
+            in_code = !in_code;
+            if in_code && !lang.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    format!("  ── {lang} "),
+                    styles.text_faint(),
+                )));
+            }
+            continue;
+        }
+        if in_code {
+            lines.push(Line::from(Span::styled(
+                format!("  │ {raw}"),
+                styles.code_block(),
+            )));
+            continue;
+        }
+        if let Some(item) = trimmed
+            .strip_prefix("- ")
+            .or_else(|| trimmed.strip_prefix("* "))
+        {
+            for wrap in wrap_text(item, width.saturating_sub(4)) {
+                lines.push(Line::from(Span::styled(
+                    format!("  • {wrap}"),
+                    styles.text(),
+                )));
+            }
+            continue;
+        }
+        if let Some(inner) = trimmed
+            .strip_prefix("**")
+            .and_then(|s| s.strip_suffix("**"))
+        {
+            if !inner.contains("**") {
+                for wrap in wrap_text(inner, width.saturating_sub(2)) {
+                    lines.push(Line::from(Span::styled(
+                        format!("  {wrap}"),
+                        styles.text().add_modifier(Modifier::BOLD),
+                    )));
+                }
+                continue;
+            }
+        }
+        if let Some(inner) = trimmed.strip_prefix('`').and_then(|s| s.strip_suffix('`')) {
+            if inner.len() > 1 && !inner.contains('`') {
+                lines.push(Line::from(Span::styled(
+                    format!("  {inner}"),
+                    styles.code_block(),
+                )));
+                continue;
+            }
+        }
+        for wrap in wrap_text(raw, width.saturating_sub(2)) {
+            lines.push(Line::from(Span::styled(format!("  {wrap}"), styles.text())));
+        }
+    }
+    if lines.is_empty() {
+        lines.push(Line::from(Span::styled("", styles.text())));
+    }
+    lines
+}
+
+/// True when a tool result looks like a unified diff worth coloring.
+fn looks_like_diff(result: &str) -> bool {
+    let mut plus = 0;
+    let mut minus = 0;
+    let mut headers = 0;
+    for line in result.lines() {
+        if line.starts_with("diff --git") || line.starts_with("Index: ") || line.starts_with("@@") {
+            headers += 1;
+        } else if line.starts_with('+') && !line.starts_with("+++") {
+            plus += 1;
+        } else if line.starts_with('-') && !line.starts_with("---") {
+            minus += 1;
+        }
+    }
+    headers > 0 || (plus > 0 && minus > 0)
+}
+
+/// Cap on rendered diff lines so a huge patch cannot flood the screen.
+const MAX_DIFF_LINES: usize = 400;
+
+/// Render a unified diff with add/remove/hunk colors. Long patches are
+/// truncated with a marker instead of flooding the conversation.
+fn diff_lines(result: &str, styles: &Styles) -> Vec<Line<'static>> {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let total = result.lines().count();
+    for line in result.lines().take(MAX_DIFF_LINES) {
+        let style = if line.starts_with("diff --git")
+            || line.starts_with("Index: ")
+            || line.starts_with("+++")
+            || line.starts_with("---")
+        {
+            styles.text_subtle()
+        } else if line.starts_with("@@") {
+            styles.info()
+        } else if line.starts_with('+') {
+            styles.success()
+        } else if line.starts_with('-') {
+            styles.error()
+        } else {
+            styles.text_muted()
+        };
+        lines.push(Line::from(Span::styled(format!("      {line}"), style)));
+    }
+    if total > MAX_DIFF_LINES {
+        lines.push(Line::from(Span::styled(
+            format!("      … {} more diff lines", total - MAX_DIFF_LINES),
+            styles.text_faint(),
+        )));
+    }
+    lines
 }
 
 /// Word-wrap text to a max character width.
@@ -349,6 +481,72 @@ mod tests {
         assert_eq!(log.scroll_offset, 1);
         log.scroll_down();
         assert!(log.at_bottom());
+    }
+
+    #[test]
+    fn fenced_code_blocks_bullets_and_bold_render_styled() {
+        let styles = Styles::dark();
+        let msg = Message::Assistant {
+            text: "Intro:\n```rust\nlet x = 1;\n```\n**Heading**\n- first item\nplain tail".into(),
+            streaming: false,
+        };
+        let lines = msg.to_lines(&styles, 80);
+        let text_of = |l: &Line| -> String { l.spans.iter().map(|s| s.content.as_ref()).collect() };
+        let texts: Vec<String> = lines.iter().map(text_of).collect();
+        assert!(
+            texts.iter().any(|t| t.contains("│ let x = 1;")),
+            "{texts:?}"
+        );
+        assert!(!texts.iter().any(|t| t.contains("```")), "{texts:?}");
+        assert!(texts.iter().any(|t| t.contains("• first item")));
+        assert!(texts.iter().any(|t| t.contains("Heading")));
+        let bold_any = lines.iter().any(|l| {
+            l.spans.iter().any(|s| {
+                s.content.contains("Heading") && s.style.add_modifier.contains(Modifier::BOLD)
+            })
+        });
+        assert!(bold_any, "whole-line bold must carry the BOLD modifier");
+    }
+
+    #[test]
+    fn tool_results_that_look_like_diffs_get_diff_colors() {
+        let styles = Styles::dark();
+        let msg = Message::ToolCall {
+            id: "1".into(),
+            name: "edit".into(),
+            arguments: "{}".into(),
+            result: Some(
+                "diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1,2 +1,2 @@\n-old\n+new\n ctx".into(),
+            ),
+            ok: Some(true),
+            duration_ms: Some(5),
+            expanded: true,
+        };
+        let lines = msg.to_lines(&styles, 80);
+        let mut saw_add = false;
+        let mut saw_del = false;
+        let mut saw_hunk = false;
+        for line in &lines {
+            for span in &line.spans {
+                if span.content.contains("+new") {
+                    saw_add = span.style == styles.success();
+                }
+                if span.content.contains("-old") {
+                    saw_del = span.style == styles.error();
+                }
+                if span.content.contains("@@") {
+                    saw_hunk = true;
+                }
+            }
+        }
+        assert!(saw_add && saw_del && saw_hunk);
+    }
+
+    #[test]
+    fn plain_tool_results_are_not_colored_like_diffs() {
+        assert!(!looks_like_diff("plain output\nwith - hyphen"));
+        assert!(!looks_like_diff("key: value\nanother: line"));
+        assert!(!looks_like_diff(""));
     }
 
     #[test]

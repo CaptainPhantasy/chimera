@@ -299,6 +299,18 @@ impl FileSessionStore {
         self.write_state(&state)
     }
 
+    /// Permanently remove a saved conversation and its file record.
+    pub async fn delete(&self, id: SessionId) -> anyhow::Result<()> {
+        let _lock = self.lock()?;
+        let path = self.session_path(id)?;
+        if !path.exists() {
+            bail!("no saved conversation exists for that id");
+        }
+        std::fs::remove_file(path)?;
+        sync_dir(&self.storage_dir()?)?;
+        Ok(())
+    }
+
     fn checkpoint_path(&self, id: CheckpointId) -> anyhow::Result<PathBuf> {
         Ok(private_dir(&self.storage_dir()?.join("checkpoints"))?.join(format!("{id}.json")))
     }
@@ -933,6 +945,20 @@ mod file_tests {
         let ids = store.list().await.unwrap();
         assert!(ids.is_empty());
     }
+
+    #[tokio::test]
+    async fn delete_removes_the_record_and_is_refused_for_unknown_ids() {
+        let root = unique_root();
+        let store = FileSessionStore::new(root.clone());
+        let id = store.create(sample_meta()).await.unwrap();
+        assert!(store.load(id).await.is_ok());
+        store.delete(id).await.unwrap();
+        assert!(store.load(id).await.is_err());
+        assert!(!store.list().await.unwrap().contains(&id));
+        assert!(store.delete(id).await.is_err());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[tokio::test]
     async fn legacy_load_versioned_save_and_explicit_corruption() {
         let root = unique_root();

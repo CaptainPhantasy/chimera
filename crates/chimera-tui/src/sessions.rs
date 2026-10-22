@@ -88,7 +88,13 @@ impl Sessions {
     }
 
     fn rows(conversations: &[Conversation]) -> Vec<Choice> {
-        conversations.iter().map(Conversation::choice).collect()
+        conversations
+            .iter()
+            .map(|c| {
+                c.choice()
+                    .with_alt_action(format!("sessions:delete:{}", c.id))
+            })
+            .collect()
     }
 
     /// Abandon a running listing request. Safe when nothing is running.
@@ -112,6 +118,35 @@ impl Sessions {
                 .clone()
                 .context("The conversation list is not open. Use /sessions.")?;
             *dialog = Some(self.begin(root, "Loading saved conversations again."));
+        } else if let Some(id) = action.strip_prefix("sessions:delete-confirm:") {
+            let id = uuid::Uuid::parse_str(id).context(
+                "That conversation could not be identified. Choose it from the list again.",
+            )?;
+            let root = self
+                .root
+                .clone()
+                .context("The conversation list is not open. Use /sessions.")?;
+            FileSessionStore::new(root.clone())
+                .delete(id)
+                .await
+                .map_err(|error| anyhow::anyhow!("Could not delete that conversation. {error}"))?;
+            *dialog = Some(self.begin(root, "Conversation deleted. Loading the updated list."));
+        } else if let Some(id) = action.strip_prefix("sessions:delete:") {
+            let id = uuid::Uuid::parse_str(id).context(
+                "That conversation could not be identified. Choose it from the list again.",
+            )?;
+            *dialog = Some(Dialog::choices(
+                "Delete conversation",
+                "This permanently removes the saved messages. They cannot be recovered.",
+                vec![
+                    Choice::new(
+                        "Delete permanently",
+                        "Remove this conversation now",
+                        format!("sessions:delete-confirm:{id}"),
+                    ),
+                    Choice::new("Keep it", "Return to the list", "sessions:retry"),
+                ],
+            ));
         } else if let Some(id) = action.strip_prefix("sessions:open:") {
             let id = uuid::Uuid::parse_str(id).context(
                 "That conversation could not be identified. Choose it from the list again.",
@@ -148,7 +183,7 @@ impl Sessions {
                 let note = if conversations.is_empty() {
                     "No saved conversations yet. Send your first request and it will appear here."
                 } else {
-                    "Search by title, date or preview. Enter opens the conversation here; your unsent text is kept."
+                    "Search by title, date or preview. Enter opens the conversation here; your unsent text is kept. Press d on a conversation to delete it."
                 };
                 *dialog = Some(Dialog::choices(
                     "Switch conversation",
@@ -363,6 +398,48 @@ mod tests {
         let mut dialog = None;
         sessions.poll(&mut dialog).await;
         assert!(dialog.is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn d_deletes_a_conversation_after_confirmation() {
+        let root = temp_root();
+        let doomed = seed(
+            &root,
+            "Doomed conversation",
+            chrono::Utc.with_ymd_and_hms(2026, 6, 15, 12, 0, 0).unwrap(),
+        )
+        .await;
+        let keeper = seed(
+            &root,
+            "Keeper conversation",
+            chrono::Utc.with_ymd_and_hms(2026, 3, 10, 8, 30, 0).unwrap(),
+        )
+        .await;
+        let mut sessions = Sessions::default();
+        let mut dialog = Some(sessions.open(root.clone()));
+        wait_for_choices(&mut sessions, &mut dialog).await;
+        let mut list = dialog.take().unwrap();
+        // 'd' on the newest row raises the confirmation, not an immediate delete.
+        let confirmed = match list.key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE)) {
+            Outcome::Action(action, _) => action,
+            other => panic!("'d' must raise the delete action, got {other:?}"),
+        };
+        assert_eq!(confirmed, format!("sessions:delete:{doomed}"));
+        sessions.action(&confirmed, &mut dialog).await.unwrap();
+        let confirm = dialog.as_ref().unwrap();
+        assert_eq!(confirm.title, "Delete conversation");
+        // Enter on the first confirmation row performs the delete and relists.
+        let mut confirm = dialog.take().unwrap();
+        let performed = match confirm.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)) {
+            Outcome::Action(action, _) => action,
+            other => panic!("Enter must confirm the delete, got {other:?}"),
+        };
+        sessions.action(&performed, &mut dialog).await.unwrap();
+        wait_for_choices(&mut sessions, &mut dialog).await;
+        let remaining = rows(dialog.as_ref().unwrap());
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].2, format!("sessions:open:{keeper}"));
         let _ = std::fs::remove_dir_all(&root);
     }
 

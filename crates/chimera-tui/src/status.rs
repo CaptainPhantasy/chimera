@@ -37,6 +37,23 @@ pub struct StatusInfo {
     pub tool_calls: u64,
     /// Whether the agent is actively running.
     pub running: bool,
+    /// When the current run started, for the elapsed readout.
+    pub run_started: Option<std::time::Instant>,
+    /// Name of the tool currently running, if any.
+    pub active_tool: Option<String>,
+}
+
+/// Spinner glyphs cycled by the running status label.
+const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+/// Compact elapsed readout: seconds below a minute, m:ss after that.
+fn elapsed_str(elapsed: std::time::Duration) -> String {
+    let secs = elapsed.as_secs();
+    if secs < 60 {
+        format!("{secs}s")
+    } else {
+        format!("{}m{:02}s", secs / 60, secs % 60)
+    }
 }
 
 impl StatusInfo {
@@ -63,6 +80,20 @@ impl StatusInfo {
     /// Iteration progress as "iter 3/40".
     pub fn iter_str(&self) -> String {
         format!("iter {}/{}", self.iteration, self.max_iterations)
+    }
+
+    /// The animated running readout: spinner, elapsed time, active tool.
+    pub fn running_label(&self, now: std::time::Instant) -> String {
+        let frame =
+            SPINNER_FRAMES[(now.elapsed().as_millis() as usize / 120) % SPINNER_FRAMES.len()];
+        let mut label = format!("{frame} Working");
+        if let Some(started) = self.run_started {
+            label.push_str(&format!(" · {}", elapsed_str(now.duration_since(started))));
+        }
+        if let Some(tool) = &self.active_tool {
+            label.push_str(&format!(" · {tool}"));
+        }
+        label
     }
 }
 
@@ -109,12 +140,12 @@ fn append_group(
 
 /// Assemble complete groups, reserving room for mode before optional measurements.
 fn status_line(info: &StatusInfo, styles: &Styles, width: usize) -> Line<'static> {
-    let state = if info.running {
-        "● Working"
+    let state: String = if info.running {
+        info.running_label(std::time::Instant::now())
     } else if info.mode == "SETUP" {
-        "○ Setup needed"
+        "○ Setup needed".into()
     } else {
-        "○ Ready"
+        "○ Ready".into()
     };
     let state_style = if info.running {
         styles.brand()
@@ -240,6 +271,22 @@ mod tests {
     }
 
     #[test]
+    fn running_label_shows_spinner_elapsed_and_tool() {
+        let info = StatusInfo {
+            running: true,
+            run_started: Some(std::time::Instant::now() - std::time::Duration::from_secs(75)),
+            active_tool: Some("bash".into()),
+            ..Default::default()
+        };
+        let label = info.running_label(std::time::Instant::now());
+        assert!(label.contains("1m15s"), "{label}");
+        assert!(label.contains("bash"), "{label}");
+        assert!(label.contains("Working"), "{label}");
+        let idle = StatusInfo::default();
+        assert!(!idle.running_label(std::time::Instant::now()).contains("·"));
+    }
+
+    #[test]
     fn status_bar_renders() {
         let styles = Styles::dark();
         let info = StatusInfo {
@@ -254,6 +301,8 @@ mod tests {
             session_id: "abc123".into(),
             tool_calls: 5,
             running: true,
+            run_started: None,
+            active_tool: None,
         };
         let backend = TestBackend::new(120, 3);
         let mut terminal = Terminal::new(backend).unwrap();

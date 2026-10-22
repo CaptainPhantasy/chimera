@@ -140,6 +140,15 @@ impl Default for Palette {
     }
 }
 
+/// Map a stored theme name to its styles; unknown names fall back to dark.
+pub fn styles_for_theme(name: &str) -> Styles {
+    if name.eq_ignore_ascii_case("light") {
+        Styles::new(Palette::light())
+    } else {
+        Styles::dark()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Styles — reusable semantic styles built from the palette
 // ---------------------------------------------------------------------------

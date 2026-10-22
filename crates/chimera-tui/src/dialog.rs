@@ -13,6 +13,8 @@ pub struct Choice {
     pub label: String,
     pub detail: String,
     pub action: String,
+    /// Optional destructive secondary action offered by the `d` key.
+    pub alt_action: Option<String>,
 }
 impl Choice {
     pub fn new(
@@ -24,7 +26,13 @@ impl Choice {
             label: label.into(),
             detail: detail.into(),
             action: action.into(),
+            alt_action: None,
         }
+    }
+    /// Offer a destructive `d` action for this row (e.g. delete a session).
+    pub fn with_alt_action(mut self, alt_action: impl Into<String>) -> Self {
+        self.alt_action = Some(alt_action.into());
+        self
     }
 }
 pub struct Field {
@@ -62,6 +70,7 @@ pub struct Dialog {
     pub note: String,
     pub body: Body,
 }
+#[derive(Debug)]
 pub enum Outcome {
     Stay,
     Close,
@@ -140,6 +149,17 @@ impl Dialog {
                     KeyCode::Enter => {
                         if let Some(row) = filtered.get(*selected) {
                             return Outcome::Action(row.action.clone(), vec![]);
+                        }
+                    }
+                    KeyCode::Char('d')
+                        if filtered
+                            .get(*selected)
+                            .is_some_and(|row| row.alt_action.is_some()) =>
+                    {
+                        if let Some(row) = filtered.get(*selected) {
+                            if let Some(alt) = &row.alt_action {
+                                return Outcome::Action(alt.clone(), vec![]);
+                            }
                         }
                     }
                     KeyCode::Backspace => {
@@ -276,7 +296,11 @@ impl Dialog {
                         &mut state,
                     );
                 }
-                "Type to search · ↑↓ choose · Enter select · Esc back"
+                if matches.iter().any(|row| row.alt_action.is_some()) {
+                    "Type to search · ↑↓ choose · Enter select · d delete · Esc back"
+                } else {
+                    "Type to search · ↑↓ choose · Enter select · Esc back"
+                }
             }
             Body::Form {
                 fields, selected, ..

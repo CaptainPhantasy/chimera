@@ -4,9 +4,10 @@
 //! cursor movement, history, and slash-command autocomplete suggestions.
 
 use std::collections::VecDeque;
+use std::path::{Path, PathBuf};
 
 use ratatui::layout::Rect;
-use ratatui::style::{Modifier, Style};
+use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
@@ -32,7 +33,16 @@ pub struct InputBar {
     pub focused: bool,
     /// Slash-command suggestions for the current buffer.
     pub suggestions: Vec<String>,
+    /// Command names parallel to `suggestions` (what completion inserts).
+    suggestion_commands: Vec<String>,
+    /// Selected suggestion index (None = none highlighted).
+    pub suggestion_sel: Option<usize>,
+    /// File the history persists to (one escaped entry per line; None = memory only).
+    pub history_path: Option<PathBuf>,
 }
+
+/// Maximum history entries kept in memory and loaded from disk.
+const HISTORY_LIMIT: usize = 100;
 
 impl Default for InputBar {
     fn default() -> Self {
@@ -49,6 +59,59 @@ impl InputBar {
             history_pos: None,
             focused: true,
             suggestions: Vec::new(),
+            suggestion_commands: Vec::new(),
+            suggestion_sel: None,
+            history_path: None,
+        }
+    }
+
+    /// Attach persistent history storage at `path`, loading existing entries.
+    /// Missing or unreadable files are ignored: history still works in memory.
+    pub fn attach_history(&mut self, path: PathBuf) {
+        self.load_history(&path);
+        self.history_path = Some(path);
+    }
+
+    /// Load persisted history (newest last). Only the newest entries are kept.
+    fn load_history(&mut self, path: &Path) {
+        let Ok(raw) = std::fs::read_to_string(path) else {
+            return;
+        };
+        let newest: Vec<&str> = raw.lines().rev().take(HISTORY_LIMIT).collect();
+        for line in newest.into_iter().rev() {
+            let entry = unescape_history(line);
+            if entry.trim().is_empty() {
+                continue;
+            }
+            self.history.push_back(entry);
+        }
+    }
+
+    /// Record an entry into history and the history file (best-effort).
+    pub fn record(&mut self, text: &str) {
+        if text.trim().is_empty() {
+            return;
+        }
+        if self.history.back().map(String::as_str) == Some(text) {
+            return;
+        }
+        if self.history.len() >= HISTORY_LIMIT {
+            self.history.pop_front();
+        }
+        self.history.push_back(text.to_string());
+        let Some(path) = &self.history_path else {
+            return;
+        };
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            use std::io::Write as _;
+            let _ = writeln!(file, "{}", escape_history(text));
         }
     }
 
@@ -150,13 +213,10 @@ impl InputBar {
         let text = std::mem::take(&mut self.buffer);
         self.cursor = 0;
         self.history_pos = None;
-        if !text.trim().is_empty() {
-            if self.history.len() >= 100 {
-                self.history.pop_front();
-            }
-            self.history.push_back(text.clone());
-        }
+        self.record(&text);
         self.suggestions.clear();
+        self.suggestion_sel = None;
+        self.suggestion_commands.clear();
         text
     }
 
@@ -197,18 +257,68 @@ impl InputBar {
         self.update_suggestions();
     }
 
+    /// Move the suggestion highlight down (wraps).
+    pub fn suggestion_next(&mut self) {
+        if self.suggestions.is_empty() {
+            return;
+        }
+        let len = self.suggestions.len();
+        self.suggestion_sel = Some(match self.suggestion_sel {
+            Some(i) => (i + 1) % len,
+            None => 0,
+        });
+    }
+
+    /// Move the suggestion highlight up (wraps).
+    pub fn suggestion_prev(&mut self) {
+        if self.suggestions.is_empty() {
+            return;
+        }
+        let len = self.suggestions.len();
+        self.suggestion_sel = Some(match self.suggestion_sel {
+            Some(0) | None => len - 1,
+            Some(i) => i - 1,
+        });
+    }
+
+    /// Complete the buffer with the selected suggestion (or the first one).
+    /// Returns true when the buffer was completed.
+    pub fn accept_suggestion(&mut self) -> bool {
+        if self.suggestions.is_empty() {
+            return false;
+        }
+        let i = self.suggestion_sel.unwrap_or(0);
+        let Some(name) = self.suggestion_commands.get(i) else {
+            self.suggestion_sel = None;
+            return false;
+        };
+        self.buffer = format!("/{name} ");
+        self.cursor = self.buffer.len();
+        self.history_pos = None;
+        self.update_suggestions();
+        true
+    }
+
     /// Update slash-command suggestions based on current buffer.
     fn update_suggestions(&mut self) {
-        if self.buffer.starts_with('/') {
-            let prefix = &self.buffer[1..];
-            self.suggestions = SLASH_COMMANDS
-                .iter()
-                .filter(|(name, _)| name.starts_with(prefix))
-                .take(5)
-                .map(|(name, desc)| format!("/{name} — {desc}"))
-                .collect();
-        } else {
-            self.suggestions.clear();
+        self.suggestion_sel = None;
+        self.suggestions.clear();
+        self.suggestion_commands.clear();
+        if !self.buffer.starts_with('/') {
+            return;
+        }
+        // Once arguments start, the command name is chosen; stop hinting.
+        if self.buffer[1..].contains(' ') {
+            return;
+        }
+        let prefix = &self.buffer[1..];
+        for (name, desc) in SLASH_COMMANDS
+            .iter()
+            .filter(|(name, _)| name.starts_with(prefix))
+            .take(5)
+        {
+            self.suggestion_commands.push((*name).to_string());
+            self.suggestions.push(format!("/{name} — {desc}"));
         }
     }
 
@@ -289,11 +399,18 @@ impl InputBar {
         let lines: Vec<Line> = self
             .suggestions
             .iter()
-            .map(|s| {
-                Line::from(vec![
-                    Span::styled("  ", Style::default()),
-                    Span::styled(s, styles.info().add_modifier(Modifier::BOLD)),
-                ])
+            .enumerate()
+            .map(|(i, s)| {
+                let selected = self.suggestion_sel == Some(i);
+                let marker = if selected { "▶ " } else { "  " };
+                let style = if selected {
+                    styles
+                        .info()
+                        .add_modifier(Modifier::BOLD | Modifier::REVERSED)
+                } else {
+                    styles.info().add_modifier(Modifier::BOLD)
+                };
+                Line::from(Span::styled(format!("{marker}{s}"), style))
             })
             .collect();
 
@@ -311,6 +428,42 @@ impl InputBar {
             self.buffer[..self.cursor].rsplit('\n').next().unwrap_or(""),
         )
     }
+}
+
+/// Escape a history entry for one-line file storage.
+fn escape_history(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => {}
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// Inverse of `escape_history`; unknown escapes keep their characters.
+fn unescape_history(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('\\') => out.push('\\'),
+            Some('n') => out.push('\n'),
+            Some(other) => {
+                out.push('\\');
+                out.push(other);
+            }
+            None => out.push('\\'),
+        }
+    }
+    out
 }
 
 /// The known slash commands (name, short description).
@@ -448,6 +601,60 @@ mod tests {
             terminal.get_cursor_position().unwrap(),
             ratatui::layout::Position::new(1, 0)
         );
+    }
+
+    #[test]
+    fn history_roundtrips_through_file() {
+        let path = std::env::temp_dir().join(format!(
+            "chimera-hist-{}-{}.txt",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let mut first = InputBar::new();
+        first.attach_history(path.clone());
+        first.insert_str_and_reset("plain entry");
+        first.submit();
+        first.insert_str_and_reset("multi\nline");
+        first.submit();
+        drop(first);
+
+        let mut second = InputBar::new();
+        second.attach_history(path.clone());
+        assert_eq!(second.history.len(), 2, "file entries must reload");
+        assert_eq!(second.history[0], "plain entry");
+        assert_eq!(second.history[1], "multi\nline", "newlines must survive");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn record_skips_empty_and_consecutive_duplicates() {
+        let mut input = InputBar::new();
+        input.record("   ");
+        assert!(input.history.is_empty());
+        input.record("same");
+        input.record("same");
+        assert_eq!(input.history.len(), 1);
+    }
+
+    #[test]
+    fn suggestion_selection_moves_and_accepts() {
+        let mut input = InputBar::new();
+        input.insert_char('/');
+        assert!(input.suggestion_sel.is_none());
+        input.suggestion_next();
+        assert_eq!(input.suggestion_sel, Some(0));
+        input.suggestion_next();
+        assert_eq!(input.suggestion_sel, Some(1));
+        input.suggestion_prev();
+        assert_eq!(input.suggestion_sel, Some(0));
+        assert!(input.accept_suggestion());
+        assert_eq!(input.text(), "/connect ");
+        assert!(input.suggestions.is_empty());
+        // Editing the buffer clears any active selection.
+        input.suggestion_next();
+        input.backspace();
+        assert!(input.suggestion_sel.is_none());
     }
 
     #[test]

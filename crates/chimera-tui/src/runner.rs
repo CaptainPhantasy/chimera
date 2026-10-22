@@ -288,9 +288,15 @@ impl Tui {
                 self.input.insert_char('\n');
             }
             KeyCode::Enter => {
-                let text = self.input.submit();
-                if !text.trim().is_empty() {
-                    let _ = self.tx.try_send(TuiEvent::Submit(text));
+                // Enter with a highlighted suggestion completes it instead of
+                // submitting, so arrow-selected commands never fire by surprise.
+                if self.input.suggestion_sel.is_some() && !self.input.suggestions.is_empty() {
+                    self.input.accept_suggestion();
+                } else {
+                    let text = self.input.submit();
+                    if !text.trim().is_empty() {
+                        let _ = self.tx.try_send(TuiEvent::Submit(text));
+                    }
                 }
             }
             KeyCode::F(2) => {
@@ -301,7 +307,10 @@ impl Tui {
                 self.help_scroll = 0;
             }
             KeyCode::Tab => {
-                if let Some(Message::ToolCall { expanded, .. }) = self
+                if !self.input.suggestions.is_empty() {
+                    // Tab completes the highlighted (or first) slash command.
+                    self.input.accept_suggestion();
+                } else if let Some(Message::ToolCall { expanded, .. }) = self
                     .log
                     .messages
                     .iter_mut()
@@ -312,10 +321,18 @@ impl Tui {
                 }
             }
             KeyCode::Up => {
-                self.input.history_prev();
+                if self.input.suggestions.is_empty() {
+                    self.input.history_prev();
+                } else {
+                    self.input.suggestion_prev();
+                }
             }
             KeyCode::Down => {
-                self.input.history_next();
+                if self.input.suggestions.is_empty() {
+                    self.input.history_next();
+                } else {
+                    self.input.suggestion_next();
+                }
             }
             KeyCode::PageUp => {
                 let limit = self.scroll_limit();
@@ -574,6 +591,9 @@ async fn run_screen(
         config.provider.model.clone(),
         config.provider.name.clone(),
     );
+    if let Some(dir) = chimera_config::config_dir() {
+        tui.input.attach_history(dir.join("history"));
+    }
     tui.status.session_id = session.id.to_string();
     tui.status.max_iterations = config.agent.max_iterations;
     for message in &session.messages {
@@ -611,7 +631,7 @@ async fn run_screen(
     let mut terminal = init_terminal()?;
     if let Some(objective) = initial.filter(|s| !s.trim().is_empty()) {
         // Setup commands must not erase a request supplied on the command line.
-        tui.input.history.push_back(objective.clone());
+        tui.input.record(&objective);
         tui.tx.try_send(TuiEvent::Submit(objective))?;
     }
     let result: Result<()> = async {
@@ -1158,6 +1178,33 @@ mod tests {
     fn short_id_is_8_chars() {
         let id = short_id();
         assert_eq!(id.len(), 8);
+    }
+
+    #[test]
+    fn slash_suggestions_complete_with_tab_and_enter() {
+        let mut tui = Tui::new(String::new(), "test".into(), "test".into());
+        for c in "/ru".chars() {
+            tui.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        assert!(!tui.input.suggestions.is_empty());
+        tui.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(tui.input.text(), "/run ");
+
+        tui.input.buffer.clear();
+        tui.input.cursor = 0;
+        for c in "/se".chars() {
+            tui.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        tui.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(tui.input.suggestion_sel, Some(0));
+        tui.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(tui.input.text(), "/setup ");
+        assert!(
+            tui.rx.try_recv().is_err(),
+            "Enter with a selection must complete, not submit"
+        );
+        tui.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(tui.rx.try_recv().unwrap(), TuiEvent::Submit(_)));
     }
 
     #[test]

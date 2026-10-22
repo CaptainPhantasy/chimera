@@ -18,7 +18,9 @@ use std::sync::{Arc, Once};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -64,8 +66,13 @@ pub fn init_terminal() -> Result<TuiTerminal> {
     TERMINAL_ACTIVE.with(|active| active.set(true));
     let mut stdout = io::stdout();
     let result = (|| {
-        execute!(stdout, EnterAlternateScreen, event::EnableBracketedPaste)
-            .context("failed to enter alternate screen")?;
+        execute!(
+            stdout,
+            EnterAlternateScreen,
+            event::EnableBracketedPaste,
+            event::EnableMouseCapture
+        )
+        .context("failed to enter alternate screen")?;
         Terminal::new(CrosstermBackend::new(stdout)).context("failed to create terminal")
     })();
     if result.is_err() {
@@ -81,6 +88,7 @@ pub fn restore_terminal() -> Result<()> {
     let screen = execute!(
         io::stdout(),
         event::DisableBracketedPaste,
+        event::DisableMouseCapture,
         LeaveAlternateScreen,
         crossterm::cursor::Show
     )
@@ -310,6 +318,14 @@ impl Tui {
                 {
                     *expanded = !*expanded;
                 }
+            }
+            KeyCode::Up if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                let limit = self.scroll_limit();
+                self.log.scroll_up(limit);
+            }
+            KeyCode::Down if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                self.log.scroll_offset = self.log.scroll_offset.min(self.scroll_limit());
+                self.log.scroll_down();
             }
             KeyCode::Up => {
                 self.input.history_prev();
@@ -1034,6 +1050,17 @@ async fn run_screen(
                 match event::read()? {
                     Event::Key(key) => tui.handle_key(key),
                     Event::Paste(text) => if let Some(dialog) = &mut tui.dialog { dialog.paste(&text); } else { for character in text.chars() { tui.input.insert_char(character); } },
+                    Event::Mouse(mouse) => match mouse.kind {
+                        MouseEventKind::ScrollUp => {
+                            let limit = tui.scroll_limit();
+                            tui.log.scroll_up(limit);
+                        }
+                        MouseEventKind::ScrollDown => {
+                            tui.log.scroll_offset = tui.log.scroll_offset.min(tui.scroll_limit());
+                            tui.log.scroll_down();
+                        }
+                        _ => {}
+                    },
                     _ => {},
                 }
             }
@@ -1230,6 +1257,35 @@ mod tests {
         assert_eq!(*ok, Some(true));
         assert_eq!(*duration_ms, Some(7));
         assert!(*expanded);
+    }
+
+    #[test]
+    fn shift_arrows_scroll_the_transcript_without_touching_the_draft() {
+        let mut tui = Tui::new("scroll".into(), "test".into(), "test".into());
+        tui.width = 40;
+        tui.height = 12;
+        let text = (1..=60)
+            .map(|n| format!("row {n:03}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        tui.log.push(Message::Assistant {
+            text,
+            streaming: false,
+        });
+        for c in "draft".chars() {
+            tui.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        for _ in 0..5 {
+            tui.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::SHIFT));
+        }
+        assert!(tui.log.scroll_offset > 0);
+        assert_eq!(tui.input.text(), "draft");
+        tui.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT));
+        assert!(tui.log.scroll_offset < 5);
+        while tui.log.scroll_offset > 0 {
+            tui.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT));
+        }
+        assert!(tui.log.follow && tui.log.at_bottom());
     }
 
     #[test]

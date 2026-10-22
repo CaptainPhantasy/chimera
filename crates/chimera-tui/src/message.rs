@@ -213,13 +213,21 @@ fn wrap_text(text: &str, max_width: usize) -> Vec<String> {
 // ---------------------------------------------------------------------------
 
 /// A bounded, scrollable log of conversation messages.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct MessageLog {
     pub messages: VecDeque<Message>,
     /// Maximum messages retained.
     pub capacity: usize,
     /// Scroll offset from the bottom (0 = pinned to latest).
     pub scroll_offset: usize,
+    /// Whether new messages snap the view back to the bottom.
+    pub follow: bool,
+}
+
+impl Default for MessageLog {
+    fn default() -> Self {
+        Self::new(100)
+    }
 }
 
 impl MessageLog {
@@ -228,6 +236,7 @@ impl MessageLog {
             messages: VecDeque::with_capacity(capacity),
             capacity,
             scroll_offset: 0,
+            follow: true,
         }
     }
 
@@ -237,12 +246,15 @@ impl MessageLog {
             self.messages.pop_front();
         }
         self.messages.push_back(msg);
-        // Reset scroll to follow new messages.
-        self.scroll_offset = 0;
+        // Only snap to the latest when the reader has not scrolled away.
+        if self.follow {
+            self.scroll_offset = 0;
+        }
     }
 
     /// Scroll up (toward older messages).
     pub fn scroll_up(&mut self, max_offset: usize) {
+        self.follow = false;
         self.scroll_offset = self.scroll_offset.min(max_offset);
         if self.scroll_offset < max_offset {
             self.scroll_offset += 1;
@@ -254,11 +266,15 @@ impl MessageLog {
         if self.scroll_offset > 0 {
             self.scroll_offset -= 1;
         }
+        if self.scroll_offset == 0 {
+            self.follow = true;
+        }
     }
 
     /// Jump to the latest message.
     pub fn scroll_to_bottom(&mut self) {
         self.scroll_offset = 0;
+        self.follow = true;
     }
 
     /// Whether the view is pinned to the latest message.
@@ -349,6 +365,21 @@ mod tests {
         assert_eq!(log.scroll_offset, 1);
         log.scroll_down();
         assert!(log.at_bottom());
+    }
+
+    #[test]
+    fn scrolling_up_detaches_from_the_bottom_until_you_return() {
+        let mut log = MessageLog::new(100);
+        log.push(Message::User { text: "a".into() });
+        log.scroll_up(9);
+        log.push(Message::User { text: "b".into() });
+        assert_eq!(log.scroll_offset, 1, "new messages must not yank the view");
+        assert!(!log.follow);
+        log.scroll_down();
+        assert!(log.follow);
+        log.scroll_up(9);
+        log.scroll_to_bottom();
+        assert!(log.follow && log.at_bottom());
     }
 
     #[test]

@@ -87,14 +87,20 @@ pub struct ToolResult {
 pub trait ToolRouter: Send + Sync {
     /// Attach an execution world before policy checks and operator approval.
     /// Routers with a selected world must reject a different requested world.
-    async fn bind_call(&self, req: ToolCall) -> anyhow::Result<ToolCall> { Ok(req) }
+    async fn bind_call(&self, req: ToolCall) -> anyhow::Result<ToolCall> {
+        Ok(req)
+    }
 
     /// Invoke a tool and return the result.
     async fn call(&self, req: ToolCall) -> anyhow::Result<ToolResult>;
 
     /// Whether this exact call needs a fresh operator decision.
     async fn approval_required(&self, req: &ToolCall) -> anyhow::Result<bool> {
-        let descriptor = self.list().await?.into_iter().find(|tool| tool.name == req.tool)
+        let descriptor = self
+            .list()
+            .await?
+            .into_iter()
+            .find(|tool| tool.name == req.tool)
             .ok_or_else(|| anyhow::anyhow!("unknown tool: {}", req.tool))?;
         Ok(!descriptor.read_only)
     }
@@ -103,7 +109,9 @@ pub trait ToolRouter: Send + Sync {
         anyhow::bail!("this router does not support approvals")
     }
     /// Revoke any unused approval for this exact call.
-    async fn deny(&self, _req: &ToolCall) -> anyhow::Result<()> { Ok(()) }
+    async fn deny(&self, _req: &ToolCall) -> anyhow::Result<()> {
+        Ok(())
+    }
 
     /// List all available tools.
     async fn list(&self) -> anyhow::Result<Vec<ToolDescriptor>>;
@@ -117,7 +125,6 @@ pub trait ToolRouter: Send + Sync {
     /// Health-check a specific tool by name.
     async fn healthcheck(&self, tool: &str) -> anyhow::Result<bool>;
 }
-
 
 /// Best-effort constructor for the concrete `DefaultToolRouter`.
 ///
@@ -145,10 +152,10 @@ pub mod default_router {
 // ---------------------------------------------------------------------------
 
 use std::collections::HashMap;
-use std::path::PathBuf;
-use std::time::{Duration, Instant};
-use std::sync::{Arc, Mutex};
 use std::io::{Read, Write};
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 const FILE_LIMIT: usize = 100_000;
 
@@ -159,10 +166,24 @@ pub struct ToolPolicy {
     pub approval_ttl: Duration,
 }
 impl ToolPolicy {
-    pub fn read_only() -> Self { Self { read_only: true, approval_ttl: Duration::from_secs(120) } }
-    pub fn supervised() -> Self { Self { read_only: false, approval_ttl: Duration::from_secs(120) } }
+    pub fn read_only() -> Self {
+        Self {
+            read_only: true,
+            approval_ttl: Duration::from_secs(120),
+        }
+    }
+    pub fn supervised() -> Self {
+        Self {
+            read_only: false,
+            approval_ttl: Duration::from_secs(120),
+        }
+    }
 }
-impl Default for ToolPolicy { fn default() -> Self { Self::supervised() } }
+impl Default for ToolPolicy {
+    fn default() -> Self {
+        Self::supervised()
+    }
+}
 
 #[derive(Default)]
 struct FileState {
@@ -202,7 +223,9 @@ impl DefaultToolRouter {
 
     pub fn with_policy(repo_root: Option<PathBuf>, policy: ToolPolicy) -> Self {
         let mut handlers: HashMap<String, Box<dyn ToolHandler>> = HashMap::new();
-        let register = |name: &str, handler: Box<dyn ToolHandler>, map: &mut HashMap<String, Box<dyn ToolHandler>>| {
+        let register = |name: &str,
+                        handler: Box<dyn ToolHandler>,
+                        map: &mut HashMap<String, Box<dyn ToolHandler>>| {
             map.insert(name.to_string(), handler);
         };
         register("read_file", Box::new(ReadFileTool), &mut handlers);
@@ -213,13 +236,20 @@ impl DefaultToolRouter {
         register("grep", Box::new(GrepTool), &mut handlers);
         register("git_status", Box::new(GitStatusTool), &mut handlers);
 
-        Self { handlers, repo_root: repo_root.or_else(|| std::env::current_dir().ok()), policy,
-            approvals: Mutex::new(HashMap::new()), files: Arc::new(FileState::default()) }
+        Self {
+            handlers,
+            repo_root: repo_root.or_else(|| std::env::current_dir().ok()),
+            policy,
+            approvals: Mutex::new(HashMap::new()),
+            files: Arc::new(FileState::default()),
+        }
     }
 
     fn ctx(&self, actor: CreatureId) -> ToolContext {
         ToolContext {
-            repo_root: self.repo_root.clone(), actor, files: self.files.clone(),
+            repo_root: self.repo_root.clone(),
+            actor,
+            files: self.files.clone(),
         }
     }
 }
@@ -232,31 +262,60 @@ impl ToolRouter for DefaultToolRouter {
             .get(&req.tool)
             .ok_or_else(|| anyhow::anyhow!("unknown tool: {}", req.tool))?;
         let writes = !handler.descriptor().read_only;
-        anyhow::ensure!(!writes || !self.policy.read_only, "plan mode denies mutating tool: {}", req.tool);
+        anyhow::ensure!(
+            !writes || !self.policy.read_only,
+            "plan mode denies mutating tool: {}",
+            req.tool
+        );
         if writes {
             let key = serde_json::to_string(&req)?;
-            let expiry = self.approvals.lock().map_err(|_| anyhow::anyhow!("approval state unavailable"))?.remove(&key);
-            anyhow::ensure!(expiry.is_some_and(|expiry| expiry > Instant::now()),
-                "approval required for this exact action: {}", req.tool);
+            let expiry = self
+                .approvals
+                .lock()
+                .map_err(|_| anyhow::anyhow!("approval state unavailable"))?
+                .remove(&key);
+            anyhow::ensure!(
+                expiry.is_some_and(|expiry| expiry > Instant::now()),
+                "approval required for this exact action: {}",
+                req.tool
+            );
         }
-        anyhow::ensure!(req.world.is_none(), "requested execution world is unavailable; refusing host fallback");
+        anyhow::ensure!(
+            req.world.is_none(),
+            "requested execution world is unavailable; refusing host fallback"
+        );
         let ctx = self.ctx(req.requested_by);
         handler.call(req.args, &ctx).await
     }
 
     async fn approval_required(&self, req: &ToolCall) -> anyhow::Result<bool> {
-        let handler = self.handlers.get(&req.tool).ok_or_else(|| anyhow::anyhow!("unknown tool: {}", req.tool))?;
+        let handler = self
+            .handlers
+            .get(&req.tool)
+            .ok_or_else(|| anyhow::anyhow!("unknown tool: {}", req.tool))?;
         let writes = !handler.descriptor().read_only;
-        anyhow::ensure!(!writes || !self.policy.read_only, "plan mode denies mutating tool: {}", req.tool);
+        anyhow::ensure!(
+            !writes || !self.policy.read_only,
+            "plan mode denies mutating tool: {}",
+            req.tool
+        );
         Ok(writes)
     }
 
     async fn approve_once(&self, req: &ToolCall) -> anyhow::Result<()> {
         anyhow::ensure!(!self.policy.read_only, "plan mode cannot approve mutation");
-        anyhow::ensure!(self.handlers.contains_key(&req.tool), "unknown tool: {}", req.tool);
-        let expiry = Instant::now().checked_add(self.policy.approval_ttl)
+        anyhow::ensure!(
+            self.handlers.contains_key(&req.tool),
+            "unknown tool: {}",
+            req.tool
+        );
+        let expiry = Instant::now()
+            .checked_add(self.policy.approval_ttl)
             .ok_or_else(|| anyhow::anyhow!("invalid approval lifetime"))?;
-        let mut approvals = self.approvals.lock().map_err(|_| anyhow::anyhow!("approval state unavailable"))?;
+        let mut approvals = self
+            .approvals
+            .lock()
+            .map_err(|_| anyhow::anyhow!("approval state unavailable"))?;
         approvals.retain(|_, until| *until > Instant::now());
         anyhow::ensure!(approvals.len() < 128, "too many pending approvals");
         approvals.insert(serde_json::to_string(req)?, expiry);
@@ -264,7 +323,10 @@ impl ToolRouter for DefaultToolRouter {
     }
 
     async fn deny(&self, req: &ToolCall) -> anyhow::Result<()> {
-        self.approvals.lock().map_err(|_| anyhow::anyhow!("approval state unavailable"))?.remove(&serde_json::to_string(req)?);
+        self.approvals
+            .lock()
+            .map_err(|_| anyhow::anyhow!("approval state unavailable"))?
+            .remove(&serde_json::to_string(req)?);
         Ok(())
     }
 
@@ -285,19 +347,38 @@ impl ToolRouter for DefaultToolRouter {
 // Every existing component must be a real directory/file inside the selected root.
 fn resolve_path(p: &str, repo_root: &Option<PathBuf>) -> anyhow::Result<PathBuf> {
     use std::path::Component;
-    let root = repo_root.as_ref().ok_or_else(|| anyhow::anyhow!("no project root configured"))?.canonicalize()?;
+    let root = repo_root
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("no project root configured"))?
+        .canonicalize()?;
     let path = PathBuf::from(p);
-    anyhow::ensure!(!path.components().any(|c| matches!(c, Component::ParentDir)), "parent path traversal is not allowed");
-    let candidate = if path.is_absolute() { path } else { root.join(path) };
-    let relative = candidate.strip_prefix(&root).map_err(|_| anyhow::anyhow!("path is outside the allowed project"))?;
+    anyhow::ensure!(
+        !path.components().any(|c| matches!(c, Component::ParentDir)),
+        "parent path traversal is not allowed"
+    );
+    let candidate = if path.is_absolute() {
+        path
+    } else {
+        root.join(path)
+    };
+    let relative = candidate
+        .strip_prefix(&root)
+        .map_err(|_| anyhow::anyhow!("path is outside the allowed project"))?;
     let mut checked = root;
     for part in relative.components() {
         let text = part.as_os_str().to_string_lossy();
-        anyhow::ensure!(!is_private(&text), "protected path is not available to tools: {text}");
+        anyhow::ensure!(
+            !is_private(&text),
+            "protected path is not available to tools: {text}"
+        );
         checked.push(part);
         match std::fs::symlink_metadata(&checked) {
-            Ok(meta) => anyhow::ensure!(!meta.file_type().is_symlink(), "symbolic links are not allowed: {}", checked.display()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {},
+            Ok(meta) => anyhow::ensure!(
+                !meta.file_type().is_symlink(),
+                "symbolic links are not allowed: {}",
+                checked.display()
+            ),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(e.into()),
         }
     }
@@ -305,17 +386,23 @@ fn resolve_path(p: &str, repo_root: &Option<PathBuf>) -> anyhow::Result<PathBuf>
 }
 
 fn is_private(name: &str) -> bool {
-    matches!(name, ".git" | ".chimera" | ".ssh" | ".aws" | ".codex" | ".supercache" | ".agents")
-        || name == ".env" || (name.starts_with(".env.") && name != ".env.example")
+    matches!(
+        name,
+        ".git" | ".chimera" | ".ssh" | ".aws" | ".codex" | ".supercache" | ".agents"
+    ) || name == ".env"
+        || (name.starts_with(".env.") && name != ".env.example")
 }
 
 fn read_bounded(path: &std::path::Path) -> anyhow::Result<(Vec<u8>, bool)> {
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
-    #[cfg(unix)] {
+    #[cfg(unix)]
+    {
         use std::os::unix::fs::OpenOptionsExt;
-        #[cfg(target_os = "macos")] options.custom_flags(0x100); // O_NOFOLLOW
-        #[cfg(not(target_os = "macos"))] options.custom_flags(0x20000);
+        #[cfg(target_os = "macos")]
+        options.custom_flags(0x100); // O_NOFOLLOW
+        #[cfg(not(target_os = "macos"))]
+        options.custom_flags(0x20000);
     }
     let file = options.open(path)?;
     anyhow::ensure!(file.metadata()?.is_file(), "path is not a regular file");
@@ -326,59 +413,123 @@ fn read_bounded(path: &std::path::Path) -> anyhow::Result<(Vec<u8>, bool)> {
     Ok((bytes, truncated))
 }
 
-fn save_file(path: &std::path::Path, content: &str, ctx: &ToolContext) -> anyhow::Result<Option<PathBuf>> {
-    anyhow::ensure!(content.len() <= FILE_LIMIT, "write exceeds the {FILE_LIMIT} byte limit");
-    let _guard = ctx.files.writes.lock().map_err(|_| anyhow::anyhow!("file state unavailable"))?;
-    let root = ctx.repo_root.as_ref().ok_or_else(|| anyhow::anyhow!("no project root"))?.canonicalize()?;
-    let path = resolve_path(path.to_str().ok_or_else(|| anyhow::anyhow!("invalid path"))?, &Some(root.clone()))?;
+fn save_file(
+    path: &std::path::Path,
+    content: &str,
+    ctx: &ToolContext,
+) -> anyhow::Result<Option<PathBuf>> {
+    anyhow::ensure!(
+        content.len() <= FILE_LIMIT,
+        "write exceeds the {FILE_LIMIT} byte limit"
+    );
+    let _guard = ctx
+        .files
+        .writes
+        .lock()
+        .map_err(|_| anyhow::anyhow!("file state unavailable"))?;
+    let root = ctx
+        .repo_root
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("no project root"))?
+        .canonicalize()?;
+    let path = resolve_path(
+        path.to_str()
+            .ok_or_else(|| anyhow::anyhow!("invalid path"))?,
+        &Some(root.clone()),
+    )?;
     let existing = match std::fs::symlink_metadata(&path) {
         Ok(_) => {
             let (bytes, truncated) = read_bounded(&path)?;
             anyhow::ensure!(!truncated, "file exceeds the editable size limit");
-            let observations = ctx.files.observed.lock().map_err(|_| anyhow::anyhow!("file state unavailable"))?;
-            let expected = observations.get(&(ctx.actor, path.clone())).ok_or_else(|| anyhow::anyhow!("read the existing file before changing it"))?;
-            anyhow::ensure!(&bytes == expected, "file changed since it was read; read it again before editing");
+            let observations = ctx
+                .files
+                .observed
+                .lock()
+                .map_err(|_| anyhow::anyhow!("file state unavailable"))?;
+            let expected = observations
+                .get(&(ctx.actor, path.clone()))
+                .ok_or_else(|| anyhow::anyhow!("read the existing file before changing it"))?;
+            anyhow::ensure!(
+                &bytes == expected,
+                "file changed since it was read; read it again before editing"
+            );
             Some(bytes)
-        },
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
         Err(e) => return Err(e.into()),
     };
-    if let Some(parent) = path.parent() { std::fs::create_dir_all(parent)?; }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
     let recovery = root.join(".chimera").join("recovery");
     for directory in [root.join(".chimera"), recovery.clone()] {
         match std::fs::symlink_metadata(&directory) {
-            Ok(meta) => anyhow::ensure!(meta.is_dir() && !meta.file_type().is_symlink(), "recovery directory is unsafe"),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => { std::fs::create_dir(&directory)?; },
+            Ok(meta) => anyhow::ensure!(
+                meta.is_dir() && !meta.file_type().is_symlink(),
+                "recovery directory is unsafe"
+            ),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::create_dir(&directory)?;
+            }
             Err(e) => return Err(e.into()),
         }
-        #[cfg(unix)] { use std::os::unix::fs::PermissionsExt; std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))?; }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))?;
+        }
     }
     let backup = if existing.is_some() {
         let backup = recovery.join(format!("{}-original", Uuid::new_v4()));
         std::fs::hard_link(&path, &backup)?;
         Some(backup)
-    } else { None };
+    } else {
+        None
+    };
     let temporary = recovery.join(format!("{}-new", Uuid::new_v4()));
     let mut options = std::fs::OpenOptions::new();
     options.create_new(true).write(true);
-    #[cfg(unix)] { use std::os::unix::fs::OpenOptionsExt; options.mode(0o600); }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
     let mut file = options.open(&temporary)?;
     file.write_all(content.as_bytes())?;
     file.sync_all()?;
     if let Some(ref original) = existing {
-        anyhow::ensure!(read_bounded(&path)?.0 == *original, "file changed during write; both versions retained in {}", recovery.display());
+        anyhow::ensure!(
+            read_bounded(&path)?.0 == *original,
+            "file changed during write; both versions retained in {}",
+            recovery.display()
+        );
         std::fs::set_permissions(&temporary, std::fs::metadata(&path)?.permissions())?;
         std::fs::rename(&temporary, &path)?;
         if let Some(ref backup) = backup {
-            anyhow::ensure!(read_bounded(backup)?.0 == *original, "concurrent edit detected; original and new versions retained in {}", recovery.display());
+            anyhow::ensure!(
+                read_bounded(backup)?.0 == *original,
+                "concurrent edit detected; original and new versions retained in {}",
+                recovery.display()
+            );
         }
     } else {
         // hard_link fails if another writer created the destination. No replacement.
         std::fs::hard_link(&temporary, &path)?;
     }
     std::fs::File::open(path.parent().unwrap())?.sync_all()?;
-    let mut observed = ctx.files.observed.lock().map_err(|_| anyhow::anyhow!("file state unavailable"))?;
-    if observed.len() >= 128 { observed.clear(); }
+    // The staging copy served its purpose once the destination is durable;
+    // drop the second link so recovery storage does not grow without bound.
+    if existing.is_none() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    let mut observed = ctx
+        .files
+        .observed
+        .lock()
+        .map_err(|_| anyhow::anyhow!("file state unavailable"))?;
+    if observed.len() >= 128 {
+        observed.clear();
+    }
     observed.insert((ctx.actor, path), content.as_bytes().to_vec());
     Ok(backup)
 }
@@ -405,13 +556,23 @@ impl ToolHandler for ReadFileTool {
         let (bytes, truncated) = read_bounded(&path)?;
         let len = bytes.len();
         if !truncated {
-            let mut observed = ctx.files.observed.lock().map_err(|_| anyhow::anyhow!("file state unavailable"))?;
+            let mut observed = ctx
+                .files
+                .observed
+                .lock()
+                .map_err(|_| anyhow::anyhow!("file state unavailable"))?;
             // Evicted files must be read again before a later write.
-            if observed.len() >= 128 { observed.clear(); }
+            if observed.len() >= 128 {
+                observed.clear();
+            }
             observed.insert((ctx.actor, path.clone()), bytes.clone());
         }
         let mut content = String::from_utf8_lossy(&bytes).to_string();
-        if truncated { content.push_str("\n[truncated: read limit reached; file is not editable until read in full]"); }
+        if truncated {
+            content.push_str(
+                "\n[truncated: read limit reached; file is not editable until read in full]",
+            );
+        }
         Ok(ToolResult {
             ok: true,
             output: serde_json::json!({
@@ -511,7 +672,8 @@ impl ToolHandler for EditFileTool {
     fn descriptor(&self) -> ToolDescriptor {
         ToolDescriptor {
             name: "edit_file".to_string(),
-            description: "Replace the first unique occurrence of old_text with new_text.".to_string(),
+            description: "Replace the first unique occurrence of old_text with new_text."
+                .to_string(),
             read_only: false,
             category: ToolCategory::LocalExecution,
         }
@@ -524,10 +686,24 @@ struct BashTool;
 impl ToolHandler for BashTool {
     async fn call(&self, args: serde_json::Value, ctx: &ToolContext) -> anyhow::Result<ToolResult> {
         let command = get_str(&args, "command")?;
-        let cwd = resolve_path(args.get("cwd").and_then(|v| v.as_str()).unwrap_or("."), &ctx.repo_root)?;
-        let root = ctx.repo_root.as_ref().ok_or_else(|| anyhow::anyhow!("no project root"))?;
-        let output = chimera_shell::run_scoped_command(root, &cwd, command, &HashMap::new(),
-            args.get("timeout_secs").and_then(|v| v.as_u64()).unwrap_or(120)).await?;
+        let cwd = resolve_path(
+            args.get("cwd").and_then(|v| v.as_str()).unwrap_or("."),
+            &ctx.repo_root,
+        )?;
+        let root = ctx
+            .repo_root
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("no project root"))?;
+        let output = chimera_shell::run_scoped_command(
+            root,
+            &cwd,
+            command,
+            &HashMap::new(),
+            args.get("timeout_secs")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(120),
+        )
+        .await?;
         Ok(ToolResult {
             ok: output.exit_code == 0,
             output: serde_json::json!({"exit_code": output.exit_code, "stdout": output.stdout,
@@ -551,7 +727,10 @@ struct GlobTool;
 impl ToolHandler for GlobTool {
     async fn call(&self, args: serde_json::Value, ctx: &ToolContext) -> anyhow::Result<ToolResult> {
         let pattern = get_str(&args, "pattern")?;
-        let base = resolve_path(args.get("path").and_then(|v| v.as_str()).unwrap_or("."), &ctx.repo_root)?;
+        let base = resolve_path(
+            args.get("path").and_then(|v| v.as_str()).unwrap_or("."),
+            &ctx.repo_root,
+        )?;
 
         let glob = globset::Glob::new(pattern)
             .map_err(|e| anyhow::anyhow!("invalid glob pattern: {e}"))?
@@ -607,14 +786,17 @@ struct GrepTool;
 impl ToolHandler for GrepTool {
     async fn call(&self, args: serde_json::Value, ctx: &ToolContext) -> anyhow::Result<ToolResult> {
         let pattern = get_str(&args, "pattern")?;
-        let base = resolve_path(args.get("path").and_then(|v| v.as_str()).unwrap_or("."), &ctx.repo_root)?;
+        let base = resolve_path(
+            args.get("path").and_then(|v| v.as_str()).unwrap_or("."),
+            &ctx.repo_root,
+        )?;
         let max_results = args
             .get("max_results")
             .and_then(|v| v.as_u64())
-            .unwrap_or(100).clamp(1, 200) as usize;
+            .unwrap_or(100)
+            .clamp(1, 200) as usize;
 
-        let re = regex::Regex::new(pattern)
-            .map_err(|e| anyhow::anyhow!("invalid regex: {e}"))?;
+        let re = regex::Regex::new(pattern).map_err(|e| anyhow::anyhow!("invalid regex: {e}"))?;
 
         let mut results: Vec<serde_json::Value> = Vec::new();
         let walker = ignore::WalkBuilder::new(&base)
@@ -632,7 +814,9 @@ impl ToolHandler for GrepTool {
                 continue;
             }
             let path = entry.path();
-            let Ok((bytes, _)) = read_bounded(path) else { continue; };
+            let Ok((bytes, _)) = read_bounded(path) else {
+                continue;
+            };
             let content = String::from_utf8_lossy(&bytes);
             let rel = path
                 .strip_prefix(&base)
@@ -676,9 +860,22 @@ struct GitStatusTool;
 #[async_trait::async_trait]
 impl ToolHandler for GitStatusTool {
     async fn call(&self, args: serde_json::Value, ctx: &ToolContext) -> anyhow::Result<ToolResult> {
-        let cwd = resolve_path(args.get("path").and_then(|v| v.as_str()).unwrap_or("."), &ctx.repo_root)?;
-        let root = ctx.repo_root.as_ref().ok_or_else(|| anyhow::anyhow!("no project root"))?;
-        let output = chimera_shell::run_scoped_command(root, &cwd, "git --no-optional-locks status --porcelain=v1", &HashMap::new(), 30).await?;
+        let cwd = resolve_path(
+            args.get("path").and_then(|v| v.as_str()).unwrap_or("."),
+            &ctx.repo_root,
+        )?;
+        let root = ctx
+            .repo_root
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("no project root"))?;
+        let output = chimera_shell::run_scoped_command(
+            root,
+            &cwd,
+            "git --no-optional-locks status --porcelain=v1",
+            &HashMap::new(),
+            30,
+        )
+        .await?;
         let stdout = &output.stdout;
         let files: Vec<serde_json::Value> = stdout
             .lines()
@@ -734,7 +931,9 @@ mod default_router_tests {
         };
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
-            if router.approval_required(&req).await.unwrap() { router.approve_once(&req).await.unwrap(); }
+            if router.approval_required(&req).await.unwrap() {
+                router.approve_once(&req).await.unwrap();
+            }
             router.call(req).await.unwrap()
         })
     }
@@ -806,7 +1005,8 @@ mod default_router_tests {
             serde_json::json!({"command": "echo bash-test-output"}),
         );
         assert!(r.ok);
-        assert!(r.output
+        assert!(r
+            .output
             .get("stdout")
             .and_then(|v| v.as_str())
             .unwrap_or("")
@@ -822,9 +1022,9 @@ mod default_router_tests {
         let r = call(&router, "glob", serde_json::json!({"pattern": "*.rs"}));
         assert!(r.ok);
         let matches = r.output.get("matches").unwrap().as_array().unwrap();
-        assert!(matches.iter().any(|m| {
-            m.as_str().unwrap_or("").ends_with("alpha.rs")
-        }));
+        assert!(matches
+            .iter()
+            .any(|m| { m.as_str().unwrap_or("").ends_with("alpha.rs") }));
     }
 
     #[test]
@@ -875,7 +1075,12 @@ mod safety_tests {
         dir.canonicalize().unwrap()
     }
     fn request(tool: &str, args: serde_json::Value) -> ToolCall {
-        ToolCall { tool: tool.into(), args, world: None, requested_by: Uuid::nil() }
+        ToolCall {
+            tool: tool.into(),
+            args,
+            world: None,
+            requested_by: Uuid::nil(),
+        }
     }
     async fn approved(router: &DefaultToolRouter, req: ToolCall) -> anyhow::Result<ToolResult> {
         router.approve_once(&req).await?;
@@ -887,7 +1092,10 @@ mod safety_tests {
         let dir = fixture();
         let router = DefaultToolRouter::with_policy(Some(dir.clone()), ToolPolicy::read_only());
         for tool in ["write_file", "edit_file", "bash"] {
-            let req = request(tool, serde_json::json!({"path":"x", "content":"x", "command":"true"}));
+            let req = request(
+                tool,
+                serde_json::json!({"path":"x", "content":"x", "command":"true"}),
+            );
             assert!(router.approve_once(&req).await.is_err());
             assert!(router.call(req).await.is_err());
         }
@@ -899,7 +1107,10 @@ mod safety_tests {
     async fn approvals_are_exact_one_use_expiring_and_revocable() {
         let dir = fixture();
         let router = DefaultToolRouter::new(Some(dir.clone()));
-        let req = request("write_file", serde_json::json!({"path":"ok", "content":"yes"}));
+        let req = request(
+            "write_file",
+            serde_json::json!({"path":"ok", "content":"yes"}),
+        );
         assert!(router.call(req.clone()).await.is_err());
         router.approve_once(&req).await.unwrap();
         let mut changed = req.clone();
@@ -913,7 +1124,13 @@ mod safety_tests {
         router.approve_once(&req).await.unwrap();
         router.deny(&req).await.unwrap();
         assert!(router.call(req.clone()).await.is_err());
-        let expired = DefaultToolRouter::with_policy(Some(dir), ToolPolicy { read_only: false, approval_ttl: Duration::ZERO });
+        let expired = DefaultToolRouter::with_policy(
+            Some(dir),
+            ToolPolicy {
+                read_only: false,
+                approval_ttl: Duration::ZERO,
+            },
+        );
         expired.approve_once(&req).await.unwrap();
         assert!(expired.call(req).await.is_err());
     }
@@ -924,15 +1141,41 @@ mod safety_tests {
         let outside = fixture();
         std::fs::write(outside.join("private"), "SECRET-MARKER").unwrap();
         std::fs::write(dir.join(".env"), "SECRET-MARKER").unwrap();
-        #[cfg(unix)] std::os::unix::fs::symlink(&outside, dir.join("link")).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside, dir.join("link")).unwrap();
         let router = DefaultToolRouter::new(Some(dir.clone()));
-        for path in [outside.join("private").to_string_lossy().into_owned(), "../private".into(), ".env".into(), "link/private".into()] {
-            assert!(router.call(request("read_file", serde_json::json!({"path":path}))).await.is_err());
-            assert!(approved(&router, request("write_file", serde_json::json!({"path":path,"content":"bad"}))).await.is_err());
+        for path in [
+            outside.join("private").to_string_lossy().into_owned(),
+            "../private".into(),
+            ".env".into(),
+            "link/private".into(),
+        ] {
+            assert!(router
+                .call(request("read_file", serde_json::json!({"path":path})))
+                .await
+                .is_err());
+            assert!(approved(
+                &router,
+                request(
+                    "write_file",
+                    serde_json::json!({"path":path,"content":"bad"})
+                )
+            )
+            .await
+            .is_err());
         }
-        let matches = router.call(request("grep", serde_json::json!({"pattern":"SECRET-MARKER"}))).await.unwrap();
+        let matches = router
+            .call(request(
+                "grep",
+                serde_json::json!({"pattern":"SECRET-MARKER"}),
+            ))
+            .await
+            .unwrap();
         assert_eq!(matches.output["count"], 0);
-        assert_eq!(std::fs::read_to_string(outside.join("private")).unwrap(), "SECRET-MARKER");
+        assert_eq!(
+            std::fs::read_to_string(outside.join("private")).unwrap(),
+            "SECRET-MARKER"
+        );
     }
 
     #[tokio::test]
@@ -941,15 +1184,27 @@ mod safety_tests {
         let path = dir.join("file");
         std::fs::write(&path, "first").unwrap();
         let router = DefaultToolRouter::new(Some(dir));
-        let write = request("write_file", serde_json::json!({"path":"file","content":"agent"}));
+        let write = request(
+            "write_file",
+            serde_json::json!({"path":"file","content":"agent"}),
+        );
         assert!(approved(&router, write.clone()).await.is_err());
-        router.call(request("read_file", serde_json::json!({"path":"file"}))).await.unwrap();
+        router
+            .call(request("read_file", serde_json::json!({"path":"file"})))
+            .await
+            .unwrap();
         std::fs::write(&path, "user edit").unwrap();
         assert!(approved(&router, write.clone()).await.is_err());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "user edit");
-        router.call(request("read_file", serde_json::json!({"path":"file"}))).await.unwrap();
+        router
+            .call(request("read_file", serde_json::json!({"path":"file"})))
+            .await
+            .unwrap();
         let result = approved(&router, write).await.unwrap();
-        assert_eq!(std::fs::read_to_string(result.output["recovery_copy"].as_str().unwrap()).unwrap(), "user edit");
+        assert_eq!(
+            std::fs::read_to_string(result.output["recovery_copy"].as_str().unwrap()).unwrap(),
+            "user edit"
+        );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "agent");
     }
 
@@ -959,9 +1214,20 @@ mod safety_tests {
         let content = format!("{}é{}", "a".repeat(FILE_LIMIT - 1), "z".repeat(FILE_LIMIT));
         std::fs::write(dir.join("large"), content).unwrap();
         let router = DefaultToolRouter::new(Some(dir));
-        let result = router.call(request("read_file", serde_json::json!({"path":"large"}))).await.unwrap();
+        let result = router
+            .call(request("read_file", serde_json::json!({"path":"large"})))
+            .await
+            .unwrap();
         assert_eq!(result.output["truncated"], true);
         assert!(result.output["content"].as_str().unwrap().len() <= FILE_LIMIT + 120);
-        assert!(approved(&router, request("write_file", serde_json::json!({"path":"large","content":"bad"}))).await.is_err());
+        assert!(approved(
+            &router,
+            request(
+                "write_file",
+                serde_json::json!({"path":"large","content":"bad"})
+            )
+        )
+        .await
+        .is_err());
     }
 }

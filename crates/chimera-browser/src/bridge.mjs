@@ -31,8 +31,14 @@ for await (const line of lines) {
       launch = puppeteer.launch({executablePath: config.executable_path, headless: true,
         pipe: true, timeout: 15000, protocolTimeout: 30000,
         handleSIGTERM: false, handleSIGHUP: false, handleSIGINT: false,
-        args: ['--disable-background-networking', '--disable-sync', '--disable-default-apps', '--no-first-run']});
+        args: ['--disable-background-networking', '--disable-sync', '--disable-default-apps', '--no-first-run', '--block-new-web-contents']});
       browser = await launch;
+      // A page can open extra targets (window.open, target="_blank"); they must
+      // never run without the approved policy, so close them before they load.
+      browser.on('targetcreated', async target => {
+        if (target.type() !== 'page') return;
+        try { const opened = await target.page(); if (opened && opened !== page) await opened.close(); } catch {}
+      });
       page = await browser.newPage();
       await page.setViewport({width: 1440, height: 900, deviceScaleFactor: 1});
       if (config.allowed_origins.length === 0) await page.setOfflineMode(true);

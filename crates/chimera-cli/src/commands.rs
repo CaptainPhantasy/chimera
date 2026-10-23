@@ -1,34 +1,61 @@
 use super::*;
 use chimera_core::skill::SkillCapture;
 use chimera_eval::Evaluator;
-use chimera_memory::MemoryStore;
 use chimera_mcp::McpClient;
+use chimera_memory::MemoryStore;
 use chimera_sandbox::WorldManager;
 use std::path::Path;
 
 pub(crate) async fn approve(call: chimera_tools::ToolCall, format: OutputFormat) -> Result<()> {
+    use chimera_core::approval::{ApprovalStore, Decision};
+    let store = ApprovalStore::new(workspace_root());
+    let pending = store.request(
+        call.requested_by,
+        call.clone(),
+        std::time::Duration::from_secs(300),
+    )?;
+    struct CancelPending(ApprovalStore, uuid::Uuid);
+    impl Drop for CancelPending {
+        fn drop(&mut self) {
+            let _ = self.0.cancel(self.1);
+        }
+    }
+    let _pending_guard = CancelPending(ApprovalStore::new(workspace_root()), pending.id);
+    prompt_and_decide(&store, pending.id, &call, format).await
+}
+
+/// Interact for a decision on one specific pending record and consume it.
+/// The shown row is the row decided: approving never creates a second record.
+async fn prompt_and_decide(
+    store: &chimera_core::approval::ApprovalStore,
+    id: uuid::Uuid,
+    call: &chimera_tools::ToolCall,
+    format: OutputFormat,
+) -> Result<()> {
+    use chimera_core::approval::Decision;
     #[cfg(unix)]
-    let mut interrupts=tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
-    use chimera_core::approval::{ApprovalStore,Decision};
-    let store=ApprovalStore::new(workspace_root());
-    let pending=store.request(call.requested_by,call.clone(),std::time::Duration::from_secs(300))?;
-    struct CancelPending(ApprovalStore,uuid::Uuid);
-    impl Drop for CancelPending {fn drop(&mut self){let _=self.0.cancel(self.1);}}
-    let _pending_guard=CancelPending(ApprovalStore::new(workspace_root()),pending.id);
-    let (answer, receive)=tokio::sync::oneshot::channel();
-    let flow=tokio::select! {
+    let mut interrupts = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+    let (answer, receive) = tokio::sync::oneshot::channel();
+    let flow = tokio::select! {
         biased;
         _=async {
             #[cfg(unix)] {let _=interrupts.recv().await;}
             #[cfg(not(unix))] {let _=tokio::signal::ctrl_c().await;}
         }=>anyhow::bail!("action cancelled; nothing executed"),
-        result=show_run_event(RunEvent::Approval { id:pending.id,call:call.clone(),answer },format,None)=>result?,
+        result=show_run_event(RunEvent::Approval { id,call:call.clone(),answer },format,None)=>result?,
     };
-    anyhow::ensure!(!matches!(flow,RunEventFlow::Cancelled(_)),"action cancelled; nothing executed");
+    anyhow::ensure!(
+        !matches!(flow, RunEventFlow::Cancelled(_)),
+        "action cancelled; nothing executed"
+    );
     match receive.await {
-        Ok(approved) => {if store.get(pending.id)?.decision==Decision::Pending {store.decide(pending.id,approved)?;}},
-        Err(_) if std::env::var("CHIMERA_WAIT_APPROVAL").as_deref()==Ok("1")=> {
-            while store.get(pending.id)?.decision==Decision::Pending {
+        Ok(approved) => {
+            if store.get(id)?.decision == Decision::Pending {
+                store.decide(id, approved)?;
+            }
+        }
+        Err(_) if std::env::var("CHIMERA_WAIT_APPROVAL").as_deref() == Ok("1") => {
+            while store.get(id)?.decision == Decision::Pending {
                 tokio::select! {
                     _=tokio::time::sleep(std::time::Duration::from_millis(100))=>(),
                     _=async {
@@ -37,36 +64,71 @@ pub(crate) async fn approve(call: chimera_tools::ToolCall, format: OutputFormat)
                     }=>anyhow::bail!("action cancelled; nothing executed"),
                 }
             }
-        },
-        Err(_)=>anyhow::bail!("approval display closed; nothing executed"),
+        }
+        Err(_) => anyhow::bail!("approval display closed; nothing executed"),
     }
-    anyhow::ensure!(store.get(pending.id)?.decision==Decision::Approved,"action denied or expired; nothing executed");
-    store.consume(pending.id,call.requested_by,&call)?;
+    anyhow::ensure!(
+        store.get(id)?.decision == Decision::Approved,
+        "action denied or expired; nothing executed"
+    );
+    store.consume(id, call.requested_by, call)?;
     Ok(())
 }
 
-struct CommandChecks { format: OutputFormat, profile: Option<String> }
+struct CommandChecks {
+    format: OutputFormat,
+    profile: Option<String>,
+}
 #[async_trait::async_trait]
 impl chimera_eval::CheckRunner for CommandChecks {
-    async fn run(&self, command:&str, cwd:&Path, timeout_secs:u64) -> Result<chimera_eval::CheckOutput> {
-        anyhow::ensure!(cwd.canonicalize()? == workspace_root().canonicalize()?,"check belongs to another project");
-        let saved_policy=chimera_core::approval::PolicyStore::new(workspace_root());
-        saved_policy.check("bash",false)?;
-        let router=chimera_tools::DefaultToolRouter::with_policy(Some(cwd.into()),policy(self.profile.as_deref(),false)?);
-        let call=chimera_tools::ToolCall { tool:"bash".into(),args:json!({"command":command,"timeout_secs":timeout_secs}),world:None,requested_by:uuid::Uuid::new_v4() };
-        if router.approval_required(&call).await? { approve(call.clone(),self.format).await?; router.approve_once(&call).await?; }
-        saved_policy.check("bash",false)?;
-        let result=router.call(call).await?;
+    async fn run(
+        &self,
+        command: &str,
+        cwd: &Path,
+        timeout_secs: u64,
+    ) -> Result<chimera_eval::CheckOutput> {
+        anyhow::ensure!(
+            cwd.canonicalize()? == workspace_root().canonicalize()?,
+            "check belongs to another project"
+        );
+        let saved_policy = chimera_core::approval::PolicyStore::new(workspace_root());
+        saved_policy.check("bash", false)?;
+        let router = chimera_tools::DefaultToolRouter::with_policy(
+            Some(cwd.into()),
+            policy(self.profile.as_deref(), false)?,
+        );
+        let call = chimera_tools::ToolCall {
+            tool: "bash".into(),
+            args: json!({"command":command,"timeout_secs":timeout_secs}),
+            world: None,
+            requested_by: uuid::Uuid::new_v4(),
+        };
+        if router.approval_required(&call).await? {
+            approve(call.clone(), self.format).await?;
+            router.approve_once(&call).await?;
+        }
+        saved_policy.check("bash", false)?;
+        let result = router.call(call).await?;
         Ok(chimera_eval::CheckOutput {
-            exit_code:result.output["exit_code"].as_i64().unwrap_or(if result.ok {0} else {1}) as i32,
-            stdout:result.output["stdout"].as_str().unwrap_or("").into(),
-            stderr:result.output["stderr"].as_str().or_else(||result.output["error"].as_str()).unwrap_or("").into(),
-            timed_out:result.output["timed_out"].as_bool().unwrap_or(false),
+            exit_code: result.output["exit_code"]
+                .as_i64()
+                .unwrap_or(if result.ok { 0 } else { 1 }) as i32,
+            stdout: result.output["stdout"].as_str().unwrap_or("").into(),
+            stderr: result.output["stderr"]
+                .as_str()
+                .or_else(|| result.output["error"].as_str())
+                .unwrap_or("")
+                .into(),
+            timed_out: result.output["timed_out"].as_bool().unwrap_or(false),
         })
     }
 }
 
-pub(super) async fn execute(command: Command, format:OutputFormat, profile:Option<String>) -> Result<()> {
+pub(super) async fn execute(
+    command: Command,
+    format: OutputFormat,
+    profile: Option<String>,
+) -> Result<()> {
     match command {
         Command::Notify {cmd}=>notify_commands::execute(cmd,format,profile.as_deref()).await,
         Command::Approve {cmd}=> {
@@ -75,7 +137,7 @@ pub(super) async fn execute(command: Command, format:OutputFormat, profile:Optio
             match cmd {
                 ApproveCmd::List=> {let rows:Vec<_>=store.list()?.into_iter().filter(|r|r.decision==Decision::Pending).collect();let shown=chimera_core::approval::display_value(json!({"actions":rows}));output(format,shown.clone(),serde_json::to_string_pretty(&shown)?)},
                 ApproveCmd::Action {id}=> {let id=uuid::Uuid::parse_str(&id)?;let row=store.get(id)?;let shown=chimera_core::approval::display_value(json!({"action":row}));output(format,shown.clone(),format!("Approving {} {} once",row.call.tool,shown["action"]["call"]["args"]))?;let row=store.decide(id,true)?;output(format,chimera_core::approval::display_value(json!({"decision":row})),format!("Approved {id} once."))},
-                ApproveCmd::Next=> {let row=store.list()?.into_iter().find(|r|r.decision==Decision::Pending).context("no pending action")?;approve(row.call.clone(),format).await?;store.decide(row.id,true)?;output(format,json!({"approved":row.id}),format!("Approved {} once.",row.id))},
+                ApproveCmd::Next=> {let row=store.list()?.into_iter().find(|r|r.decision==Decision::Pending).context("no pending action")?;prompt_and_decide(&store,row.id,&row.call,format).await?;output(format,json!({"approved":row.id}),format!("Approved {} once.",row.id))},
                 ApproveCmd::Plan=>anyhow::bail!("blanket plan approval is unavailable; use approve list and approve action <id> for an exact pending action"),
             }
         }
@@ -195,7 +257,7 @@ pub(super) async fn execute(command: Command, format:OutputFormat, profile:Optio
             let servers:Vec<chimera_mcp::McpServer>=serde_json::from_slice(&std::fs::read(&config)?)?;
             let server_name=match &cmd {McpCmd::Tools {server}|McpCmd::Call {server,..}|McpCmd::Resources {server}|McpCmd::Read {server,..}|McpCmd::Healthcheck {server}=>server};
             let server=servers.iter().find(|s| &s.name==server_name).context("server name is not configured")?;
-            approve(chimera_tools::ToolCall {tool:"external_server".into(),args:json!({"server":server.name,"command":server.command,"arguments":server.args,"operation":format!("{cmd:?}")}),world:None,requested_by:uuid::Uuid::new_v4()},format).await?;
+            approve(chimera_tools::ToolCall {tool:"external_server".into(),args:json!({"server":server.name,"transport":server.transport,"command":server.command,"arguments":server.args,"env":server.env,"operation":format!("{cmd:?}")}),world:None,requested_by:uuid::Uuid::new_v4()},format).await?;
             let client=chimera_mcp::StdioMcpClient::new(servers,chimera_mcp::StdioOptions {working_directory:Some(workspace_root()),..Default::default()})?;
             let result:Result<Value>=async { Ok(match cmd {
                 McpCmd::Tools {server}=>json!(client.list_tools(&server).await?),
@@ -214,13 +276,30 @@ pub(super) async fn execute(command: Command, format:OutputFormat, profile:Optio
 }
 
 /// Startup requires separate exact permission before even discovering server tools.
-pub(crate) async fn external_tools(builtins:Arc<dyn ToolRouter>,path:std::path::PathBuf,format:OutputFormat)->Result<Arc<chimera_core::external_tools::ExternalTools>> {
-    let meta=std::fs::symlink_metadata(&path)?;
-    anyhow::ensure!(meta.is_file()&&!meta.file_type().is_symlink()&&meta.len()<=1_048_576,"external settings must be a regular JSON file under 1 MiB");
-    let servers:Vec<chimera_mcp::McpServer>=serde_json::from_slice(&std::fs::read(path)?)?;
-    let options=chimera_mcp::StdioOptions {working_directory:Some(workspace_root()),..Default::default()};
-    let actor=uuid::Uuid::new_v4();
-    let actions=chimera_core::external_tools::startup_actions(&servers,&options,actor)?;
-    for action in &actions {approve(action.clone(),format).await?;}
-    Ok(Arc::new(chimera_core::external_tools::ExternalTools::discover(builtins,servers,options,actor,&actions).await?))
+pub(crate) async fn external_tools(
+    builtins: Arc<dyn ToolRouter>,
+    path: std::path::PathBuf,
+    format: OutputFormat,
+) -> Result<Arc<chimera_core::external_tools::ExternalTools>> {
+    let meta = std::fs::symlink_metadata(&path)?;
+    anyhow::ensure!(
+        meta.is_file() && !meta.file_type().is_symlink() && meta.len() <= 1_048_576,
+        "external settings must be a regular JSON file under 1 MiB"
+    );
+    let servers: Vec<chimera_mcp::McpServer> = serde_json::from_slice(&std::fs::read(path)?)?;
+    let options = chimera_mcp::StdioOptions {
+        working_directory: Some(workspace_root()),
+        ..Default::default()
+    };
+    let actor = uuid::Uuid::new_v4();
+    let actions = chimera_core::external_tools::startup_actions(&servers, &options, actor)?;
+    for action in &actions {
+        approve(action.clone(), format).await?;
+    }
+    Ok(Arc::new(
+        chimera_core::external_tools::ExternalTools::discover(
+            builtins, servers, options, actor, &actions,
+        )
+        .await?,
+    ))
 }

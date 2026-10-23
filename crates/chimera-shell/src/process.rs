@@ -1,19 +1,35 @@
 //! Bounded, owned subprocess execution. Dropping the future kills its process group.
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 const OUTPUT_LIMIT: usize = 50_000;
+
+/// Escape a filesystem path for use inside an SBPL regex literal.
+fn regex_escape(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        if "\\.()+[]{}|^$*?".contains(c) {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
 
 #[cfg(unix)]
 struct ProcessGroup(i32);
 #[cfg(unix)]
 impl Drop for ProcessGroup {
     fn drop(&mut self) {
-        unsafe extern "C" { fn kill(pid: i32, signal: i32) -> i32; }
+        unsafe extern "C" {
+            fn kill(pid: i32, signal: i32) -> i32;
+        }
         // Only the new child group created below is addressed, never the caller's group.
-        unsafe { kill(-self.0, 9); }
+        unsafe {
+            kill(-self.0, 9);
+        }
     }
 }
 
@@ -23,7 +39,9 @@ async fn drain_bounded<R: AsyncRead + Unpin>(mut reader: R) -> std::io::Result<S
     let mut total = 0u64;
     loop {
         let n = reader.read(&mut chunk).await?;
-        if n == 0 { break; }
+        if n == 0 {
+            break;
+        }
         total += n as u64;
         let keep = n.min(OUTPUT_LIMIT.saturating_sub(retained.len()));
         retained.extend_from_slice(&chunk[..keep]);
@@ -58,25 +76,83 @@ pub async fn run_scoped_command_with_access(
 ) -> anyhow::Result<crate::ShellOutput> {
     let root = root.canonicalize()?;
     let cwd = cwd.canonicalize()?;
-    anyhow::ensure!(cwd.starts_with(&root), "command directory is outside the allowed project");
-    anyhow::ensure!((1..=600).contains(&timeout_secs), "command timeout must be between 1 and 600 seconds");
+    anyhow::ensure!(
+        cwd.starts_with(&root),
+        "command directory is outside the allowed project"
+    );
+    anyhow::ensure!(
+        (1..=600).contains(&timeout_secs),
+        "command timeout must be between 1 and 600 seconds"
+    );
     // Overrides cannot reintroduce credentials, startup scripts, or loader injection.
     for key in env.keys() {
-        anyhow::ensure!(matches!(key.as_str(), "LANG" | "LC_ALL" | "TERM" | "NO_COLOR"),
-            "environment override is not allowed: {key}");
+        anyhow::ensure!(
+            matches!(key.as_str(), "LANG" | "LC_ALL" | "TERM" | "NO_COLOR"),
+            "environment override is not allowed: {key}"
+        );
     }
     #[cfg(not(target_os = "macos"))]
-    anyhow::bail!("isolated shell execution is unavailable on this platform; no command was started");
+    anyhow::bail!(
+        "isolated shell execution is unavailable on this platform; no command was started"
+    );
 
     #[cfg(target_os = "macos")]
     {
         use std::os::unix::process::CommandExt;
-        let root_text = root.to_str().ok_or_else(|| anyhow::anyhow!("project path is not valid UTF-8"))?;
+        let root_text = root
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("project path is not valid UTF-8"))?;
         let root_quoted = serde_json::to_string(root_text)?;
-        let protected = r#"(regex #"(^|/)(\.env($|\.)|\.ssh(/|$)|\.aws(/|$)|\.codex(/|$)|\.supercache(/|$))")"#;
+        let protected =
+            r#"(regex #"(^|/)(\.env($|\.)|\.ssh(/|$)|\.aws(/|$)|\.codex(/|$)|\.supercache(/|$))")"#;
         let private_state = serde_json::to_string(&root.join(".chimera").to_string_lossy())?;
-        let write_rule = if writable { format!("(allow file-write* (subpath {root_quoted}))") } else { String::new() };
-        let profile = format!(r#"(version 1)
+        // Deny .chimera anywhere below the scoped root, not only at its top
+        // level; a root that itself lives beneath .chimera/worlds is unaffected
+        // because the pattern only matches .chimera components after the root.
+        let private_descendants = format!(
+            r#"(regex #"{}(/.*)?/\.chimera(/|$)")"#,
+            regex_escape(root_text)
+        );
+        // Approved toolchain access: a standard rustup install lives outside
+        // the project, so cargo checks need narrow read/exec access plus cache
+        // writes. Registry credentials are denied explicitly; deny wins over
+        // allow when both match, so the read grant below cannot leak them.
+        let real_home = std::env::var("HOME").unwrap_or_default();
+        let home_path = PathBuf::from(&real_home);
+        let cargo_bin = home_path.join(".cargo/bin");
+        let cargo_home = home_path.join(".cargo");
+        let rustup_home = home_path.join(".rustup");
+        let quoted =
+            |p: &Path| serde_json::to_string(&p.to_string_lossy().to_string()).unwrap_or_default();
+        let toolchain_ready = cargo_bin.join("cargo").is_file();
+        let toolchain_read = if toolchain_ready {
+            format!(
+                "(allow file-read* file-map-executable (subpath {}) (subpath {}))\n(allow file-read* (subpath {}))\n(deny file-read* (literal {}) (literal {}))\n",
+                quoted(&cargo_bin),
+                quoted(&rustup_home),
+                quoted(&cargo_home),
+                quoted(&cargo_home.join("credentials")),
+                quoted(&cargo_home.join("credentials.toml")),
+            )
+        } else {
+            String::new()
+        };
+        let cache_writes = if toolchain_ready {
+            format!(
+                "(allow file-write* (subpath {}) (subpath {}))",
+                quoted(&cargo_home.join("registry")),
+                quoted(&cargo_home.join("git")),
+            )
+        } else {
+            String::new()
+        };
+        let write_rule = if writable {
+            format!("(allow file-write* (subpath {root_quoted})){cache_writes}")
+        } else {
+            String::new()
+        };
+        let profile = format!(
+            r#"(version 1)
 (deny default)
 (import "dyld-support.sb")
 (allow process*)
@@ -86,41 +162,86 @@ pub async fn run_scoped_command_with_access(
 (allow file-read* file-map-executable (subpath "/private/var/db/dyld") (subpath "/private/var/db/oah") (subpath "/dev"))
 (allow file-read* file-map-executable (subpath {root_quoted}) (subpath "/bin") (subpath "/sbin") (subpath "/usr/bin") (subpath "/usr/sbin") (subpath "/usr/lib") (subpath "/usr/share") (subpath "/System") (subpath "/Library/Apple") (subpath "/opt/homebrew/bin") (subpath "/opt/homebrew/Cellar") (subpath "/opt/homebrew/opt") (subpath "/opt/homebrew/lib") (literal "/dev/null") (literal "/dev/urandom") (literal "/dev/zero") (literal "/private/etc/localtime"))
 {write_rule}
+{toolchain_read}
 (allow file-write* (literal "/dev/null"))
-(deny file-read* file-write* {protected} (subpath {private_state}))
+(deny file-read* file-write* {protected} (subpath {private_state}) {private_descendants})
 (deny file-write* (regex #"(^|/)(\.git|\.agents)(/|$)"))
 (deny file-write-unlink)
 (deny network*)
-"#);
+"#
+        );
+        let path_env = if toolchain_ready {
+            format!(
+                "{}:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin",
+                cargo_bin.to_string_lossy()
+            )
+        } else {
+            "/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin".to_string()
+        };
         let mut cmd = tokio::process::Command::new("/usr/bin/sandbox-exec");
         cmd.args(["-p", &profile, "/bin/sh", "-c", command])
-            .current_dir(&cwd).env_clear()
-            .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin")
-            .env("HOME", &root).env("TMPDIR", &root)
-            .envs(env).kill_on_drop(true)
+            .current_dir(&cwd)
+            .env_clear()
+            .env("PATH", &path_env)
+            .env("HOME", &root)
+            .env("TMPDIR", &root);
+        if toolchain_ready {
+            cmd.env("CARGO_HOME", cargo_home.as_os_str())
+                .env("RUSTUP_HOME", rustup_home.as_os_str());
+        }
+        cmd.envs(env)
+            .kill_on_drop(true)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
         cmd.as_std_mut().process_group(0);
         let start = Instant::now();
         let mut child = cmd.spawn()?;
-        let group = ProcessGroup(child.id().ok_or_else(|| anyhow::anyhow!("child has no process identifier"))? as i32);
-        let stdout = child.stdout.take().ok_or_else(|| anyhow::anyhow!("missing command output pipe"))?;
-        let stderr = child.stderr.take().ok_or_else(|| anyhow::anyhow!("missing command error pipe"))?;
+        let group = ProcessGroup(
+            child
+                .id()
+                .ok_or_else(|| anyhow::anyhow!("child has no process identifier"))?
+                as i32,
+        );
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("missing command output pipe"))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("missing command error pipe"))?;
         let result = tokio::time::timeout(Duration::from_secs(timeout_secs), async {
             tokio::try_join!(child.wait(), drain_bounded(stdout), drain_bounded(stderr))
-        }).await;
+        })
+        .await;
         let duration_ms = start.elapsed().as_millis() as u64;
         drop(group);
         match result {
             Ok(Ok((status, stdout, stderr))) => Ok(crate::ShellOutput {
-                exit_code: status.code().unwrap_or(-1), stdout, stderr: if status.code().is_none() { format!("{stderr}\nprocess stopped: {status}") } else { stderr }, duration_ms,
+                exit_code: status.code().unwrap_or(-1),
+                stdout,
+                stderr: if status.code().is_none() {
+                    format!("{stderr}\nprocess stopped: {status}")
+                } else {
+                    stderr
+                },
+                duration_ms,
             }),
-            Ok(Err(error)) => { let _ = child.wait().await; Err(error.into()) },
+            Ok(Err(error)) => {
+                let _ = child.wait().await;
+                Err(error.into())
+            }
             Err(_) => {
                 let _ = child.wait().await;
-                Ok(crate::ShellOutput { exit_code: 124, stdout: String::new(),
-                    stderr: format!("command timed out after {timeout_secs}s; owned processes stopped"), duration_ms })
+                Ok(crate::ShellOutput {
+                    exit_code: 124,
+                    stdout: String::new(),
+                    stderr: format!(
+                        "command timed out after {timeout_secs}s; owned processes stopped"
+                    ),
+                    duration_ms,
+                })
             }
         }
     }

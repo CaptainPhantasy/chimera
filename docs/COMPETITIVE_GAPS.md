@@ -95,7 +95,7 @@ P0 makes CHIMERA usable day to day and establishes its distinctive position. P1 
 
 ### 10. Diff preview in approvals
 - **CHIMERA:** The tool card shows the tool name and raw `args` (`crates/chimera-tui/src/message.rs:135`).
-- **Competitors:** Claude Code, Codex and Aider show a colored diff before approval. Claude Code can open it in the IDE for editing.
+- **Competitors:** Claude Code and Codex show a colored diff before approval, and Claude Code can open it in the IDE for editing. Aider works differently: it applies and auto-commits edits by default, then offers `/diff` and `/undo` for review and rollback (https://aider.chat/docs/git.html) — post-edit review, not an approval boundary.
 - **Needed:** A unified diff for `write_file` and `edit_file` in both the chat and terminal review prompts.
 
 ### 11. `@file` mentions with fuzzy search
@@ -115,7 +115,7 @@ P0 makes CHIMERA usable day to day and establishes its distinctive position. P1 
 
 ### 14. Automatic checkpoints and rewind
 - **CHIMERA:** Checkpoints are manual: `checkpoint create --file X` for each file (`docs/USER_MANUAL.md`, Checkpoints).
-- **Competitors:** Claude Code checkpoints every edit and restores with Esc Esc or `/rewind`. Aider commits each change and `/undo` reverts it. Gemini CLI keeps shadow-git checkpoints with `/restore`.
+- **Competitors:** Claude Code checkpoints every edit made through its file tools (not changes from Bash/shell commands) and restores with Esc Esc or `/rewind` (https://code.claude.com/docs/en/checkpointing). Aider commits each change and `/undo` reverts it. Gemini CLI keeps shadow-git checkpoints with `/restore`.
 - **Needed:** An automatic checkpoint before every file-changing tool call, plus `/rewind` that can restore code, conversation or both.
 
 ### 15. MCP in chat and over HTTP
@@ -144,7 +144,7 @@ P0 makes CHIMERA usable day to day and establishes its distinctive position. P1 
 - **Needed (later):** A small editor bridge for the current selection and diff review.
 
 ### 20. Unattended / CI runs with declared permissions
-- **CHIMERA:** With `--format json`, any action that needs approval is denied unless someone approves it from another terminal (`docs/USER_MANUAL.md`, Approvals).
+- **CHIMERA:** With `--format json`, any action that needs approval is denied, unless `CHIMERA_WAIT_APPROVAL=1` is set and someone approves it from an authenticated terminal in the same project; otherwise the run denies the action (`crates/chimera-cli/src/main.rs`, `docs/USER_MANUAL.md`, Approvals).
 - **Competitors:** Claude Code has `claude -p` with `--output-format stream-json`, `--allowedTools` and a GitHub Action. Codex has `codex exec` and GitHub review.
 - **Needed:** `chimera run --policy ci.toml --format json` with clear exit codes, plus a CI example.
 

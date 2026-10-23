@@ -157,6 +157,14 @@ def apply(args):
                 os.fsync(directory_fd)
             finally:
                 os.close(directory_fd)
+            # The record and quarantine renames above must survive power loss
+            # together with the binary, or the next run sees a torn install.
+            for durable_directory in (state_dir, quarantine):
+                directory_fd = os.open(str(durable_directory), os.O_RDONLY)
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
         except Exception:
             for destination in reversed(placed):
                 os.rename(destination, quarantine / ('failed-new-' + destination.name))

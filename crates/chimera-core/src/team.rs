@@ -583,7 +583,10 @@ impl TeamRegistry {
             &model,
             &objective,
             &config,
-            crate::runtime::RunChannels { events: out, cancellation: stopped },
+            crate::runtime::RunChannels {
+                events: out,
+                cancellation: stopped,
+            },
         );
         tokio::pin!(run);
         let result = loop {
@@ -979,41 +982,54 @@ impl ToolRouter for ScopedRouter {
                     evidence: vec![],
                 });
             }
+            // Grep the base directory in one pass: the built-in walker reads
+            // every matching file (private paths filtered inside the tool), so
+            // matches beyond the first 200 file names are no longer missed.
+            // Out-of-scope results are dropped here and never reach context.
             let limit = call
                 .args
                 .get("max_results")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(100)
                 .clamp(1, 200) as usize;
+            let mut args = call.args.clone();
+            args["path"] = serde_json::json!(base.clone());
+            args["max_results"] = serde_json::json!(200);
+            let result = self
+                .tools
+                .call(ToolCall {
+                    tool: "grep".into(),
+                    args,
+                    world: None,
+                    requested_by: call.requested_by,
+                })
+                .await?;
+            let raw = result.output["matches"]
+                .as_array()
+                .context("search output invalid")?
+                .clone();
             let mut matches = Vec::new();
-            for path in paths {
-                if matches.len() >= limit {
-                    break;
+            let mut truncated = raw.len() >= 200;
+            for mut value in raw {
+                let rel = value["path"].as_str().context("search output invalid")?;
+                let full = normalized(&if base.is_empty() {
+                    rel.to_string()
+                } else {
+                    format!("{base}/{rel}")
+                })?;
+                if !allowed(&record.request.scope, &full) {
+                    continue;
                 }
-                let mut args = call.args.clone();
-                args["path"] = serde_json::json!(path);
-                args["max_results"] = serde_json::json!(limit - matches.len());
-                let result = self
-                    .tools
-                    .call(ToolCall {
-                        tool: "grep".into(),
-                        args,
-                        world: None,
-                        requested_by: call.requested_by,
-                    })
-                    .await?;
-                for mut value in result.output["matches"]
-                    .as_array()
-                    .context("search output invalid")?
-                    .clone()
-                {
-                    value["path"] = serde_json::json!(path);
+                value["path"] = serde_json::json!(full);
+                if matches.len() < limit {
                     matches.push(value);
+                } else {
+                    truncated = true;
                 }
             }
             return Ok(ToolResult {
                 ok: true,
-                output: serde_json::json!({"count":matches.len(),"truncated":names.len()>=200||matches.len()>=limit,"matches":matches}),
+                output: serde_json::json!({"count":matches.len(),"truncated":truncated,"matches":matches}),
                 evidence: vec![],
             });
         }

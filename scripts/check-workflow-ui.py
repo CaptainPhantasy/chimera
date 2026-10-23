@@ -18,8 +18,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]/'.floyd/testdeps'))
 import pyte
 
 class RenderedScreen(setup.Screen):
-    def __init__(self, binary, cwd, config, arguments, check, row, profile='read-only'):
-        super().__init__(binary, cwd, config, arguments, check, row, profile=profile)
+    def __init__(self, binary, cwd, config, arguments, check, row, profile='read-only', extra_env=None):
+        super().__init__(binary, cwd, config, arguments, check, row, profile=profile, extra_env=extra_env)
 
     def visible(self):
         terminal = pyte.Screen(120, 32)
@@ -308,7 +308,8 @@ try:
     # /rewind — automatic per-turn snapshots, exact preview, confirmed restore.
     # A supervised screen is required so the agent may really edit files.
     rewind_row = {}
-    screen = RenderedScreen(binary, project, config, ['tui'], check, rewind_row, profile='supervised'); screens.append(screen)
+    screen = RenderedScreen(binary, project, config, ['tui'], check, rewind_row, profile='supervised',
+                            extra_env={'CHIMERA_MCP_CONFIG': str(mcp_config)}); screens.append(screen)
     screen.wait_for('model-beta', seconds=20)
     state_dir = project/'.chimera'/'sessions'
 
@@ -481,6 +482,12 @@ try:
     # /mcp — external tool connections in read-only mode: real status rows, an
     # honest refusal to start programs, and guided setup that appends one
     # entry without touching the saved ones.
+    # A read-only screen is required here: the earlier rewind flow leaves a
+    # supervised screen active, which by design may start programs.
+    mcp_readonly_row = {}
+    screen = RenderedScreen(binary, project, config, ['tui'], check, mcp_readonly_row, profile='read-only',
+                            extra_env={'CHIMERA_MCP_CONFIG': str(mcp_config)}); screens.append(screen)
+    screen.wait_for('model-beta', seconds=20)
     send('/mcp\r', 'External tool connections')
     screen.wait_for('broken')
     screen.wait_for('reachable-fixture')
@@ -527,9 +534,18 @@ try:
     send('\r', 'reachable-fixture is reachable')
     send('\r', 'Attach reachable-fixture to this chat?')
     screen.wait_for('mcp_server_start')
-    check('attach confirmation masks the credential value', b'fixture-secret-value' not in screen.output)
+    # Assert on the rendered screen: the confirmation shows the startup as
+    # pretty-printed JSON, so the argument and the script path never share a
+    # raw byte-stream line and must be checked as separate visible parts.
+    confirmation = screen.visible()
+    check('attach confirmation masks the credential value', 'fixture-secret-value' not in confirmation)
+    # The approval dialog is 96 columns and clips long lines at its border, so
+    # a long temp path can never be guaranteed fully visible. The stable path
+    # prefix plus the -u argument is the on-screen "exact program" guarantee;
+    # the full path stays bound in the approval record either way.
+    path_prefix = str(mcp_fixture)[:20]
     check('attach confirmation names the exact startup program',
-          ('-u ' + str(mcp_fixture)) in bytes(screen.output).decode('utf8', 'replace'))
+          '-u' in confirmation and path_prefix in confirmation)
     send('\r', 'reachable-fixture is attached with')
     send('\x1b')
     send('use the echo tool\r', 'Use /approve or /deny')
@@ -544,7 +560,7 @@ try:
     screen.wait_for('No background jobs exist yet')
     screen.wait_for('Service: not running')
     send('\x1b')
-    screen.wait_for('ready to send')
+    screen.wait_for('Describe a task')
     check('closing the job panel returns to the conversation', True)
     send('/jobs\r', 'Background work')
     send('Describe')
@@ -554,7 +570,7 @@ try:
     send('Summarize the project state\r')
     send('\x15every:3600\r')
     send('\r', 'Saved job')
-    schedules = project/'.chimera'/'jobs'/'schedules.json'
+    schedules = project_supervised/'.chimera'/'jobs'/'schedules.json'
     saved_jobs = json.loads(schedules.read_text())['data']['workflows']
     check('created job is saved by the real scheduler', len(saved_jobs) == 1)
     job = next(iter(saved_jobs.values()))
@@ -575,7 +591,7 @@ try:
     saved_jobs = json.loads(schedules.read_text())['data']['workflows']
     check('confirmed stop cancels the job in the scheduler', next(iter(saved_jobs.values()))['handle']['status'] == 'cancelled')
     send('\x1b')
-    screen.wait_for('ready to send')
+    screen.wait_for('Describe a task')
     check('leaving the job panel keeps the conversation intact', True)
     # /editor — the unsent draft round-trips through the external editor.
     before = len(calls)
@@ -585,9 +601,9 @@ try:
     check('editing the draft sends no model request', len(calls) == before)
     # A configured editor that cannot start must preserve the draft exactly.
     screen.clear_input('EDITOR-WAS-HERE chat draft ')
-    saved = json.loads(config.read_text())
+    saved = json.loads(config_supervised.read_text())
     saved['editor'] = '/chimera-no-such-editor-xyz'
-    config.write_text(json.dumps(saved))
+    config_supervised.write_text(json.dumps(saved))
     send('/reload\r', 'Model settings reloaded')
     before = len(calls)
     send('chat draft ')

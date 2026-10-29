@@ -41,6 +41,11 @@ pub struct StatusInfo {
     pub run_started: Option<std::time::Instant>,
     /// Name of the tool currently running, if any.
     pub active_tool: Option<String>,
+    pub project: String,
+    pub branch: String,
+    pub queued: usize,
+    pub context_tokens: u64,
+    pub context_window: Option<u64>,
 }
 
 /// Spinner glyphs cycled by the running status label.
@@ -57,6 +62,13 @@ fn elapsed_str(elapsed: std::time::Duration) -> String {
 }
 
 impl StatusInfo {
+    pub fn context_label(&self) -> String {
+        match self.context_window {
+            Some(limit) => format!("ctx ~{}/{}", self.context_tokens, limit),
+            None => format!("ctx ~{}/?", self.context_tokens),
+        }
+    }
+
     /// Cost cannot be inferred without the actual provider's price schedule.
     pub fn est_cost(&self) -> String {
         "cost unavailable".into()
@@ -200,6 +212,15 @@ fn status_line(info: &StatusInfo, styles: &Styles, width: usize) -> Line<'static
         styles.text_subtle(),
     );
     for (text, style) in [
+        (info.context_label(), styles.text_muted()),
+        (
+            if info.queued > 0 {
+                format!("queued {}", info.queued)
+            } else {
+                String::new()
+            },
+            styles.info(),
+        ),
         (format!("tokens: {}", info.token_str()), styles.text_muted()),
         (format!("tools: {}", info.tool_calls), styles.text_muted()),
         (info.est_cost(), styles.text_subtle()),
@@ -306,6 +327,7 @@ mod tests {
             running: true,
             run_started: None,
             active_tool: None,
+            ..Default::default()
         };
         let backend = TestBackend::new(120, 3);
         let mut terminal = Terminal::new(backend).unwrap();

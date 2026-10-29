@@ -299,20 +299,83 @@ impl FileSessionStore {
         self.write_state(&state)
     }
 
-    /// Permanently remove a saved conversation and its file record.
+    /// Remove a conversation from the active list while preserving an exact,
+    /// private archive. The same locks used by writers exclude active runs.
     pub async fn delete(&self, id: SessionId) -> anyhow::Result<()> {
         let _lock = self.lock()?;
-        // An active runner holds this lease; refuse rather than delete mid-run.
         let _run_lease = self.lock_run(id)?;
-        let path = self.session_path(id)?;
-        if !path.exists() {
-            bail!("no saved conversation exists for that id");
-        }
-        std::fs::remove_file(&path)?;
-        // The crash-safe writer keeps a `.previous` copy beside the record;
-        // remove it too so the conversation is really gone.
-        let _ = std::fs::remove_file(PathBuf::from(format!("{}.previous", path.display())));
+        self.read_state(id)?;
+        let source = self.session_path(id)?;
+        let archive = private_dir(&self.storage_dir()?.join("archived"))?;
+        // Persist the archive directory itself before removing any active name.
         sync_dir(&self.storage_dir()?)?;
+        let target = archive.join(format!("{id}.json"));
+        reject_link(&source)?;
+        reject_link(&target)?;
+        // Exclusive creation: neither another archive nor a user file can be
+        // overwritten. Hard links preserve exact bytes on the same filesystem.
+        link_record_or_resume(&source, &target)
+            .context("could not preserve this conversation in its archive; nothing removed")?;
+        // Existing .previous recovery copies stay private and untouched. The
+        // archived current record is the authoritative restore source.
+        sync_dir(&archive)?;
+        std::fs::remove_file(&source)?;
+        sync_dir(&self.storage_dir()?)?;
+        Ok(())
+    }
+
+    /// List archive identifiers without retaining full conversations in memory.
+    pub async fn archived_session_ids(&self) -> anyhow::Result<Vec<SessionId>> {
+        let _lock = self.lock()?;
+        let directory = self.storage_dir()?.join("archived");
+        if !directory.exists() {
+            return Ok(Vec::new());
+        }
+        let directory = private_dir(&directory)?;
+        let mut ids = Vec::new();
+        for entry in std::fs::read_dir(directory)? {
+            let path = entry?.path();
+            if path.extension().and_then(|s| s.to_str()) == Some("json") {
+                if let Some(id) = path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .and_then(|s| Uuid::parse_str(s).ok())
+                {
+                    ids.push(id);
+                }
+            }
+        }
+        Ok(ids)
+    }
+
+    /// Load one archive with the same size, identity and link checks as active records.
+    pub async fn load_archived(&self, id: SessionId) -> anyhow::Result<SessionState> {
+        let _lock = self.lock()?;
+        let directory = private_dir(&self.storage_dir()?.join("archived"))?;
+        let state: SessionState = read_record(&directory.join(format!("{id}.json")))?;
+        anyhow::ensure!(state.id == id, "archived conversation identity mismatch");
+        state.effective_events()?;
+        Ok(state)
+    }
+
+    /// Restore without replacing a conversation that already exists.
+    pub async fn restore_archived(&self, id: SessionId) -> anyhow::Result<()> {
+        let _lock = self.lock()?;
+        let _run_lease = self.lock_run(id)?;
+        let directory = private_dir(&self.storage_dir()?.join("archived"))?;
+        let source = directory.join(format!("{id}.json"));
+        let target = self.session_path(id)?;
+        let state: SessionState = read_record(&source)?;
+        anyhow::ensure!(state.id == id, "archived conversation identity mismatch");
+        state.effective_events()?;
+        reject_link(&source)?;
+        reject_link(&target)?;
+        link_record_or_resume(&source, &target).context(
+            "could not restore the archive; an existing conversation will not be overwritten",
+        )?;
+        sync_dir(&self.storage_dir()?)?;
+        std::fs::remove_file(source)?;
+        sync_dir(&directory)?;
         Ok(())
     }
 
@@ -699,6 +762,29 @@ impl SessionStore for FileSessionStore {
         }
         ids.sort();
         Ok(ids)
+    }
+}
+
+/// Resume a crash-interrupted archive/restore only when both names identify
+/// the exact same record. A distinct destination is always preserved.
+fn link_record_or_resume(source: &Path, target: &Path) -> anyhow::Result<()> {
+    match std::fs::hard_link(source, target) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            reject_link(source)?;
+            reject_link(target)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                let from = std::fs::metadata(source)?;
+                let to = std::fs::metadata(target)?;
+                if from.dev() == to.dev() && from.ino() == to.ino() {
+                    return Ok(());
+                }
+            }
+            Err(error.into())
+        }
+        Err(error) => Err(error.into()),
     }
 }
 

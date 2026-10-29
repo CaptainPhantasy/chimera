@@ -29,7 +29,7 @@ pub fn render(
         area,
     );
 
-    render_header(f, styles, regions[0], objective);
+    render_header(f, styles, regions[0], objective, status_info);
     if log.is_empty() {
         render_welcome(f, styles, regions[1]);
     } else {
@@ -45,7 +45,11 @@ pub fn render(
     if regions[4].height > 0 {
         input.render_suggestions(f, regions[4], styles);
     }
-    render_footer(f, styles, regions[5]);
+    if log.archive_error.is_some() {
+        f.render_widget(Paragraph::new("History storage unavailable: older screen entries may be missing; /sessions retains saved conversation.").style(styles.text_subtle()), regions[5]);
+    } else {
+        render_footer(f, styles, regions[5]);
+    }
 }
 
 /// Header, conversation, status, input, suggestions, and keyboard hint.
@@ -85,12 +89,24 @@ pub(crate) fn message_area(area: Rect, show_suggestions: bool) -> Rect {
     chat_areas(area, show_suggestions)[1]
 }
 
-fn render_header(f: &mut Frame, styles: &Styles, area: Rect, objective: &str) {
+fn render_header(f: &mut Frame, styles: &Styles, area: Rect, objective: &str, info: &StatusInfo) {
     if area.is_empty() {
         return;
     }
     let width = usize::from(area.width);
-    let brand = status::fit_text("◆ CHIMERA", width);
+    let identity = if info.project.is_empty() {
+        "◆ CHIMERA".to_string()
+    } else {
+        format!(
+            "◆ {} [{}]",
+            std::path::Path::new(&info.project)
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy(),
+            info.branch
+        )
+    };
+    let brand = status::fit_text(&identity, width);
     let mut used = brand.width();
     let mut spans = vec![Span::styled(brand, styles.brand())];
     let version = concat!("  v", env!("CARGO_PKG_VERSION"));
@@ -191,9 +207,9 @@ fn render_footer(f: &mut Frame, styles: &Styles, area: Rect) {
     }
     let width = usize::from(area.width);
     let text = [
-        "Enter send · Alt+Enter new line · F1 help · Ctrl+C quit",
-        "Enter send · F1 help · Ctrl+C quit",
-        "F1 help · Ctrl+C quit",
+        "Enter send · Alt+Enter new line · F1 help · Ctrl+C stop · Ctrl+Q quit",
+        "Enter send · F1 help · Ctrl+C stop · Ctrl+Q quit",
+        "F1 help · Ctrl+C stop",
         "F1 help",
     ]
     .into_iter()

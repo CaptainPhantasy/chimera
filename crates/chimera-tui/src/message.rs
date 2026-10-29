@@ -14,7 +14,7 @@ use crate::theme::Styles;
 // ---------------------------------------------------------------------------
 
 /// A single entry in the conversation stream.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum Message {
     /// A user-submitted objective or follow-up.
     User { text: String },
@@ -42,7 +42,7 @@ pub enum Message {
 }
 
 /// Severity/kind for system messages.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum SystemKind {
     Info,
     Success,
@@ -51,6 +51,21 @@ pub enum SystemKind {
 }
 
 impl Message {
+    pub fn plain_text(&self) -> String {
+        match self {
+            Self::User { text } | Self::Assistant { text, .. } | Self::System { text, .. } => {
+                text.clone()
+            }
+            Self::ToolCall {
+                name,
+                arguments,
+                result,
+                ..
+            } => format!("{name}\n{arguments}\n{}", result.as_deref().unwrap_or("")),
+            Self::Divider { label } => label.clone(),
+        }
+    }
+
     /// How many terminal lines this message occupies when rendered at the
     /// given width (approximate — used for scroll math).
     pub fn estimated_lines(&self, width: usize) -> usize {
@@ -125,9 +140,9 @@ impl Message {
                     Span::styled(dur_str, styles.text_subtle()),
                     Span::styled(
                         if *expanded {
-                            " [tab to collapse]"
+                            " [expanded · /tools-view to inspect]"
                         } else {
-                            " [tab to expand]"
+                            " [Tab latest · /tools-view to select]"
                         },
                         styles.text_faint(),
                     ),
@@ -350,6 +365,8 @@ pub struct MessageLog {
     pub messages: VecDeque<Message>,
     /// Maximum messages retained.
     pub capacity: usize,
+    pub archive: Option<crate::history::Archive>,
+    pub archive_error: Option<String>,
     /// Scroll offset from the bottom (0 = pinned to latest).
     pub scroll_offset: usize,
     /// Whether new messages snap the view back to the bottom.
@@ -369,6 +386,8 @@ impl MessageLog {
         Self {
             messages: VecDeque::with_capacity(capacity),
             capacity,
+            archive: None,
+            archive_error: None,
             scroll_offset: 0,
             follow: true,
             width: 80,
@@ -393,6 +412,11 @@ impl MessageLog {
                 .unwrap_or(0)
         };
         if self.messages.len() >= self.capacity {
+            if let (Some(archive), Some(oldest)) = (&mut self.archive, self.messages.front()) {
+                if let Err(error) = archive.append(oldest) {
+                    self.archive_error = Some(error.to_string());
+                }
+            }
             self.messages.pop_front();
         }
         self.messages.push_back(msg);

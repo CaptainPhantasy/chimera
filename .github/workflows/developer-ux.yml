@@ -1,0 +1,45 @@
+name: Developer workspace UX
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: developer-ux-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  macos-developer-workspace:
+    name: macOS build and direct UX acceptance
+    runs-on: macos-latest
+    timeout-minutes: 30
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_BUILD_JOBS: 2
+    steps:
+      - name: Check out the exact revision
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Rust build and static-check components
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+          rustup default stable
+
+      - name: Check terminal source formatting
+        run: cargo fmt --package chimera-tui -- --check
+
+      - name: Build the application developers launch
+        run: cargo build --locked -p chimera-cli
+
+      - name: Reject compiler and static-analysis warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      # Only the owner-authorized direct acceptance cases run. Each ux_NN
+      # test states WHAT it checks, WHY it matters and its visible PASS/FAIL.
+      - name: Verify each developer-facing UX correction directly
+        run: cargo test --locked -p chimera-tui --lib ux_ -- --test-threads=1

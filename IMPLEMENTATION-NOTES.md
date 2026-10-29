@@ -66,3 +66,52 @@ Feature 1 of the ten requested workflow changes: `/connect`, `/setup`, and F2 op
 Verification: 363 workspace tests, 84 targeted config/interface tests, strict targeted Clippy, package formatting, 18 actual-terminal provider checks and 78 existing setup/reload checks passed. These use isolated local services; no paid model or hosted account was called. Rendered terminal output was inspected for masking and layout. Temporary harness observations are retained: differential screen output needed terminal-cell parsing, and the test must drain output while waiting between Escape and the next command.
 
 Evidence: `.floyd/workflow-checks/` and retained workflow reports under the operating-system temporary directory. Final feature verification receipts identify the source and executable.
+
+
+## 2026-10-29: Developer workspace UX — twenty corrections
+
+Scope: the personal macOS developer application. Android toolchains, licensing, distribution agreements and public-release formalities are out of scope. This checkpoint addresses the twenty UI/UX findings; it does not declare the whole application beta-ready.
+
+Each checked item below has one direct acceptance test, named `ux_NN`, that states what is being tested, why a developer needs it and an observable pass/fail result. These tests drive real input/state/rendering and isolated local file/Git fixtures. They do not establish hosted-model reliability or physical keyboard behavior in every terminal. Only these twenty cases were executed for this change; existing broad suites were not run.
+
+| Verified | User-visible result | Direct case |
+| --- | --- | --- |
+| [x] 01 | `/plan` persists for ordinary follow-ups; `/run` explicitly selects execution | `ux_01` |
+| [x] 02 | Ctrl+C requests cancellation while keeping the workspace open | `ux_02` |
+| [x] 03 | Approval shows the actual file change with Deny selected | `ux_03` |
+| [x] 04 | `/diff` reviews staged and unstaged patches and lists untracked files without changing Git | `ux_04` |
+| [x] 05 | Busy-chat follow-ups queue in order, retain PLAN/RUN intent and can return safely to the composer | `ux_05` |
+| [x] 06 | `/jobs` is accessible while foreground chat runs | `ux_06` |
+| [x] 07 | `/tools-view` selects earlier tool results from the current transcript page | `ux_07` |
+| [x] 08 | Full tool inspection scrolls beyond the compact 400-line patch preview | `ux_08` |
+| [x] 09 | Conversation search finds matching conversation output | `ux_09` |
+| [x] 10 | `/load-older` retrieves evicted screen output | `ux_10` |
+| [x] 11 | `/new` starts fresh model context while preserving saved conversation and unsent draft | `ux_11` |
+| [x] 12 | Saved conversations sort by recent activity | `ux_12` |
+| [x] 13 | Session search finds later conversation text beyond the opening preview | `ux_13` |
+| [x] 14 | Keep is the archive confirmation default; archived conversations can be restored | `ux_14` |
+| [x] 15 | Typing `d` in session search searches; Delete is a separate archive action | `ux_15` |
+| [x] 16 | Input history restores the unsent draft and insertion point | `ux_16` |
+| [x] 17 | Up/Down move within multiline drafts before reaching history boundaries | `ux_17` |
+| [x] 18 | Ctrl+A/E/K/U/W edit the current line | `ux_18` |
+| [x] 19 | The header identifies the current project and Git branch | `ux_19` |
+| [x] 20 | Context shows approximate usage and a known limit, or explicitly unknown capacity | `ux_20` |
+
+Ancillary controls were source-reviewed, rather than separately executed: Ctrl+Q exits, `/approve` reopens the pending approval review, Ctrl+F opens search, `/latest` returns to live output and Ctrl+G launches the external editor. The external editor process was not exercised.
+
+Context capacity is a per-chat setting: `/context N` uses a limit supplied by the user; `/context unknown` clears it. Usage is a byte-based estimate, not a tokenizer measurement, and tool schemas/project facts may add context. The interface labels this limitation. Scrollback is private, bounded to 128 MiB per screen; storage failures are visible. Saved sessions remain the durable conversation source. Archiving the currently open session is refused; switch conversations or use `/new` first. Cancellation pauses queued work until explicitly resumed.
+
+Independent Git Steward review found and corrected approval-shortcut bypass, queued mode loss, history loss on archive failure, incorrect historical-page mouse scrolling, current-session archive failure and stale resumed status. No dependency versions changed. A pre-existing unused CLI import was removed so strict workspace compilation succeeds.
+
+Local publication checks passed: exact twenty acceptance cases (20 passed, zero failed), terminal-package formatting, workspace/all-target strict Clippy and the actual CLI application build. Staged Gitleaks scanned 106,183 bytes with no leaks; whitespace and file hygiene checks passed. The first Unicode draft case exposed a test-screen observer error: the observer was corrected to skip wide-glyph continuation cells, retaining the original draft/caret assertion. Its rerun and the final twenty-case run passed.
+
+Commands used (build/static checks do not execute extra test cases):
+
+```sh
+cargo test --locked --offline -p chimera-tui --lib ux_ -j 2 -- --test-threads=1
+cargo fmt --package chimera-tui -- --check
+cargo clippy --workspace --all-targets --locked --offline -j 2 -- -D warnings
+cargo build --locked --offline -p chimera-cli -j 2
+```
+
+Implementation checkpoint: `b6196d82add8c3dd1dc0e6d7836bd5abb61a3715`, branch `feat/developer-workspace-ux`. macOS remote validation: [implementation run](https://github.com/CaptainPhantasy/chimera/actions/runs/40916010011). The [branch workflow history](https://github.com/CaptainPhantasy/chimera/actions/workflows/developer-ux.yml?query=branch%3Afeat%2Fdeveloper-workspace-ux) identifies each subsequent documentation checkpoint by its exact SHA. The workflow runs the same twenty acceptance cases, formatting, strict compilation and application build. A run link alone does not assert success: confirm green on the final pushed revision before treating publication as finished.

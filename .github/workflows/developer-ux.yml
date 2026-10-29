@@ -27,8 +27,9 @@ jobs:
 
       - name: Set up Rust build and static-check components
         run: |
-          rustup toolchain install stable --profile minimal --component rustfmt --component clippy
-          rustup default stable
+          # Match the compiler and Clippy used for the reviewed local receipts.
+          rustup toolchain install 1.98.0 --profile minimal --component rustfmt --component clippy
+          rustup default 1.98.0
 
       - name: Check terminal source formatting
         run: cargo fmt --package chimera-tui -- --check

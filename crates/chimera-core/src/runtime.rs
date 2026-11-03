@@ -107,20 +107,20 @@ impl SavedSession {
     ) -> Result<AgentRunResult> {
         let RunChannels { events, mut cancellation } = channels;
         anyhow::ensure!(!objective.trim().is_empty(), "the request is empty");
-        let _lease = self.store.claim_run(self.id)?;
-        let current = self.store.load(self.id).await?;
+        let store = Arc::new(self.store.for_run(self.id).await?);
+        let current = store.load(self.id).await?;
         if let Some(payload) = current.effective_events()?.iter().rev().find_map(|event| match event {
             SessionEvent::Custom { key, payload } if key == "messages" => Some(payload.clone()),
             _ => None,
         }) { self.messages = serde_json::from_value(payload).context("saved conversation is damaged")?; }
         close_pending_tools(&mut self.messages);
-        self.store.reopen(self.id).await?;
-        self.store.append_event(self.id, SessionEvent::Custom {
+        store.reopen(self.id).await?;
+        store.append_event(self.id, SessionEvent::Custom {
             key: "run_started".into(), payload: json!({"objective": objective, "model": model}),
         }).await?;
         // The relative paths of files this turn edits, for the rewind snapshot.
         let edited = Arc::new(Mutex::new(Vec::new()));
-        let guarded = SavedRouter { inner: tools, events: events.clone(), store: self.store.clone(), session: self.id, root:self.root.clone(), edited: edited.clone() };
+        let guarded = SavedRouter { inner: tools, events: events.clone(), store: store.clone(), session: self.id, root:self.root.clone(), edited: edited.clone() };
         let setup = async {
             Ok::<_, anyhow::Error>((config_with_project_memory(&self.root, config).await?, agent::build_tool_definitions(&guarded).await?))
         }.await;
@@ -128,9 +128,9 @@ impl SavedSession {
             Ok(prepared) => prepared,
             Err(error) => {
                 self.messages.push(Message::user(objective));
-                self.store.append_event(self.id, SessionEvent::Custom {key:"messages".into(),payload:serde_json::to_value(&self.messages)?}).await?;
-                self.store.append_event(self.id, SessionEvent::Custom {key:"run_error".into(),payload:json!({"error":format!("{error:#}")})}).await?;
-                self.store.close(self.id, "failed").await?;
+                store.append_event(self.id, SessionEvent::Custom {key:"messages".into(),payload:serde_json::to_value(&self.messages)?}).await?;
+                store.append_event(self.id, SessionEvent::Custom {key:"run_error".into(),payload:json!({"error":format!("{error:#}")})}).await?;
+                store.close(self.id, "failed").await?;
                 return Err(error);
             }
         };
@@ -141,44 +141,66 @@ impl SavedSession {
         let mut initial = self.messages.clone();
         initial.push(Message::user(objective));
         *latest.lock().unwrap() = initial.clone();
-        self.store.append_event(self.id, SessionEvent::Custom {
+        store.append_event(self.id, SessionEvent::Custom {
             key: "messages".into(), payload: serde_json::to_value(initial)?,
         }).await?;
-        let mut callback = |kind: String, value: Value| {
-            if kind == "messages" {
-                match serde_json::from_value::<Vec<Message>>(value.clone()) {
-                    Ok(messages) => {
-                        *latest.lock().unwrap() = messages;
-                        partial.lock().unwrap().clear();
-                        if let Err(error) = self.store.append_event_sync(self.id, SessionEvent::Custom {
-                            key: "messages".into(), payload: value,
-                        }) {
-                            *failure.lock().unwrap() = Some(format!("could not save progress: {error:#}"));
+        // Serialize progress writes off the executor. A bounded queue stops
+        // generation if storage falls behind instead of growing without limit.
+        let (progress, mut pending_progress) = mpsc::channel::<SessionEvent>(16);
+        let progress_store = store.clone();
+        let progress_session = self.id;
+        let progress_failure = failure.clone();
+        let progress_stop = stop.clone();
+        let mut progress_writer = ProgressWriter(tokio::spawn(async move {
+            while let Some(event) = pending_progress.recv().await {
+                let store = progress_store.clone();
+                // The in-flight write retains the lease even if the enclosing
+                // run is dropped, preventing a later run from overtaking it.
+                let saved = tokio::task::spawn_blocking(move || {
+                    store.append_event_sync(progress_session, event)
+                }).await.context("progress storage task failed").and_then(|result| result);
+                if let Err(error) = saved {
+                    *progress_failure.lock().unwrap() = Some(format!("could not save progress: {error:#}"));
+                    progress_stop.notify_one();
+                    break;
+                }
+            }
+        }));
+        let outcome = {
+            let mut callback = |kind: String, value: Value| {
+                if kind == "messages" {
+                    match serde_json::from_value::<Vec<Message>>(value.clone()) {
+                        Ok(messages) => {
+                            *latest.lock().unwrap() = messages;
+                            partial.lock().unwrap().clear();
+                            if let Err(error) = progress.try_send(SessionEvent::Custom {
+                                key: "messages".into(), payload: value,
+                            }) {
+                                *failure.lock().unwrap() = Some(format!("could not save progress: {error:#}"));
+                                stop.notify_one();
+                            }
+                        }
+                        Err(error) => {
+                            *failure.lock().unwrap() = Some(format!("could not save conversation: {error}"));
                             stop.notify_one();
                         }
                     }
-                    Err(error) => {
-                        *failure.lock().unwrap() = Some(format!("could not save conversation: {error}"));
-                        stop.notify_one();
-                    }
-                }
-                return;
-            }
-            if kind == "text" {
-                let mut text = partial.lock().unwrap();
-                if text.len() + value.as_str().unwrap_or("").len() > 1_048_576 {
-                    *failure.lock().unwrap() = Some("response exceeds the saved-text limit".into());
-                    stop.notify_one();
                     return;
                 }
-                text.push_str(value.as_str().unwrap_or(""));
-            }
-            if events.try_send(RunEvent::Update { kind, value }).is_err() {
-                *failure.lock().unwrap() = Some("the output reader stopped keeping up; partial progress was saved".into());
-                stop.notify_one();
-            }
-        };
-        let outcome = {
+                if kind == "text" {
+                    let mut text = partial.lock().unwrap();
+                    if text.len() + value.as_str().unwrap_or("").len() > 1_048_576 {
+                        *failure.lock().unwrap() = Some("response exceeds the saved-text limit".into());
+                        stop.notify_one();
+                        return;
+                    }
+                    text.push_str(value.as_str().unwrap_or(""));
+                }
+                if events.try_send(RunEvent::Update { kind, value }).is_err() {
+                    *failure.lock().unwrap() = Some("the output reader stopped keeping up; partial progress was saved".into());
+                    stop.notify_one();
+                }
+            };
             let run = agent::run_agent_loop_with_history(provider, &guarded, model, objective,
                 agent::AgentLoopContext { creature_id: self.id, config: &effective_config, available_tools: &definitions }, &self.messages, &mut callback);
             tokio::pin!(run);
@@ -189,20 +211,24 @@ impl SavedSession {
                 result = &mut run => result,
             }
         };
+        // No old progress may land after final messages/outcome or after the
+        // run lease is released. Drain in submission order, including cancel.
+        drop(progress);
+        (&mut progress_writer.0).await.context("progress storage worker failed")?;
         let outcome = if let Some(error) = failure.lock().unwrap().clone() {
             Err(anyhow::anyhow!(error))
         } else { outcome };
         match outcome {
             Ok(result) => {
                 self.messages = result.messages.clone();
-                self.store.append_event(self.id, SessionEvent::Custom {
+                store.append_event(self.id, SessionEvent::Custom {
                     key: "messages".into(), payload: serde_json::to_value(&self.messages)?,
                 }).await?;
-                self.store.append_event(self.id, SessionEvent::Custom {
+                store.append_event(self.id, SessionEvent::Custom {
                     key: "run_result".into(), payload: serde_json::to_value(&result)?,
                 }).await?;
-                checkpoint_edited_files(&self.store, self.id, &edited).await;
-                self.store.close(self.id, match result.done_reason {
+                checkpoint_edited_files(&store, self.id, &edited).await;
+                store.close(self.id, match result.done_reason {
                     agent::DoneReason::FinalAnswer => "completed",
                     agent::DoneReason::MaxIterations => "unfinished",
                     agent::DoneReason::Error => "failed",
@@ -214,18 +240,25 @@ impl SavedSession {
                 close_pending_tools(&mut self.messages);
                 let text = partial.lock().unwrap().clone();
                 if !text.is_empty() { self.messages.push(Message::assistant(text)); }
-                self.store.append_event(self.id, SessionEvent::Custom {
+                store.append_event(self.id, SessionEvent::Custom {
                     key: "messages".into(), payload: serde_json::to_value(&self.messages)?,
                 }).await?;
-                self.store.append_event(self.id, SessionEvent::Custom {
+                store.append_event(self.id, SessionEvent::Custom {
                     key: "run_error".into(), payload: json!({"error":format!("{error:#}")}),
                 }).await?;
-                checkpoint_edited_files(&self.store, self.id, &edited).await;
-                self.store.close(self.id, if *cancellation.borrow() { "cancelled" } else { "failed" }).await?;
+                checkpoint_edited_files(&store, self.id, &edited).await;
+                store.close(self.id, if *cancellation.borrow() { "cancelled" } else { "failed" }).await?;
                 Err(error)
             }
         }
     }
+}
+
+/// Cancelling the enclosing run also stops any queued progress writes.
+/// An already-started blocking write owns a run-lease clone until it finishes.
+struct ProgressWriter(tokio::task::JoinHandle<()>);
+impl Drop for ProgressWriter {
+    fn drop(&mut self) { self.0.abort(); }
 }
 
 struct SavedRouter {

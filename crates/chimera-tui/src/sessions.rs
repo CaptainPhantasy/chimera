@@ -248,7 +248,7 @@ impl Sessions {
                 .clone()
                 .context("The conversation list is not open. Use /sessions.")?;
             FileSessionStore::new(root.clone())
-                .delete(id)
+                .archive(id)
                 .await
                 .map_err(|error| anyhow::anyhow!("Could not archive that conversation. {error}"))?;
             *dialog = Some(self.begin(

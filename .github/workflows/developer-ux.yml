@@ -32,7 +32,7 @@ jobs:
           rustup default 1.98.0
 
       - name: Check terminal source formatting
-        run: cargo fmt --package chimera-tui -- --check
+        run: cargo fmt --package chimera-session --package chimera-tui -- --check
 
       - name: Build the application developers launch
         run: cargo build --locked -p chimera-cli
@@ -44,3 +44,10 @@ jobs:
       # test states WHAT it checks, WHY it matters and its visible PASS/FAIL.
       - name: Verify each developer-facing UX correction directly
         run: cargo test --locked -p chimera-tui --lib ux_ -- --test-threads=1
+
+      # Each issue case states WHAT, WHY and its developer-visible pass/fail result.
+      - name: Verify session deletion and responsive saving directly
+        run: cargo test --locked -p chimera-session --lib issue_ -- --test-threads=1
+
+      - name: Verify external connection cleanup and status directly
+        run: cargo test --locked -p chimera-tui --lib issue_ -- --test-threads=1

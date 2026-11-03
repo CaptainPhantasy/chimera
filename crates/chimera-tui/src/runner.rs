@@ -281,6 +281,7 @@ impl Tui {
             match key.code {
                 KeyCode::Char('c') => {
                     self.queue_paused = true;
+                    self.dialog = None;
                     let _ = self.tx.try_send(TuiEvent::Submit("/cancel".into()));
                     return;
                 }

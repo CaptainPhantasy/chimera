@@ -8,7 +8,8 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
     Frame,
 };
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::sync::Arc;
 
 pub struct Choice {
     pub label: String,
@@ -72,7 +73,7 @@ pub enum Body {
         action: String,
     },
     Text {
-        text: String,
+        text: Arc<str>,
         scroll: usize,
         actions: Vec<Choice>,
         selected: usize,
@@ -80,10 +81,21 @@ pub enum Body {
     Busy,
 }
 pub struct Dialog {
+    identity: uuid::Uuid,
     pub title: String,
     pub note: String,
     pub body: Body,
     text_view: Cell<(usize, usize)>,
+    text_layout: RefCell<TextLayout>,
+}
+
+#[derive(Default)]
+struct TextLayout {
+    source: Option<Arc<str>>,
+    width: usize,
+    lines: Vec<String>,
+    #[cfg(test)]
+    builds: usize,
 }
 #[derive(Debug)]
 pub enum Outcome {
@@ -92,9 +104,14 @@ pub enum Outcome {
     Action(String, Vec<String>),
 }
 impl Dialog {
+    pub(crate) fn identity(&self) -> uuid::Uuid {
+        self.identity
+    }
     pub fn choices(title: &str, note: &str, rows: Vec<Choice>) -> Self {
         Self {
+            identity: uuid::Uuid::new_v4(),
             text_view: Cell::new((10, 0)),
+            text_layout: RefCell::default(),
             title: title.into(),
             note: note.into(),
             body: Body::Choices {
@@ -106,7 +123,9 @@ impl Dialog {
     }
     pub fn form(title: &str, note: &str, fields: Vec<Field>, action: &str) -> Self {
         Self {
+            identity: uuid::Uuid::new_v4(),
             text_view: Cell::new((10, 0)),
+            text_layout: RefCell::default(),
             title: title.into(),
             note: note.into(),
             body: Body::Form {
@@ -118,7 +137,9 @@ impl Dialog {
     }
     pub fn busy(title: &str, note: &str) -> Self {
         Self {
+            identity: uuid::Uuid::new_v4(),
             text_view: Cell::new((10, 0)),
+            text_layout: RefCell::default(),
             title: title.into(),
             note: note.into(),
             body: Body::Busy,
@@ -129,15 +150,17 @@ impl Dialog {
         let text = text.into();
         let limit = text.lines().count().saturating_sub(1);
         Self {
+            identity: uuid::Uuid::new_v4(),
             title: title.into(),
             note: note.into(),
             body: Body::Text {
-                text,
+                text: Arc::from(text),
                 scroll: 0,
                 actions,
                 selected: 0,
             },
             text_view: Cell::new((10, limit)),
+            text_layout: RefCell::default(),
         }
     }
     pub fn paste(&mut self, text: &str) {
@@ -414,13 +437,34 @@ impl Dialog {
                 let regions =
                     Layout::vertical([Constraint::Min(0), Constraint::Length(action_rows)])
                         .split(parts[1]);
-                let lines = wrapped_text(text, regions[0].width as usize);
-                let limit = lines.len().saturating_sub(regions[0].height as usize);
+                let width = regions[0].width as usize;
+                let mut layout = self.text_layout.borrow_mut();
+                if layout.width != width
+                    || !layout
+                        .source
+                        .as_ref()
+                        .is_some_and(|source| Arc::ptr_eq(source, text))
+                {
+                    layout.lines = wrapped_text(text, width);
+                    layout.width = width;
+                    // Keeping the old Arc alive also forces Arc::make_mut to
+                    // allocate on edits, so identity detects same-length changes.
+                    layout.source = Some(Arc::clone(text));
+                    #[cfg(test)]
+                    {
+                        layout.builds += 1;
+                    }
+                }
+                let limit = layout
+                    .lines
+                    .len()
+                    .saturating_sub(regions[0].height as usize);
                 self.text_view
                     .set((regions[0].height.saturating_sub(1) as usize, limit));
                 let offset = (*scroll).min(limit);
-                let visible = lines
-                    .into_iter()
+                let visible = layout
+                    .lines
+                    .iter()
                     .skip(offset)
                     .take(regions[0].height as usize)
                     .map(|line| {
@@ -431,7 +475,7 @@ impl Dialog {
                         } else {
                             p.fg
                         };
-                        Line::styled(line, Style::default().fg(color))
+                        Line::styled(line.as_str(), Style::default().fg(color))
                     })
                     .collect::<Vec<_>>();
                 frame.render_widget(Paragraph::new(visible), regions[0]);
@@ -523,6 +567,73 @@ fn matching<'a>(rows: &'a [Choice], search: &str) -> Vec<&'a Choice> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn reviewfix_04_large_review_redraws_scrolls_and_resizes_without_rewrapping_unchanged_text() {
+        // WHAT: Redraw, scroll and resize a large real review dialog, then
+        // replace its document. WHY: chat ticks must keep large patch review
+        // responsive. PASS/FAIL: visible start/end/content stay correct, normal
+        // redraws and scrolling reuse one layout, and width/document changes
+        // each rebuild once. The counter observes actual rendering work.
+        let document = format!(
+            "FIRST_SENTINEL\n{}\nLAST_SENTINEL",
+            "unchanged patch context\n".repeat(60_000)
+        );
+        let mut dialog = Dialog::text("Review", "", document, Vec::new());
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+        let screen = |terminal: &ratatui::Terminal<ratatui::backend::TestBackend>| {
+            terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>()
+        };
+        terminal
+            .draw(|frame| dialog.render(frame, &Styles::dark()))
+            .unwrap();
+        assert!(screen(&terminal).contains("FIRST_SENTINEL"));
+        for _ in 0..20 {
+            terminal
+                .draw(|frame| dialog.render(frame, &Styles::dark()))
+                .unwrap();
+        }
+        dialog.key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+        terminal
+            .draw(|frame| dialog.render(frame, &Styles::dark()))
+            .unwrap();
+        assert!(
+            screen(&terminal).contains("LAST_SENTINEL") && dialog.text_layout.borrow().builds == 1,
+            "redraw and End must reuse the document layout while displaying the correct patch tail"
+        );
+        let mut narrow =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(45, 25)).unwrap();
+        narrow
+            .draw(|frame| dialog.render(frame, &Styles::dark()))
+            .unwrap();
+        dialog.key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+        narrow
+            .draw(|frame| dialog.render(frame, &Styles::dark()))
+            .unwrap();
+        assert!(
+            screen(&narrow).contains("LAST_SENTINEL") && dialog.text_layout.borrow().builds == 2,
+            "resize must rebuild once and preserve access to the final patch lines"
+        );
+        if let Body::Text { text, .. } = &mut dialog.body {
+            // Same-length in-place edits must invalidate too. The retained
+            // layout Arc makes this copy-on-write rather than stale identity.
+            Arc::make_mut(text).make_ascii_lowercase();
+        }
+        narrow
+            .draw(|frame| dialog.render(frame, &Styles::dark()))
+            .unwrap();
+        assert!(
+            screen(&narrow).contains("last_sentinel") && dialog.text_layout.borrow().builds == 3,
+            "replacing document content must show fresh text, never cached stale text"
+        );
+    }
+
     #[test]
     fn chooser_filters_and_form_masks_secrets() {
         let mut dialog = Dialog::choices(

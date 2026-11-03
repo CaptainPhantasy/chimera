@@ -176,6 +176,8 @@ pub struct Tui {
     queue_paused: bool,
     queue_session: Option<String>,
     queued_in_flight: bool,
+    interrupt_pending: bool,
+    dismiss_helpers_pending: bool,
     history_view: Option<MessageLog>,
     history_page: usize,
     history_cursor: Option<usize>,
@@ -231,6 +233,8 @@ impl Tui {
             queue_paused: false,
             queue_session: None,
             queued_in_flight: false,
+            interrupt_pending: false,
+            dismiss_helpers_pending: false,
             history_view: None,
             history_page: 0,
             history_cursor: None,
@@ -270,7 +274,7 @@ impl Tui {
     }
 
     /// Handle a keyboard event.
-    fn handle_key(&mut self, key: KeyEvent) {
+    pub(crate) fn handle_key(&mut self, key: KeyEvent) {
         // Text and navigation may repeat; release events never perform an action.
         if key.kind == KeyEventKind::Release {
             return;
@@ -281,6 +285,10 @@ impl Tui {
             match key.code {
                 KeyCode::Char('c') => {
                     self.queue_paused = true;
+                    self.cancel_history();
+                    self.dialog = None;
+                    self.interrupt_pending = true;
+                    self.dismiss_helpers_pending = true;
                     let _ = self.tx.try_send(TuiEvent::Submit("/cancel".into()));
                     return;
                 }
@@ -317,6 +325,7 @@ impl Tui {
             match dialog.key(key) {
                 crate::dialog::Outcome::Stay => {}
                 crate::dialog::Outcome::Close => {
+                    self.dismiss_helpers_pending = true;
                     self.cancel_history();
                     self.dialog = None;
                     let _ = self.tx.try_send(TuiEvent::DialogClosed);
@@ -1254,6 +1263,15 @@ async fn run_screen(
     }
     let result: Result<()> = async {
         loop {
+            // Input intent wins over a result that completed during the frame
+            // sleep. Never publish a canceled session/attachment before draining
+            // the queued /cancel or DialogClosed notification.
+            if std::mem::take(&mut tui.interrupt_pending) { cancel.send_replace(true); }
+            if std::mem::take(&mut tui.dismiss_helpers_pending) {
+                connections.cancel(); models.cancel(); sessions.cancel(); rewind.cancel();
+                permissions.cancel(); memory.cancel(); skills.cancel(); external.cancel();
+                jobs.cancel(); review.cancel();
+            }
             connections.poll(&mut tui.dialog).await;
             models.poll(&mut tui.dialog).await;
             poll_sessions(&root, &mut tui, &mut sessions, &mut session).await;

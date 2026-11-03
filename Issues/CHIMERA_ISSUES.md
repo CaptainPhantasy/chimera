@@ -170,3 +170,6 @@ cargo fmt --package chimera-tui -- --check
 cargo clippy --workspace --all-targets --locked --offline -j 2 -- -D warnings
 cargo build --locked --offline -p chimera-cli -j 2
 ```
+
+PR #10 follow-up: Copilot identified a [Ctrl+C/poll ordering race](https://github.com/CaptainPhantasy/chimera/pull/10#discussion_r4454308119) before merge. Interrupt now invalidates the owning dialog and history job synchronously, and helper cancellation is applied before any completed result is polled. Escape also schedules helper cancellation before delivery. The existing R10 case was strengthened with an already-completed session result plus an actual Ctrl+C key event; no eleventh test case was added.
+ The strengthened case initially required a fixture correction: after the first successful open canceled the chooser state, the second open now goes through the real chooser-opening flow. Its unchanged cancellation assertions then passed, and the integrated ten-case run passed again.

@@ -1012,6 +1012,39 @@ mod tests {
             resumed.id, id,
             "PASS only when the preserved work opens after the wait and cancellation"
         );
+        // A completed result must not win a race with Ctrl+C before poll delivery.
+        let mut tui = crate::runner::Tui::new(
+            "ORIGINAL_CONVERSATION".into(),
+            "local".into(),
+            "local".into(),
+        );
+        let original = tui.status.session_id.clone();
+        tui.input.set_buffer("UNSENT_DRAFT");
+        tui.dialog = Some(sessions.open(root.clone()));
+        wait_for_choices(&mut sessions, &mut tui.dialog).await;
+        sessions
+            .action(&format!("sessions:open:{id}"), &mut tui.dialog)
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !sessions
+                .resume_job
+                .as_ref()
+                .is_some_and(|job| job.is_finished())
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("fixture session must finish before cancellation is tested");
+        tui.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(
+            tui.dialog.is_none(),
+            "Ctrl+C must invalidate the owning view synchronously"
+        );
+        assert!(sessions.poll(&mut tui.dialog).await.is_none() && tui.status.session_id == original
+            && tui.objective == "ORIGINAL_CONVERSATION" && tui.input.buffer == "UNSENT_DRAFT",
+            "PASS only when Ctrl+C rejects an already-completed session result before it can replace context or draft");
         std::fs::remove_dir_all(root).unwrap();
     }
 }

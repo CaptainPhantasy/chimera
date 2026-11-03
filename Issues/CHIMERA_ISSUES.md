@@ -139,3 +139,34 @@ cargo build --locked --offline -p chimera-cli -j 2
 ```
 
 The integrated run passed all four cases. After strengthening interrupted-write ownership handling, the same two session cases passed again. Publication requires Git Steward approval and successful macOS CI on the exact pushed revision. CI's test commands are limited to the four issue cases plus the existing twenty direct developer UX cases, each documented with its user-facing purpose; unrelated suites are not executed.
+
+
+## 2026-11-03: Ten follow-up review findings on PR #9
+
+The ten items are Copilot review threads on [PR #9](https://github.com/CaptainPhantasy/chimera/pull/9), rather than new GitHub issue tickets. Implemented on `fix/reviewed-workspace-safety`. Each new `reviewfix_NN` acceptance case states WHAT, WHY and an observable pass/fail condition. The initial `review_` filter accidentally included three older preview tests; all passed, but the filter exceeded the requested scope. It was replaced with the unique `reviewfix_` filter, which selects exactly these ten cases. No broad suite was run.
+
+| Finding | Correction | Direct case | Local result |
+| --- | --- | --- | --- |
+| [R01 FIFO preview](https://github.com/CaptainPhantasy/chimera/pull/9#discussion_r4453974503) | Reject special files before opening; nonblocking/no-follow open and descriptor checks also protect a replacement race. Unsafe previews remain Deny-only. | `reviewfix_01_fifo_preview_refuses_without_waiting_for_a_writer` — real FIFO in a bounded subprocess, actual denial preview. | PASS |
+| [R02 queued conversation](https://github.com/CaptainPhantasy/chimera/pull/9#discussion_r4453974563) | Bind dispatch to its originating session, track the in-flight last item, block context switches and retain mismatched/paused deliveries. | `reviewfix_02_queued_work_keeps_its_original_session_context` — open/restore/new refusal, last-item dispatch gap and mismatched-context retention. | PASS |
+| [R03 effective PLAN](https://github.com/CaptainPhantasy/chimera/pull/9#discussion_r4453974601) | Actual external-start and rewind-confirm paths honor current PLAN plus sticky launch read-only. | `reviewfix_03_plan_and_launch_read_only_guard_mutating_actions` — shared production mutation guards refuse both actions and preserve launch restriction. | PASS |
+| [R04 repeated wrapping](https://github.com/CaptainPhantasy/chimera/pull/9#discussion_r4453974657) | Cache wrapped rows by retained immutable text identity and width; steady redraw renders only the viewport. | `reviewfix_04_large_review_redraws_scrolls_and_resizes_without_rewrapping_unchanged_text` — 60,000-line document, repeated redraw/End, resize and same-length edit. | PASS |
+| [R05 page boundaries](https://github.com/CaptainPhantasy/chimera/pull/9#discussion_r4453974706) | Carry an absolute before-entry cursor; concurrent append cannot shift previously selected page boundaries. | `reviewfix_05_history_cursor_preserves_contiguous_pages_during_append` — original entries appear once, without overlap or gaps after append. | PASS |
+| [R06 clear pending tools](https://github.com/CaptainPhantasy/chimera/pull/9#discussion_r4453974757) | Refuse Clear during a running request; the refusal does not append a notice that could evict the pending card. | `reviewfix_06_clear_during_a_tool_preserves_its_result_card` — real completion update still reaches the visible card after refused Clear. | PASS |
+| [R07 restored completion](https://github.com/CaptainPhantasy/chimera/pull/9#discussion_r4453974807) | Output with unavailable success metadata is explicitly completed/status unknown; known success/failure remain intact. | `reviewfix_07_restored_tool_output_has_an_honest_completed_status` — restores saved assistant/tool messages and renders completed output without a running/success/failure claim. | PASS |
+| [R08 archive reads](https://github.com/CaptainPhantasy/chimera/pull/9#discussion_r4453974874) | Search and paging execute in a serialized blocking worker with polled delivery, cancellation and exact dialog ownership; searches use a start-time snapshot. | `reviewfix_08_archive_reads_leave_the_workspace_responsive` — Escape and subsequent draft editing remain usable; background search/page results are displayed. | PASS |
+| [R09 queued slash text](https://github.com/CaptainPhantasy/chimera/pull/9#discussion_r4453974941) | Already-parsed queued objectives bypass command dispatch and keep their captured mode. | `reviewfix_09_queued_slash_objectives_remain_literal_requests` — slash paths and `/quit` remain literal objectives. | PASS |
+| [R10 session I/O wait](https://github.com/CaptainPhantasy/chimera/pull/9#discussion_r4453974988) | Open, restore, archive and new-conversation storage run as background jobs; stale delivery cannot replace an unrelated dialog. | `reviewfix_10_restore_wait_keeps_escape_responsive_and_can_resume` — archive/restore with a held lock, Escape, successful retry and same-title unrelated-modal preservation. | PASS |
+
+Independent review identified and corrected the in-flight queue gap, foreground archive/new-conversation waits and modal ownership. Dialog ownership uses a private UUID, avoiding allocator-pointer reuse. The existing global interrupt path also cancels pending external connection work, addressing the related Codex comment. Its cancellation call was source-reviewed; no extra standalone case was added. Two other Codex comments duplicate R07/R09.
+
+Limits: a document's first layout/changed-width layout still requires one complete wrapping pass; subsequent idle redraws reuse it. Started read-only blocking reads may finish after cancellation, but they cannot publish stale results and only one reader per screen executes at once. Started session filesystem operations may also finish after cancellation; the preserved session remains available while UI delivery is canceled. Missing historical tool success metadata is explicitly unknown rather than guessed.
+
+Verification: exactly ten new cases passed; terminal formatting, strict workspace/all-target Clippy and CLI application build passed. The FIFO case runs its dangerous operation in a bounded child so a regression cannot hang the check. Existing UX09/UX10/UX11 and archive-restore expectations were updated for polled delivery without adding duplicate cases. CI retains the twenty existing direct UX cases, four prior lifecycle cases and these ten review cases; unrelated suites are not selected.
+
+```sh
+cargo test --locked --offline -p chimera-tui --lib reviewfix_ -j 2 -- --test-threads=1
+cargo fmt --package chimera-tui -- --check
+cargo clippy --workspace --all-targets --locked --offline -j 2 -- -D warnings
+cargo build --locked --offline -p chimera-cli -j 2
+```

@@ -98,6 +98,11 @@ impl Conversation {
     }
 }
 
+enum OperationResult {
+    Opened(SavedSession),
+    Archived,
+}
+
 /// A conversation listing request that runs while the chat screen keeps drawing.
 #[derive(Default)]
 pub struct Sessions {
@@ -105,6 +110,8 @@ pub struct Sessions {
     archived: bool,
     query: String,
     job: Option<tokio::task::JoinHandle<Result<Vec<Conversation>>>>,
+    resume_job: Option<tokio::task::JoinHandle<Result<OperationResult>>>,
+    owned_view: Option<(uuid::Uuid, bool)>,
 }
 
 impl Sessions {
@@ -112,6 +119,42 @@ impl Sessions {
     pub fn open(&mut self, root: PathBuf) -> Dialog {
         self.archived = false;
         self.begin(root, "Loading saved conversations from this project.")
+    }
+
+    /// Start the existing new-conversation flow without blocking terminal input.
+    pub fn create(&mut self, root: PathBuf) -> Dialog {
+        self.cancel();
+        self.root = Some(root.clone());
+        self.resume_job = Some(tokio::spawn(async move {
+            SavedSession::create(root, "Interactive conversation")
+                .await
+                .map(OperationResult::Opened)
+        }));
+        self.own(Dialog::busy(
+            "Creating conversation",
+            "Preparing private conversation storage. Escape returns to chat.",
+        ))
+    }
+
+    fn own(&mut self, dialog: Dialog) -> Dialog {
+        self.owned_view = Some((
+            dialog.identity(),
+            matches!(dialog.body, crate::dialog::Body::Busy),
+        ));
+        dialog
+    }
+
+    fn owns(&self, dialog: &Option<Dialog>) -> bool {
+        match (self.owned_view.as_ref(), dialog.as_ref()) {
+            (Some((identity, busy)), Some(dialog)) if dialog.identity() == *identity => {
+                if *busy {
+                    matches!(dialog.body, crate::dialog::Body::Busy)
+                } else {
+                    matches!(dialog.body, crate::dialog::Body::Choices { .. })
+                }
+            }
+            _ => false,
+        }
     }
 
     fn begin(&mut self, root: PathBuf, note: &str) -> Dialog {
@@ -122,7 +165,7 @@ impl Sessions {
         self.job = Some(tokio::spawn(async move {
             Self::list_matching(root, archived, "").await
         }));
-        Dialog::busy("Switch conversation", note)
+        self.own(Dialog::busy("Switch conversation", note))
     }
 
     /// Every stored conversation, newest first. One unreadable record is
@@ -203,14 +246,17 @@ impl Sessions {
 
     /// Abandon a running listing request. Safe when nothing is running.
     pub fn cancel(&mut self) {
+        if let Some(job) = self.resume_job.take() {
+            job.abort();
+        }
         if let Some(job) = self.job.take() {
             job.abort();
         }
         self.root = None;
+        self.owned_view = None;
     }
 
-    /// Handle one confirmed overlay choice. `Ok(Some(session))` means the
-    /// conversation was resumed and the caller should show it in place.
+    /// Start a confirmed choice without blocking input; poll delivers resumed work.
     pub async fn action(
         &mut self,
         action: &str,
@@ -220,19 +266,32 @@ impl Sessions {
             let root = self.root.clone().context("Open /sessions first.")?;
             self.archived = action == "sessions:archives";
             *dialog = Some(self.begin(root, "Loading conversations."));
-        } else if let Some(id) = action.strip_prefix("sessions:restore:") {
-            let id = uuid::Uuid::parse_str(id)
-                .context("Choose an archived conversation from the list.")?;
-            let root = self.root.clone().context("Open /sessions first.")?;
-            FileSessionStore::new(root.clone())
-                .restore_archived(id)
-                .await?;
-            let resumed = SavedSession::resume(root, id).await.context(
-                "The archived record was restored to the active list, but its conversation could not be opened. Reopen /sessions to inspect it; the restored record is preserved",
+        } else if let Some((id, restore)) = action
+            .strip_prefix("sessions:restore:")
+            .map(|id| (id, true))
+            .or_else(|| action.strip_prefix("sessions:open:").map(|id| (id, false)))
+        {
+            let id = uuid::Uuid::parse_str(id).context(
+                "That conversation could not be identified. Choose it from the list again.",
             )?;
+            let root = self.root.clone().context("Open /sessions first.")?;
             self.cancel();
-            *dialog = None;
-            return Ok(Some(resumed));
+            self.root = Some(root.clone());
+            self.resume_job = Some(tokio::spawn(async move {
+                let store = FileSessionStore::new(root.clone());
+                if restore {
+                    store.restore_archived(id).await?;
+                }
+                SavedSession::resume(root, id).await.context(if restore {
+                    "The record was recovered to the active list, but could not be opened. Reopen /sessions; the recovered record is preserved."
+                } else {
+                    "Could not open that conversation. It may be damaged or from another project."
+                }).map(OperationResult::Opened)
+            }));
+            *dialog = Some(self.own(Dialog::busy(
+                "Opening conversation",
+                "Loading private saved messages. Escape returns to chat. If recovery has started, the preserved record may finish returning to the active list.",
+            )));
         } else if action == "sessions:retry" {
             let root = self
                 .root
@@ -247,18 +306,25 @@ impl Sessions {
                 .root
                 .clone()
                 .context("The conversation list is not open. Use /sessions.")?;
-            FileSessionStore::new(root.clone())
-                .archive(id)
-                .await
-                .map_err(|error| anyhow::anyhow!("Could not archive that conversation. {error}"))?;
-            *dialog = Some(self.begin(
-                root,
-                "Conversation archived. Restore it from Archived conversations.",
-            ));
+            self.cancel();
+            self.root = Some(root.clone());
+            self.archived = false;
+            self.resume_job = Some(tokio::spawn(async move {
+                FileSessionStore::new(root)
+                    .archive(id)
+                    .await
+                    .context("Could not archive that conversation")?;
+                Ok(OperationResult::Archived)
+            }));
+            *dialog = Some(self.own(Dialog::busy(
+                "Archiving conversation",
+                "Preserving this conversation in the private archive. Escape returns to chat; archiving already started may finish safely.",
+            )));
         } else if let Some(id) = action.strip_prefix("sessions:delete:") {
             if let Some(job) = self.job.take() {
                 job.abort();
             }
+            self.owned_view = None;
             let id = uuid::Uuid::parse_str(id).context(
                 "That conversation could not be identified. Choose it from the list again.",
             )?;
@@ -274,28 +340,55 @@ impl Sessions {
                     ),
                 ],
             ));
-        } else if let Some(id) = action.strip_prefix("sessions:open:") {
-            let id = uuid::Uuid::parse_str(id).context(
-                "That conversation could not be identified. Choose it from the list again.",
-            )?;
-            let root = self
-                .root
-                .clone()
-                .context("The conversation list is not open. Use /sessions.")?;
-            let resumed = SavedSession::resume(root, id).await.map_err(|error| {
-                anyhow::anyhow!(
-                    "Could not open that conversation. It may be damaged or from another project. {error}"
-                )
-            })?;
-            self.cancel();
-            *dialog = None;
-            return Ok(Some(resumed));
         }
         Ok(None)
     }
 
-    /// Move a finished listing request into the overlay.
-    pub async fn poll(&mut self, dialog: &mut Option<Dialog>) {
+    /// Deliver a finished resume, or update the overlay after a background listing.
+    pub async fn poll(&mut self, dialog: &mut Option<Dialog>) -> Option<SavedSession> {
+        if (self.resume_job.is_some() || self.job.is_some()) && !self.owns(dialog) {
+            self.cancel();
+            return None;
+        }
+        if let Some(job) = self.resume_job.as_ref() {
+            if !job.is_finished() {
+                return None;
+            }
+            let result = self
+                .resume_job
+                .take()?
+                .await
+                .context("Conversation storage operation stopped")
+                .and_then(|result| result);
+            match result {
+                Ok(OperationResult::Opened(resumed)) => {
+                    self.cancel();
+                    *dialog = None;
+                    return Some(resumed);
+                }
+                Ok(OperationResult::Archived) => {
+                    let root = self.root.clone()?;
+                    *dialog = Some(self.begin(
+                        root,
+                        "Conversation archived. Restore it from Archived conversations.",
+                    ));
+                    return None;
+                }
+                Err(error) => {
+                    let next = Dialog::choices(
+                        "Conversation storage unavailable",
+                        &format!("{error:#}"),
+                        vec![Choice::new(
+                            "Return to conversations",
+                            "The saved record remains preserved",
+                            "sessions:retry",
+                        )],
+                    );
+                    *dialog = Some(self.own(next));
+                    return None;
+                }
+            }
+        }
         let title = if self.archived {
             "Archived conversations"
         } else {
@@ -325,14 +418,13 @@ impl Sessions {
             }
         }
         if !self.job.as_ref().is_some_and(|job| job.is_finished()) {
-            return;
+            return None;
         }
-        let Some(job) = self.job.take() else { return };
-        let result = job.await.unwrap_or_else(|_| {
-            Err(anyhow::anyhow!(
-                "The conversation list stopped loading. Try again."
-            ))
-        });
+        let job = self.job.take()?;
+        let result = job
+            .await
+            .context("The conversation list stopped loading. Try again.")
+            .and_then(|result| result);
         match result {
             Ok(conversations) => {
                 let note = if conversations.is_empty() {
@@ -370,10 +462,10 @@ impl Sessions {
                     rows,
                 );
                 next.paste(&self.query);
-                *dialog = Some(next);
+                *dialog = Some(self.own(next));
             }
             Err(error) => {
-                *dialog = Some(Dialog::choices(
+                let next = Dialog::choices(
                     "Switch conversation",
                     &error.to_string(),
                     vec![Choice::new(
@@ -381,9 +473,11 @@ impl Sessions {
                         "Reload the saved conversation list.",
                         "sessions:retry",
                     )],
-                ));
+                );
+                *dialog = Some(self.own(next));
             }
         }
+        None
     }
 }
 
@@ -442,8 +536,9 @@ mod tests {
 
     async fn wait_for_choices(sessions: &mut Sessions, dialog: &mut Option<Dialog>) {
         for _ in 0..500 {
-            sessions.poll(dialog).await;
+            let _ = sessions.poll(dialog).await;
             if sessions.job.is_none()
+                && sessions.resume_job.is_none()
                 && matches!(dialog.as_ref().map(|d| &d.body), Some(Body::Choices { .. }))
             {
                 return;
@@ -451,6 +546,19 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
         panic!("the conversation listing never finished");
+    }
+
+    async fn wait_for_resume(sessions: &mut Sessions, dialog: &mut Option<Dialog>) -> SavedSession {
+        for _ in 0..500 {
+            if let Some(resumed) = sessions.poll(dialog).await {
+                return resumed;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        panic!(
+            "the conversation never resumed: {:?}",
+            dialog.as_ref().map(|d| &d.note)
+        );
     }
 
     #[test]
@@ -558,15 +666,21 @@ mod tests {
         assert!(error.to_string().contains("could not be identified"));
         assert!(dialog.is_some());
         let unknown = uuid::Uuid::new_v4();
-        let error = match sessions
+        sessions
             .action(&format!("sessions:open:{unknown}"), &mut dialog)
             .await
-        {
-            Err(error) => error,
-            Ok(_) => panic!("an unknown session must be refused"),
-        };
-        assert!(error
-            .to_string()
+            .unwrap();
+        for _ in 0..500 {
+            let _ = sessions.poll(&mut dialog).await;
+            if sessions.resume_job.is_none() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(dialog
+            .as_ref()
+            .unwrap()
+            .note
             .contains("Could not open that conversation"));
         assert!(dialog.is_some());
         let _ = std::fs::remove_dir_all(&root);
@@ -583,7 +697,7 @@ mod tests {
         assert!(sessions.job.is_none());
         assert!(sessions.root.is_none());
         let mut dialog = None;
-        sessions.poll(&mut dialog).await;
+        let _ = sessions.poll(&mut dialog).await;
         assert!(dialog.is_none());
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -744,6 +858,7 @@ mod tests {
             _ => panic!("Archive must be explicitly selected"),
         };
         sessions.action(&archive, &mut dialog).await.unwrap();
+        wait_for_choices(&mut sessions, &mut dialog).await;
         assert_eq!(
             std::fs::read(
                 root.join(".chimera/sessions/archived")
@@ -765,11 +880,8 @@ mod tests {
             Outcome::Action(action, _) => action,
             _ => panic!("Archived work must be selectable"),
         };
-        let restored = sessions
-            .action(&restore, &mut dialog)
-            .await
-            .unwrap()
-            .unwrap();
+        sessions.action(&restore, &mut dialog).await.unwrap();
+        let restored = wait_for_resume(&mut sessions, &mut dialog).await;
         assert_eq!(
             restored.messages[0].content.as_deref(),
             Some("Original engineering decision"),
@@ -803,5 +915,103 @@ mod tests {
             Outcome::Action(action, _) if action == format!("sessions:open:{id}")),
             "PASS only when ordinary search text opens the matching conversation"
         );
+    }
+    /// WHAT: archiving and opening archived work leave Escape responsive during storage waits,
+    /// and a later restore still opens the exact preserved conversation.
+    /// WHY: disk contention must never trap the engineer inside a frozen chooser.
+    #[tokio::test(flavor = "current_thread")]
+    async fn reviewfix_10_restore_wait_keeps_escape_responsive_and_can_resume() {
+        let root = temp_root();
+        let id = seed(&root, "Restore without freezing", chrono::Utc::now()).await;
+        let store = FileSessionStore::new(root.clone());
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(root.join(".chimera/sessions/.lock"))
+            .unwrap();
+        lock.lock().unwrap();
+        let mut sessions = Sessions::default();
+        sessions.root = Some(root.clone());
+        let mut dialog = None;
+        tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            sessions.action(&format!("sessions:delete-confirm:{id}"), &mut dialog),
+        )
+        .await
+        .expect("FAIL: archiving blocked keyboard handling behind storage")
+        .unwrap();
+        tokio::task::yield_now().await;
+        assert!(sessions.poll(&mut dialog).await.is_none());
+        assert!(
+            matches!(
+                dialog
+                    .as_mut()
+                    .unwrap()
+                    .key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+                Outcome::Close
+            ),
+            "PASS only when archive leaves Escape responsive while storage is locked"
+        );
+        drop(lock);
+        wait_for_choices(&mut sessions, &mut dialog).await;
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(root.join(".chimera/sessions/.lock"))
+            .unwrap();
+        lock.lock().unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            sessions.action(&format!("sessions:restore:{id}"), &mut dialog),
+        )
+        .await
+        .expect("FAIL: choosing restore blocked keyboard handling behind storage")
+        .unwrap();
+        tokio::task::yield_now().await;
+        assert!(sessions.poll(&mut dialog).await.is_none());
+        assert!(matches!(dialog.as_ref().map(|d| &d.body), Some(Body::Busy)));
+        assert!(
+            matches!(
+                dialog
+                    .as_mut()
+                    .unwrap()
+                    .key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+                Outcome::Close
+            ),
+            "PASS only when Escape is handled while the storage lock is still held"
+        );
+        dialog = Some(Dialog::choices(
+            "Unrelated settings",
+            "Leave this modal alone",
+            Vec::new(),
+        ));
+        assert!(sessions.poll(&mut dialog).await.is_none());
+        assert!(sessions.resume_job.is_none());
+        assert_eq!(
+            dialog.as_ref().unwrap().title,
+            "Unrelated settings",
+            "cancelled completion must not replace another modal"
+        );
+        drop(lock);
+        // A blocking restore may already have started before Escape. Both outcomes
+        // preserve the same record: wait for its active name or start it again.
+        if !root
+            .join(".chimera/sessions")
+            .join(format!("{id}.json"))
+            .exists()
+        {
+            let _ = store.restore_archived(id).await;
+        }
+        sessions.root = Some(root.clone());
+        sessions
+            .action(&format!("sessions:open:{id}"), &mut dialog)
+            .await
+            .unwrap();
+        let resumed = wait_for_resume(&mut sessions, &mut dialog).await;
+        assert_eq!(
+            resumed.id, id,
+            "PASS only when the preserved work opens after the wait and cancellation"
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

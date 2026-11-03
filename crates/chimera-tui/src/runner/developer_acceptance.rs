@@ -16,6 +16,16 @@ fn text(tui: &Tui) -> String {
         .map(|cell| cell.symbol())
         .collect()
 }
+async fn finish_history(tui: &mut Tui) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while tui.history_job.is_some() {
+            tui.poll_history().await;
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("history read must finish");
+}
 fn key(code: KeyCode) -> KeyEvent {
     KeyEvent::new(code, KeyModifiers::NONE)
 }
@@ -144,14 +154,15 @@ fn ux_08_full_patch_inspection_reaches_the_last_line() {
 
 /// WHAT: transcript search finds an earlier diagnostic by its literal text.
 /// WHY: developers must find previous errors without manually scrolling.
-#[test]
-fn ux_09_search_displays_the_matching_diagnostic() {
+#[tokio::test]
+async fn ux_09_search_displays_the_matching_diagnostic() {
     let mut tui = screen();
     tui.log.push(Message::Assistant {
         text: "Build failed: missing_symbol_42".into(),
         streaming: false,
     });
     tui.search("missing_symbol_42").unwrap();
+    finish_history(&mut tui).await;
     assert!(
         text(&tui).contains("Build failed: missing_symbol_42"),
         "PASS only when search displays the actual matching diagnostic"
@@ -160,8 +171,8 @@ fn ux_09_search_displays_the_matching_diagnostic() {
 
 /// WHAT: output evicted from the live 100-message window is available in an older page.
 /// WHY: tool-heavy development must not silently lose inspectable scrollback.
-#[test]
-fn ux_10_older_output_remains_readable_after_live_window_eviction() {
+#[tokio::test]
+async fn ux_10_older_output_remains_readable_after_live_window_eviction() {
     let mut tui = screen();
     tui.attach_scrollback(&root());
     for i in 0..150 {
@@ -170,6 +181,7 @@ fn ux_10_older_output_remains_readable_after_live_window_eviction() {
         });
     }
     tui.load_older().unwrap();
+    finish_history(&mut tui).await;
     assert!(
         text(&tui).contains("HISTORY_ENTRY_000"),
         "PASS only when the first evicted entry is visible after loading older output"
@@ -199,11 +211,18 @@ async fn ux_11_new_conversation_is_fresh_without_losing_previous_work() {
     let mut tui = screen();
     tui.input.set_buffer("My unsent draft");
     let mut session = Some(old);
-    new_conversation(&root, &mut tui, &mut session)
-        .await
-        .unwrap();
+    let mut sessions = crate::sessions::Sessions::default();
+    assert!(new_conversation(&root, &mut tui, &mut sessions));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while session.as_ref().unwrap().id == old_id {
+            poll_sessions(&root, &mut tui, &mut sessions, &mut session).await;
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("new conversation should load in the background");
     let fresh = session.as_ref().unwrap();
-    assert!(fresh.id!=old_id && fresh.messages.is_empty() && tui.input.text()=="My unsent draft" && !SavedSession::resume(root,old_id).await.unwrap().messages.is_empty() && text(&tui).contains("New conversation"), "PASS only when new context is empty while the old task and unsent draft remain recoverable");
+    assert!(fresh.id!=old_id && fresh.messages.is_empty() && tui.input.text()=="My unsent draft" && !SavedSession::resume(root,old_id).await.unwrap().messages.is_empty() && text(&tui).contains("Conversation opened"), "PASS only when new context is empty while the old task and unsent draft remain recoverable");
 }
 
 /// WHAT: the header identifies the real project and checked-out branch.

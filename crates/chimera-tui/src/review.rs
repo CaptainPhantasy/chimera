@@ -133,10 +133,19 @@ fn safe_path(root: &Path, value: &str) -> Result<PathBuf> {
         );
         checked.push(part);
         match std::fs::symlink_metadata(&checked) {
-            Ok(meta) => anyhow::ensure!(
-                !meta.file_type().is_symlink(),
-                "symbolic links cannot be previewed"
-            ),
+            Ok(meta) => {
+                anyhow::ensure!(
+                    !meta.file_type().is_symlink(),
+                    "symbolic links cannot be previewed"
+                );
+                anyhow::ensure!(
+                    meta.is_file() || meta.is_dir(),
+                    "special files cannot be previewed; choose a regular file"
+                );
+                if checked == candidate {
+                    anyhow::ensure!(meta.is_file(), "path is not a regular file");
+                }
+            }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
         }
@@ -151,9 +160,9 @@ fn read_text(path: &Path) -> Result<String> {
     {
         use std::os::unix::fs::OpenOptionsExt;
         #[cfg(target_os = "macos")]
-        options.custom_flags(0x100); // O_NOFOLLOW
+        options.custom_flags(0x100 | 0x4); // O_NOFOLLOW | O_NONBLOCK
         #[cfg(not(target_os = "macos"))]
-        options.custom_flags(0x20000);
+        options.custom_flags(0x20000 | 0x800); // O_NOFOLLOW | O_NONBLOCK (Linux)
     }
     let file = options
         .open(path)
@@ -422,6 +431,84 @@ mod tests {
         let root = std::env::temp_dir().join(format!("chimera-review-{}", Uuid::new_v4()));
         std::fs::create_dir(&root).unwrap();
         root
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reviewfix_01_fifo_preview_refuses_without_waiting_for_a_writer() {
+        // WHAT: Preview a real FIFO with no writer. WHY: an approval overlay
+        // must never freeze chat on a special file. PASS/FAIL: within the
+        // parent's deadline the actual overlay explains refusal, offers Deny
+        // only, and the nonblocking read also rejects a FIFO raced into place.
+        const FIXTURE: &str = "CHIMERA_REVIEW_FIFO_FIXTURE";
+        if let Some(root) = std::env::var_os(FIXTURE) {
+            let root = PathBuf::from(root);
+            let id = Uuid::new_v4();
+            let call = ToolCall {
+                tool: "write_file".into(),
+                args: serde_json::json!({"path":"pipe","content":"replacement"}),
+                world: None,
+                requested_by: Uuid::new_v4(),
+            };
+            let mut dialog = approval(&root, &call, id);
+            let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+            terminal
+                .draw(|frame| dialog.render(frame, &Styles::dark()))
+                .unwrap();
+            let screen: String = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect();
+            let deny_only = matches!(&dialog.body, Body::Text { actions, .. } if actions.len() == 1 && actions[0].action == format!("approval:deny:{id}"));
+            assert!(
+                screen.contains("special files")
+                    && deny_only
+                    && matches!(dialog.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)), Outcome::Action(action, _) if action == format!("approval:deny:{id}"))
+                    && read_text(&root.join("pipe"))
+                        .unwrap_err()
+                        .to_string()
+                        .contains("regular file"),
+                "the developer must receive a responsive Deny-only refusal: {screen}"
+            );
+            return;
+        }
+        let root = temp_root();
+        assert!(std::process::Command::new("mkfifo")
+            .arg(root.join("pipe"))
+            .status()
+            .unwrap()
+            .success());
+        // A separate process is essential: a timeout around a blocked OS open
+        // cannot interrupt it. Kill and reap the child on regression instead.
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "review::tests::reviewfix_01_fifo_preview_refuses_without_waiting_for_a_writer",
+                "--nocapture",
+            ])
+            .env(FIXTURE, &root)
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let outcome = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break Some(status);
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        let _ = std::fs::remove_dir_all(root);
+        assert!(
+            outcome.is_some_and(|status| status.success()),
+            "FIFO approval must refuse promptly rather than waiting for a writer"
+        );
     }
 
     #[test]

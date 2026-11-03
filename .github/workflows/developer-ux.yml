@@ -51,3 +51,7 @@ jobs:
 
       - name: Verify external connection cleanup and status directly
         run: cargo test --locked -p chimera-tui --lib issue_ -- --test-threads=1
+
+      # Only the ten named PR-review scenarios; do not match unrelated preview tests.
+      - name: Verify the ten reviewed workspace safety scenarios directly
+        run: cargo test --locked -p chimera-tui --lib reviewfix_ -- --test-threads=1

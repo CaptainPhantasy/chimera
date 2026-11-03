@@ -125,6 +125,7 @@ impl Message {
                 let icon = match ok {
                     Some(true) => "✓",
                     Some(false) => "✗",
+                    None if result.is_some() => "•",
                     None => "⟳",
                 };
                 let status_style = match ok {
@@ -137,6 +138,14 @@ impl Message {
                 let header = Line::from(vec![
                     Span::styled(format!("  {icon} ",), status_style),
                     Span::styled(name.clone(), styles.info()),
+                    Span::styled(
+                        if ok.is_none() && result.is_some() {
+                            " [completed · status unknown]"
+                        } else {
+                            ""
+                        },
+                        styles.text_subtle(),
+                    ),
                     Span::styled(dur_str, styles.text_subtle()),
                     Span::styled(
                         if *expanded {

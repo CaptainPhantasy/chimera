@@ -65,6 +65,7 @@ pub struct External {
     pending_attach: Option<PendingAttach>,
     attached: Option<Arc<ExternalTools>>,
     attached_names: Vec<String>,
+    cleanup_pending: bool,
     job: Option<tokio::task::JoinHandle<Result<Step>>>,
     kind: Option<Kind>,
 }
@@ -100,6 +101,9 @@ impl External {
     }
 
     fn status_text(&self, server: &McpServer) -> String {
+        if self.cleanup_pending && self.attached_names.contains(&server.name) {
+            return "unavailable — cleanup failed; choose Detach external tools to retry".into();
+        }
         if let Some(status) = self.status.get(&server.name) {
             return status.clone();
         }
@@ -119,7 +123,7 @@ impl External {
     fn menu(&self, note: &str) -> Dialog {
         let mut rows = Vec::new();
         for server in &self.servers {
-            let label = if self.attached_names.contains(&server.name) {
+            let label = if self.attached_names.contains(&server.name) && !self.cleanup_pending {
                 format!("{} — attached", server.name)
             } else {
                 server.name.clone()
@@ -252,12 +256,22 @@ impl External {
                 client.ping(&server.name).await?,
                 "the server answered an invalid protocol response"
             );
-            client.shutdown().await
+            Ok(())
         }
         .await;
-        match answered {
-            Ok(()) => Ok(Step::Checked { server }),
-            Err(error) => Err(error),
+        // Ping validation can fail after a successful transport request, leaving
+        // a live connection. Always close it, including failed/timed-out checks.
+        let stopped = client.shutdown().await;
+        match (answered, stopped) {
+            (Ok(()), Ok(())) => Ok(Step::Checked { server }),
+            (Err(error), Ok(())) => Err(error),
+            (Ok(()), Err(error)) => Err(error).context("The check answered, but cleanup failed"),
+            (Err(error), Err(cleanup)) => {
+                let message = format!(
+                    "Check failed: {error:#}. Its server could not be stopped cleanly: {cleanup:#}"
+                );
+                Err(error).context(message)
+            }
         }
     }
 
@@ -305,18 +319,37 @@ impl External {
 
     /// The tools attached to this chat, used by the request path.
     pub fn attached(&self) -> Option<Arc<ExternalTools>> {
-        self.attached.clone()
+        if self.cleanup_pending {
+            None
+        } else {
+            self.attached.clone()
+        }
     }
 
     /// Stop attached external servers; used when the chat screen exits.
     pub async fn shutdown(&mut self) {
         self.cancel();
-        if let Some(attached) = self.attached.take() {
+        if let Err(error) = self.detach().await {
+            tracing::error!("could not stop an attached external server cleanly: {error:#}");
+        }
+    }
+
+    /// Keep ownership on cleanup failure so the user can retry stopping the
+    /// processes. Shutdown disables the tools even when process cleanup fails.
+    async fn detach(&mut self) -> Result<()> {
+        if let Some(attached) = self.attached.as_ref() {
             if let Err(error) = attached.shutdown().await {
-                tracing::error!("could not stop an attached external server cleanly: {error:#}");
+                self.cleanup_pending = true;
+                return Err(error).context("Could not stop the external servers cleanly");
             }
         }
-        self.attached_names.clear();
+        self.attached = None;
+        self.cleanup_pending = false;
+        for name in self.attached_names.drain(..) {
+            self.status
+                .insert(name, "detached — stopped; Enter to check again".into());
+        }
+        Ok(())
     }
 
     /// Handle one confirmed overlay choice. `Ok(Some(message))` is a success
@@ -465,13 +498,12 @@ impl External {
                 "Starting the server and listing its tools. Tool calls will still require approval in chat.",
             ));
         } else if action == "external:detach" {
-            let attached = self.attached.take();
-            if let Some(attached) = attached {
-                attached.shutdown().await.map_err(|error| {
-                    anyhow::anyhow!("Could not stop the external servers cleanly: {error:#}")
-                })?;
+            if let Err(error) = self.detach().await {
+                *dialog = Some(self.menu(&format!(
+                    "{error:#}. Tools are unavailable; retry Detach to finish cleanup."
+                )));
+                return Err(error);
             }
-            self.attached_names.clear();
             *dialog = Some(self.menu(
                 "External tools detached; their processes were stopped and the tools left this chat.",
             ));
@@ -679,6 +711,149 @@ for line in sys.stdin:
             args: vec!["-u".into(), script.to_string_lossy().into()],
             env: HashMap::from([("FIXTURE_KEY".into(), "fixture-secret-value".into())]),
         }
+    }
+
+    /// Track the exact child used by these acceptance cases, without changing
+    /// the host environment or relying on a process-name search.
+    fn tracked_fixture(root: &Path, name: &str, mode: &str) -> McpServer {
+        let mut server = fixture_server(root, name);
+        let script = FIXTURE
+            .replace("import json, sys", "import json, os, sys, time\nwith open(os.environ['FIXTURE_PID'], 'w') as pid_file:\n    pid_file.write(str(os.getpid()))")
+            .replace("elif method == 'ping':\n        result = {}", "elif method == 'ping':\n        if os.environ['FIXTURE_MODE'] == 'timeout':\n            time.sleep(60)\n        result = [] if os.environ['FIXTURE_MODE'] == 'invalid' else {}");
+        let path = root.join(format!("{name}.py"));
+        std::fs::write(&path, script).unwrap();
+        server.args = vec!["-u".into(), path.to_string_lossy().into()];
+        server.env.insert("FIXTURE_MODE".into(), mode.into());
+        server.env.insert(
+            "FIXTURE_PID".into(),
+            root.join(format!("{name}.pid")).to_string_lossy().into(),
+        );
+        server
+    }
+
+    /// Observe whether the actual child was reaped. If a regression leaks it,
+    /// clean up before reporting failure so a failing test leaves no server.
+    fn child_was_stopped(root: &Path, name: &str) -> bool {
+        let pid = std::fs::read_to_string(root.join(format!("{name}.pid"))).unwrap();
+        let stopped = !std::process::Command::new("kill")
+            .args(["-0", pid.trim()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap()
+            .success();
+        if !stopped {
+            let _ = std::process::Command::new("kill")
+                .args(["-KILL", pid.trim()])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+        }
+        stopped
+    }
+
+    #[tokio::test]
+    async fn issue_07_failed_connection_checks_stop_the_actual_server_and_show_the_error() {
+        // WHAT: Check a real stdio server with an invalid ping and a timed-out
+        // ping. WHY: a failed connection check must not leave background
+        // programs running. PASS/FAIL: the menu reports the real failure and
+        // each recorded child PID is gone when that check finishes.
+        let root = temp_root();
+        std::fs::create_dir(&root).unwrap();
+        for (mode, expected) in [("invalid", "invalid result"), ("timeout", "timed out")] {
+            let name = format!("check-{mode}");
+            let server = tracked_fixture(&root, &name, mode);
+            let mut external = External::default();
+            external.servers = vec![server];
+            let mut dialog = Some(external.menu(MENU_NOTE));
+            external
+                .action(
+                    &format!("external:check:{name}"),
+                    &[],
+                    &root,
+                    false,
+                    &mut dialog,
+                )
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(15), async {
+                while external.job.is_some() {
+                    external.poll(&mut dialog).await;
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("the check must finish with an honest failure");
+            let stopped = child_was_stopped(&root, &name);
+            let view = dialog.as_ref().unwrap();
+            assert!(stopped && note(view).contains(expected)
+                && rows(view).iter().any(|(label, detail, _)| label == &name && detail.contains("failed")),
+                "failed check must show {expected:?} and stop its child; stopped={stopped}, note={}", note(view));
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn issue_08_detach_shows_stopped_connection_in_the_actual_menu() {
+        // WHAT: Attach a real server, then choose Detach in the connection
+        // menu. WHY: a developer must be able to trust which tools are live.
+        // PASS/FAIL: the returned menu visibly says detached/stopped, offers no
+        // Detach action, tools leave the chat, and the recorded child is gone.
+        let root = temp_root();
+        std::fs::create_dir(&root).unwrap();
+        let mut external = External::default();
+        external.servers = vec![tracked_fixture(&root, "fixture", "normal")];
+        let mut dialog = Some(external.menu(MENU_NOTE));
+        external
+            .action("external:attach:fixture", &[], &root, false, &mut dialog)
+            .await
+            .unwrap();
+        external
+            .action(
+                "external:attach-confirm:fixture",
+                &[],
+                &root,
+                false,
+                &mut dialog,
+            )
+            .await
+            .unwrap();
+        wait_for_menu(&mut external, &mut dialog).await;
+        assert!(rows(dialog.as_ref().unwrap())
+            .iter()
+            .any(|(label, detail, _)| label == "fixture — attached"
+                && detail.starts_with("attached")));
+        external
+            .action("external:detach", &[], &root, false, &mut dialog)
+            .await
+            .unwrap();
+        let stopped = child_was_stopped(&root, "fixture");
+        let view = dialog.as_ref().unwrap();
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 32)).unwrap();
+        terminal
+            .draw(|frame| view.render(frame, &crate::theme::Styles::dark()))
+            .unwrap();
+        let screen = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(
+            stopped
+                && external.attached().is_none()
+                && screen.contains("detached")
+                && screen.contains("stopped")
+                && !rows(view)
+                    .iter()
+                    .any(|(label, detail, action)| label.contains("attached")
+                        || detail.starts_with("attached")
+                        || action == "external:detach"),
+            "detach must remove live tools and show the stopped state: {screen}"
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 
     fn unreachable_server(name: &str) -> McpServer {

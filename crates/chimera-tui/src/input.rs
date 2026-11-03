@@ -6,6 +6,8 @@
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
 use ratatui::layout::Rect;
 use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
@@ -39,6 +41,10 @@ pub struct InputBar {
     pub suggestion_sel: Option<usize>,
     /// File the history persists to (one escaped entry per line; None = memory only).
     pub history_path: Option<PathBuf>,
+    /// The unsent composition and insertion point saved while browsing history.
+    history_draft: Option<(String, usize)>,
+    /// Desired terminal-cell column retained across short intervening lines.
+    vertical_column: Option<usize>,
 }
 
 /// Maximum history entries kept in memory and loaded from disk.
@@ -62,6 +68,8 @@ impl InputBar {
             suggestion_commands: Vec::new(),
             suggestion_sel: None,
             history_path: None,
+            history_draft: None,
+            vertical_column: None,
         }
     }
 
@@ -103,6 +111,9 @@ impl InputBar {
     pub fn set_buffer(&mut self, text: &str) {
         self.buffer = text.to_string();
         self.cursor = self.buffer.len();
+        self.history_pos = None;
+        self.history_draft = None;
+        self.vertical_column = None;
         self.update_suggestions();
     }
 
@@ -151,11 +162,13 @@ impl InputBar {
         }
         self.buffer.insert(self.cursor, c);
         self.cursor += c.len_utf8();
+        self.vertical_column = None;
         self.update_suggestions();
     }
 
     /// Delete the character before the cursor (backspace).
     pub fn backspace(&mut self) {
+        self.vertical_column = None;
         if let Some(prev) = self.buffer[..self.cursor].chars().next_back() {
             let char_start = self.cursor - prev.len_utf8();
             self.buffer.replace_range(char_start..self.cursor, "");
@@ -166,6 +179,7 @@ impl InputBar {
 
     /// Delete the character at the cursor (delete).
     pub fn delete_char(&mut self) {
+        self.vertical_column = None;
         if let Some(next) = self.buffer[self.cursor..].chars().next() {
             let end = self.cursor + next.len_utf8();
             self.buffer.replace_range(self.cursor..end, "");
@@ -175,6 +189,7 @@ impl InputBar {
 
     /// Move cursor left one char.
     pub fn cursor_left(&mut self) {
+        self.vertical_column = None;
         if let Some(prev) = self.buffer[..self.cursor].chars().next_back() {
             self.cursor -= prev.len_utf8();
         }
@@ -182,6 +197,7 @@ impl InputBar {
 
     /// Move cursor right one char.
     pub fn cursor_right(&mut self) {
+        self.vertical_column = None;
         if let Some(next) = self.buffer[self.cursor..].chars().next() {
             self.cursor += next.len_utf8();
         }
@@ -190,15 +206,18 @@ impl InputBar {
     /// Move cursor to start.
     pub fn cursor_home(&mut self) {
         self.cursor = 0;
+        self.vertical_column = None;
     }
 
     /// Move cursor to end.
     pub fn cursor_end(&mut self) {
         self.cursor = self.buffer.len();
+        self.vertical_column = None;
     }
 
     /// Move one word left.
     pub fn cursor_word_left(&mut self) {
+        self.vertical_column = None;
         let mut pos = self.cursor;
         let bytes = self.buffer.as_bytes();
         // Skip trailing whitespace.
@@ -214,6 +233,7 @@ impl InputBar {
 
     /// Move one word right.
     pub fn cursor_word_right(&mut self) {
+        self.vertical_column = None;
         let mut pos = self.cursor;
         let bytes = self.buffer.as_bytes();
         // Skip word chars.
@@ -227,11 +247,143 @@ impl InputBar {
         self.cursor = pos;
     }
 
+    /// Move within the multiline draft, retaining the desired display column.
+    /// False means the first logical row was reached; the caller may browse history.
+    pub fn cursor_up(&mut self) -> bool {
+        let start = self.line_start();
+        if start == 0 {
+            return false;
+        }
+        let column = self
+            .vertical_column
+            .unwrap_or_else(|| self.cursor_display_offset());
+        let end = start - 1;
+        let previous = self.buffer[..end].rfind('\n').map_or(0, |i| i + 1);
+        self.cursor = self.column_position(previous, end, column);
+        self.vertical_column = Some(column);
+        true
+    }
+
+    /// Move within the multiline draft. False means the last logical row was reached.
+    pub fn cursor_down(&mut self) -> bool {
+        let end = self.line_end();
+        if end == self.buffer.len() {
+            return false;
+        }
+        let column = self
+            .vertical_column
+            .unwrap_or_else(|| self.cursor_display_offset());
+        let next = end + 1;
+        let next_end = self.buffer[next..]
+            .find('\n')
+            .map_or(self.buffer.len(), |i| next + i);
+        self.cursor = self.column_position(next, next_end, column);
+        self.vertical_column = Some(column);
+        true
+    }
+
+    fn line_start(&self) -> usize {
+        self.buffer[..self.cursor].rfind('\n').map_or(0, |i| i + 1)
+    }
+
+    fn line_end(&self) -> usize {
+        self.buffer[self.cursor..]
+            .find('\n')
+            .map_or(self.buffer.len(), |i| self.cursor + i)
+    }
+
+    fn column_position(&self, start: usize, end: usize, column: usize) -> usize {
+        let mut cells = 0;
+        let mut position = start;
+        for (offset, character) in self.buffer[start..end].char_indices() {
+            let width = unicode_width::UnicodeWidthChar::width(character).unwrap_or(0);
+            if cells + width > column {
+                break;
+            }
+            cells += width;
+            position = start + offset + character.len_utf8();
+        }
+        position
+    }
+
+    /// Familiar terminal composition shortcuts operate on the current logical line.
+    /// Returns false for controls owned by the surrounding application.
+    pub fn handle_edit_key(&mut self, key: KeyEvent) -> bool {
+        if !key.modifiers.contains(KeyModifiers::CONTROL) {
+            return false;
+        }
+        match key.code {
+            KeyCode::Char('a') => self.cursor_line_home(),
+            KeyCode::Char('e') => self.cursor_line_end(),
+            KeyCode::Char('k') => self.kill_to_line_end(),
+            KeyCode::Char('u') => self.kill_to_line_start(),
+            KeyCode::Char('w') => self.delete_word_left(),
+            _ => return false,
+        }
+        true
+    }
+
+    pub fn cursor_line_home(&mut self) {
+        self.cursor = self.line_start();
+        self.vertical_column = None;
+    }
+
+    pub fn cursor_line_end(&mut self) {
+        self.cursor = self.line_end();
+        self.vertical_column = None;
+    }
+
+    /// Delete through the end of this line; at its end, join the following line.
+    pub fn kill_to_line_end(&mut self) {
+        let mut end = self.line_end();
+        if end == self.cursor && end < self.buffer.len() {
+            end += 1;
+        }
+        self.buffer.replace_range(self.cursor..end, "");
+        self.vertical_column = None;
+        self.update_suggestions();
+    }
+
+    /// Delete back to the start of this line; at its start, join the previous line.
+    pub fn kill_to_line_start(&mut self) {
+        let mut start = self.line_start();
+        if start == self.cursor && start > 0 {
+            start -= 1;
+        }
+        self.buffer.replace_range(start..self.cursor, "");
+        self.cursor = start;
+        self.vertical_column = None;
+        self.update_suggestions();
+    }
+
+    /// Delete a preceding word without splitting international text or crossing a line.
+    pub fn delete_word_left(&mut self) {
+        let start = self.line_start();
+        let mut boundary = self.cursor;
+        let mut word_started = false;
+        for (offset, character) in self.buffer[start..self.cursor].char_indices().rev() {
+            if character.is_whitespace() {
+                if word_started {
+                    break;
+                }
+            } else {
+                word_started = true;
+            }
+            boundary = start + offset;
+        }
+        self.buffer.replace_range(boundary..self.cursor, "");
+        self.cursor = boundary;
+        self.vertical_column = None;
+        self.update_suggestions();
+    }
+
     /// Clear the buffer and return the submitted text, recording to history.
     pub fn submit(&mut self) -> String {
         let text = std::mem::take(&mut self.buffer);
         self.cursor = 0;
         self.history_pos = None;
+        self.history_draft = None;
+        self.vertical_column = None;
         self.record(&text);
         self.suggestions.clear();
         self.suggestion_sel = None;
@@ -245,13 +397,17 @@ impl InputBar {
             return;
         }
         let pos = match self.history_pos {
-            None => self.history.len() - 1,
+            None => {
+                self.history_draft = Some((self.buffer.clone(), self.cursor));
+                self.history.len() - 1
+            }
             Some(p) if p > 0 => p - 1,
             Some(p) => p,
         };
         self.history_pos = Some(pos);
         self.buffer = self.history[pos].clone();
         self.cursor = self.buffer.len();
+        self.vertical_column = None;
         self.update_suggestions();
     }
 
@@ -262,10 +418,11 @@ impl InputBar {
             None => {}
             Some(p) => {
                 if p + 1 >= len {
-                    // Past newest: clear to new composition.
+                    // Restore the exact unsent composition, including its insertion point.
                     self.history_pos = None;
-                    self.buffer.clear();
-                    self.cursor = 0;
+                    let (draft, cursor) = self.history_draft.take().unwrap_or_default();
+                    self.buffer = draft;
+                    self.cursor = cursor;
                 } else {
                     self.history_pos = Some(p + 1);
                     self.buffer = self.history[p + 1].clone();
@@ -273,6 +430,7 @@ impl InputBar {
                 }
             }
         }
+        self.vertical_column = None;
         self.update_suggestions();
     }
 
@@ -314,6 +472,8 @@ impl InputBar {
         self.buffer = format!("/{name} ");
         self.cursor = self.buffer.len();
         self.history_pos = None;
+        self.history_draft = None;
+        self.vertical_column = None;
         self.update_suggestions();
         true
     }
@@ -489,8 +649,14 @@ fn unescape_history(line: &str) -> String {
 pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("connect", "choose and connect a provider"),
     ("help", "show keyboard shortcuts and commands"),
-    ("run", "execute an objective"),
-    ("plan", "plan without write side effects"),
+    ("run", "switch to run mode; optional text starts a task"),
+    ("plan", "stay read-only; optional text starts planning"),
+    ("new", "start a fresh conversation and context"),
+    ("search", "find text in the conversation"),
+    ("diff", "review project changes"),
+    ("tools-view", "inspect earlier tool cards"),
+    ("context", "set known context-window tokens, or unknown"),
+    ("load-older", "load earlier saved conversation messages"),
     ("setup", "choose and connect a provider"),
     ("reload", "reload saved model settings"),
     ("model", "show or change the active model"),
@@ -521,6 +687,110 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// WHAT: recall an old request, then return to and keep editing the draft.
+    /// WHY: browsing history must never discard an engineer's unsent instruction.
+    /// PASS: the complete international draft returns with its original insertion point.
+    #[test]
+    fn ux_16_history_returns_the_unsent_draft_and_insertion_point() {
+        let mut input = InputBar::new();
+        input.record("an earlier request");
+        input.set_buffer("Please fix café 世界");
+        input.cursor_left();
+        input.cursor_left();
+        input.history_prev();
+        input.history_next();
+        input.insert_char('!');
+        assert_eq!(input.text(), "Please fix café !世界");
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 5)).unwrap();
+        terminal
+            .draw(|frame| input.render(frame, frame.area(), &Styles::dark(), "Message"))
+            .unwrap();
+        // A wide glyph owns its following continuation cell. Reading every
+        // stored cell as another character would insert spaces inside 世界.
+        let buffer = terminal.backend().buffer();
+        let mut visible = String::new();
+        for y in buffer.area.y..buffer.area.bottom() {
+            let mut x = buffer.area.x;
+            while x < buffer.area.right() {
+                let symbol = buffer[(x, y)].symbol();
+                visible.push_str(symbol);
+                x += unicode_width::UnicodeWidthStr::width(symbol).max(1) as u16;
+            }
+            visible.push('\n');
+        }
+        assert!(
+            visible.contains("Please fix café !世界"),
+            "the restored draft must be visible: {visible}"
+        );
+    }
+
+    /// WHAT: move vertically through a short international line in a long draft.
+    /// WHY: arrow keys should edit multiline instructions instead of recalling history.
+    /// PASS: the displayed caret returns to its original column without changing the draft.
+    #[test]
+    fn ux_17_vertical_arrows_preserve_the_multiline_draft_and_column() {
+        let mut input = InputBar::new();
+        input.record("previous request");
+        input.set_buffer("abcdef\né\nuvwxyz");
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 5)).unwrap();
+        let mut positions = Vec::new();
+        for up in [true, true, false, false] {
+            assert!(
+                if up {
+                    input.cursor_up()
+                } else {
+                    input.cursor_down()
+                },
+                "a draft row should be available"
+            );
+            terminal
+                .draw(|frame| input.render(frame, frame.area(), &Styles::dark(), "Message"))
+                .unwrap();
+            let point = terminal.get_cursor_position().unwrap();
+            positions.push((point.x, point.y));
+        }
+        assert_eq!(
+            positions,
+            [(2, 2), (7, 1), (2, 2), (7, 3)],
+            "the visible caret should retain its preferred column"
+        );
+        assert_eq!(input.text(), "abcdef\né\nuvwxyz");
+    }
+
+    /// WHAT: use Ctrl+A/E/W/U/K while composing a multiline request.
+    /// WHY: familiar terminal editing must work without opening another application.
+    /// PASS: each shortcut produces the expected visible text or insertion point,
+    /// while preserving the preceding draft line.
+    #[test]
+    fn ux_18_terminal_editing_shortcuts_edit_the_current_draft_line() {
+        let mut input = InputBar::new();
+        input.set_buffer("prefix\nalpha beta gamma");
+        let mut outcomes = Vec::new();
+        for key in ['a', 'e', 'w', 'u'] {
+            assert!(input.handle_edit_key(KeyEvent::new(KeyCode::Char(key), KeyModifiers::CONTROL)));
+            outcomes.push((key, input.text().to_owned(), input.cursor));
+        }
+        input.set_buffer("prefix\nalpha tail");
+        input.handle_edit_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
+        for _ in 0..5 {
+            input.cursor_right();
+        }
+        input.handle_edit_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL));
+        outcomes.push(('k', input.text().to_owned(), input.cursor));
+        assert_eq!(
+            outcomes,
+            vec![
+                ('a', "prefix\nalpha beta gamma".into(), 7),
+                ('e', "prefix\nalpha beta gamma".into(), 23),
+                ('w', "prefix\nalpha beta ".into(), 18),
+                ('u', "prefix\n".into(), 7),
+                ('k', "prefix\nalpha".into(), 12),
+            ]
+        );
+    }
 
     #[test]
     fn insert_and_backspace_roundtrip() {

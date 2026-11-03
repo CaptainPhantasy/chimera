@@ -15,3 +15,7 @@ node_modules/
 .env.*
 !.env.example
 __pycache__/
+
+# Local build cache and standalone development experiment
+/target-wt-baseline/
+/self_mod.py

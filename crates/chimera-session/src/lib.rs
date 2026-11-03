@@ -190,13 +190,43 @@ pub struct RunLease {
     _file: File,
 }
 
+#[derive(Clone)]
 pub struct FileSessionStore {
     root: PathBuf,
+    // Cloned into blocking jobs so dropping a run future cannot release its
+    // lease while an unabortable filesystem transaction is still executing.
+    run_lease: Option<std::sync::Arc<RunLease>>,
 }
 
 impl FileSessionStore {
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        Self {
+            root: root.into(),
+            run_lease: None,
+        }
+    }
+
+    /// Keep lock waits, filesystem calls and fsync off the async executor.
+    async fn blocking<T: Send + 'static>(
+        &self,
+        operation: impl FnOnce(Self) -> anyhow::Result<T> + Send + 'static,
+    ) -> anyhow::Result<T> {
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || operation(store))
+            .await
+            .context("session storage worker failed")?
+    }
+
+    pub async fn claim_run_async(&self, id: SessionId) -> anyhow::Result<RunLease> {
+        self.blocking(move |store| store.claim_run(id)).await
+    }
+
+    /// Bind every storage operation and its blocking job to this run's lease.
+    pub async fn for_run(&self, id: SessionId) -> anyhow::Result<Self> {
+        let lease = self.claim_run_async(id).await?;
+        let mut store = self.clone();
+        store.run_lease = Some(std::sync::Arc::new(lease));
+        Ok(store)
     }
 
     fn storage_dir(&self) -> anyhow::Result<PathBuf> {
@@ -267,53 +297,295 @@ impl FileSessionStore {
 
     /// End a run with an explicit status and retain the complete event history.
     pub async fn close(&self, id: SessionId, outcome: &str) -> anyhow::Result<()> {
-        if ![
-            "completed",
-            "failed",
-            "cancelled",
-            "interrupted",
-            "unfinished",
-        ]
-        .contains(&outcome)
-        {
-            bail!("invalid run outcome: {outcome}");
-        }
-        let _lock = self.lock()?;
-        let mut state = self.read_state(id)?;
-        state.active = false;
-        state.events.push(SessionEvent::Custom {
-            key: "run_outcome".into(),
-            payload: serde_json::json!({"outcome":outcome,"at":Utc::now()}),
-        });
-        self.write_state(&state)
+        let outcome = outcome.to_string();
+        self.blocking(move |store| {
+            if ![
+                "completed",
+                "failed",
+                "cancelled",
+                "interrupted",
+                "unfinished",
+            ]
+            .contains(&outcome.as_str())
+            {
+                bail!("invalid run outcome: {outcome}");
+            }
+            let _lock = store.lock()?;
+            let mut state = store.read_state(id)?;
+            state.active = false;
+            state.events.push(SessionEvent::Custom {
+                key: "run_outcome".into(),
+                payload: serde_json::json!({"outcome":outcome,"at":Utc::now()}),
+            });
+            store.write_state(&state)
+        })
+        .await
     }
 
     pub async fn reopen(&self, id: SessionId) -> anyhow::Result<()> {
-        let _lock = self.lock()?;
-        let mut state = self.read_state(id)?;
-        state.active = true;
-        state.events.push(SessionEvent::Custom {
-            key: "run_resumed".into(),
-            payload: serde_json::json!({"at":Utc::now()}),
-        });
-        self.write_state(&state)
+        self.blocking(move |store| {
+            let _lock = store.lock()?;
+            let mut state = store.read_state(id)?;
+            state.active = true;
+            state.events.push(SessionEvent::Custom {
+                key: "run_resumed".into(),
+                payload: serde_json::json!({"at":Utc::now()}),
+            });
+            store.write_state(&state)
+        })
+        .await
     }
 
-    /// Permanently remove a saved conversation and its file record.
+    /// Remove a conversation from the active list while preserving an exact,
+    /// private archive. The same locks used by writers exclude active runs.
+    pub async fn archive(&self, id: SessionId) -> anyhow::Result<()> {
+        self.blocking(move |store| {
+            let _lock = store.lock()?;
+            let _run_lease = store.lock_run(id)?;
+            store.read_state(id)?;
+            let source = store.session_path(id)?;
+            let archive = private_dir(&store.storage_dir()?.join("archived"))?;
+            // Persist the archive directory itself before removing any active name.
+            sync_dir(&store.storage_dir()?)?;
+            let target = archive.join(format!("{id}.json"));
+            reject_link(&source)?;
+            reject_link(&target)?;
+            // Exclusive creation: neither another archive nor a user file can be
+            // overwritten. Hard links preserve exact bytes on the same filesystem.
+            link_record_or_resume(&source, &target)
+                .context("could not preserve this conversation in its archive; nothing removed")?;
+            // Existing .previous recovery copies stay private and untouched. The
+            // archived current record is the authoritative restore source.
+            sync_dir(&archive)?;
+            std::fs::remove_file(&source)?;
+            sync_dir(&store.storage_dir()?)?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Permanently remove this session's saved records and recovery data.
+    /// Archiving is a separate, reversible operation; working files are untouched.
     pub async fn delete(&self, id: SessionId) -> anyhow::Result<()> {
-        let _lock = self.lock()?;
-        // An active runner holds this lease; refuse rather than delete mid-run.
-        let _run_lease = self.lock_run(id)?;
-        let path = self.session_path(id)?;
-        if !path.exists() {
-            bail!("no saved conversation exists for that id");
-        }
-        std::fs::remove_file(&path)?;
-        // The crash-safe writer keeps a `.previous` copy beside the record;
-        // remove it too so the conversation is really gone.
-        let _ = std::fs::remove_file(PathBuf::from(format!("{}.previous", path.display())));
-        sync_dir(&self.storage_dir()?)?;
-        Ok(())
+        self.blocking(move |store| {
+            let _lock = store.lock()?;
+            let _run_lease = store.lock_run(id)?;
+            let directory = store.storage_dir()?;
+            let mut records = Vec::new();
+            let mut recovery_directories = Vec::new();
+            let mut session_records = Vec::new();
+
+            // Identify all owned records before removing anything, including
+            // recovery copies left by an interrupted deletion.
+            for base in [directory.clone(), directory.join("archived")] {
+                if !base.exists() {
+                    continue;
+                }
+                let base = private_dir(&base)?;
+                for entry in std::fs::read_dir(base)? {
+                    let path = entry?.path();
+                    let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+                    if name.starts_with(".pending-") {
+                        if pending_owner(&path)? == id {
+                            records.push(path);
+                        }
+                        continue;
+                    }
+                    if name == format!("{id}.json")
+                        || name == format!("{id}.json.previous")
+                        || name
+                            .strip_prefix(&format!("{id}.recovered-"))
+                            .is_some_and(|suffix| Uuid::parse_str(suffix).is_ok())
+                    {
+                        reject_link(&path)?;
+                        session_records.push(path);
+                    }
+                }
+            }
+            let checkpoints = directory.join("checkpoints");
+            if checkpoints.exists() {
+                for entry in std::fs::read_dir(private_dir(&checkpoints)?)? {
+                    let path = entry?.path();
+                    let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+                    if name.starts_with(".pending-") {
+                        if pending_owner(&path)? == id {
+                            records.push(path);
+                        }
+                        continue;
+                    }
+                    if !(name.ends_with(".json") || name.ends_with(".json.previous")) {
+                        continue;
+                    }
+                    let checkpoint: Checkpoint = read_record(&path)
+                        .context("cannot identify checkpoint ownership; no records removed")?;
+                    if checkpoint.session_id == id {
+                        anyhow::ensure!(
+                            checkpoint.state.id == id,
+                            "checkpoint session identity mismatch"
+                        );
+                        records.push(path);
+                    }
+                }
+            }
+            let restores = directory.join("restores");
+            if restores.exists() {
+                for entry in std::fs::read_dir(private_dir(&restores)?)? {
+                    let path = entry?.path();
+                    // Recovery directories are private UUID names, never paths
+                    // supplied by a conversation or embedded in a journal.
+                    if path
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .and_then(|s| Uuid::parse_str(s).ok())
+                        .is_none()
+                    {
+                        continue;
+                    }
+                    let path = private_dir(&path)?;
+                    let mut owner = None;
+                    for name in [
+                        "journal.json",
+                        "journal.json.previous",
+                        "completed.json",
+                        "completed.json.previous",
+                    ] {
+                        let record = path.join(name);
+                        if !record.exists() {
+                            continue;
+                        }
+                        let value: serde_json::Value = read_record(&record)
+                            .context("cannot identify restore ownership; no records removed")?;
+                        let found = value
+                            .get("session")
+                            .and_then(|v| v.as_str())
+                            .and_then(|v| Uuid::parse_str(v).ok())
+                            .context(
+                                "restore record has no valid session identity; no records removed",
+                            )?;
+                        anyhow::ensure!(
+                            owner.is_none_or(|prior| prior == found),
+                            "restore records disagree about session ownership"
+                        );
+                        owner = Some(found);
+                    }
+                    for entry in std::fs::read_dir(&path)? {
+                        let pending = entry?.path();
+                        if pending
+                            .file_name()
+                            .and_then(|s| s.to_str())
+                            .is_some_and(|name| name.starts_with(".pending-"))
+                        {
+                            let found = pending_owner(&pending)?;
+                            anyhow::ensure!(
+                                owner.is_none_or(|prior| prior == found),
+                                "pending restore record has conflicting ownership"
+                            );
+                            owner = Some(found);
+                        }
+                    }
+                    anyhow::ensure!(
+                        owner.is_some() || std::fs::read_dir(&path)?.next().is_none(),
+                        "restore data has no identifiable owner; no records removed"
+                    );
+                    if owner == Some(id) {
+                        recovery_directories.push(path);
+                    }
+                }
+            }
+            anyhow::ensure!(
+                !session_records.is_empty()
+                    || !records.is_empty()
+                    || !recovery_directories.is_empty(),
+                "unknown session {id}"
+            );
+            for path in records {
+                std::fs::remove_file(path)?;
+            }
+            if checkpoints.exists() {
+                sync_dir(&checkpoints)?;
+            }
+            for path in recovery_directories {
+                std::fs::remove_dir_all(path)?;
+            }
+            if restores.exists() {
+                sync_dir(&restores)?;
+            }
+            // Retain the main record until auxiliary removal succeeds, so a
+            // failed operation can be retried with the same identity.
+            for path in session_records {
+                std::fs::remove_file(path)?;
+            }
+            let archived = directory.join("archived");
+            if archived.exists() {
+                sync_dir(&archived)?;
+            }
+            sync_dir(&directory)
+        })
+        .await
+    }
+
+    /// List archive identifiers without retaining full conversations in memory.
+    pub async fn archived_session_ids(&self) -> anyhow::Result<Vec<SessionId>> {
+        self.blocking(move |store| {
+            let _lock = store.lock()?;
+            let directory = store.storage_dir()?.join("archived");
+            if !directory.exists() {
+                return Ok(Vec::new());
+            }
+            let directory = private_dir(&directory)?;
+            let mut ids = Vec::new();
+            for entry in std::fs::read_dir(directory)? {
+                let path = entry?.path();
+                if path.extension().and_then(|s| s.to_str()) == Some("json") {
+                    if let Some(id) = path
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .and_then(|s| Uuid::parse_str(s).ok())
+                    {
+                        ids.push(id);
+                    }
+                }
+            }
+            Ok(ids)
+        })
+        .await
+    }
+
+    /// Load one archive with the same size, identity and link checks as active records.
+    pub async fn load_archived(&self, id: SessionId) -> anyhow::Result<SessionState> {
+        self.blocking(move |store| {
+            let _lock = store.lock()?;
+            let directory = private_dir(&store.storage_dir()?.join("archived"))?;
+            let state: SessionState = read_record(&directory.join(format!("{id}.json")))?;
+            anyhow::ensure!(state.id == id, "archived conversation identity mismatch");
+            state.effective_events()?;
+            Ok(state)
+        })
+        .await
+    }
+
+    /// Restore without replacing a conversation that already exists.
+    pub async fn restore_archived(&self, id: SessionId) -> anyhow::Result<()> {
+        self.blocking(move |store| {
+            let _lock = store.lock()?;
+            let _run_lease = store.lock_run(id)?;
+            let directory = private_dir(&store.storage_dir()?.join("archived"))?;
+            let source = directory.join(format!("{id}.json"));
+            let target = store.session_path(id)?;
+            let state: SessionState = read_record(&source)?;
+            anyhow::ensure!(state.id == id, "archived conversation identity mismatch");
+            state.effective_events()?;
+            reject_link(&source)?;
+            reject_link(&target)?;
+            link_record_or_resume(&source, &target).context(
+                "could not restore the archive; an existing conversation will not be overwritten",
+            )?;
+            sync_dir(&store.storage_dir()?)?;
+            std::fs::remove_file(source)?;
+            sync_dir(&directory)?;
+            Ok(())
+        })
+        .await
     }
 
     fn checkpoint_path(&self, id: CheckpointId) -> anyhow::Result<PathBuf> {
@@ -334,36 +606,40 @@ impl FileSessionStore {
         id: SessionId,
         paths: &[PathBuf],
     ) -> anyhow::Result<CheckpointId> {
-        let _lock = self.lock()?;
-        let mut state = self.read_state(id)?;
-        let mut seen = std::collections::HashSet::new();
-        let mut files = Vec::new();
-        let mut total = 0usize;
-        for path in paths {
-            if !seen.insert(path.clone()) {
-                bail!("duplicate snapshot path: {}", path.display());
+        let paths = paths.to_vec();
+        self.blocking(move |store| {
+            let _lock = store.lock()?;
+            let mut state = store.read_state(id)?;
+            let mut seen = std::collections::HashSet::new();
+            let mut files = Vec::new();
+            let mut total = 0usize;
+            for path in &paths {
+                if !seen.insert(path.clone()) {
+                    bail!("duplicate snapshot path: {}", path.display());
+                }
+                let file = store.capture_file(path)?;
+                total += file.bytes.as_ref().map_or(0, Vec::len);
+                if total > MAX_SNAPSHOT_BYTES as usize {
+                    bail!("checkpoint file contents exceed 8 MiB");
+                }
+                files.push(file);
             }
-            let file = self.capture_file(path)?;
-            total += file.bytes.as_ref().map_or(0, Vec::len);
-            if total > MAX_SNAPSHOT_BYTES as usize {
-                bail!("checkpoint file contents exceed 8 MiB");
-            }
-            files.push(file);
-        }
-        let cp = Checkpoint {
-            id: Uuid::new_v4(),
-            session_id: id,
-            created_at: Utc::now(),
-            state: state.clone(),
-            files,
-        };
-        write_record(&self.checkpoint_path(cp.id)?, &cp)?;
-        state.checkpoints.push(cp.id);
-        state.events.push(SessionEvent::Checkpointed {
-            checkpoint_id: cp.id,
-        });
-        self.write_state(&state)?;
-        Ok(cp.id)
+            let cp = Checkpoint {
+                id: Uuid::new_v4(),
+                session_id: id,
+                created_at: Utc::now(),
+                state: state.clone(),
+                files,
+            };
+            write_record(&store.checkpoint_path(cp.id)?, &cp)?;
+            state.checkpoints.push(cp.id);
+            state.events.push(SessionEvent::Checkpointed {
+                checkpoint_id: cp.id,
+            });
+            store.write_state(&state)?;
+            Ok(cp.id)
+        })
+        .await
     }
 
     /// Every checkpoint of one session, newest first, without pulling file
@@ -372,23 +648,26 @@ impl FileSessionStore {
         &self,
         session: SessionId,
     ) -> anyhow::Result<Vec<CheckpointSummary>> {
-        let _lock = self.lock()?;
-        let state = self.read_state(session)?;
-        let mut summaries = Vec::new();
-        for id in state.checkpoints {
-            let checkpoint = self.read_checkpoint(session, id)?;
-            summaries.push(CheckpointSummary {
-                id: checkpoint.id,
-                created_at: checkpoint.created_at,
-                files: checkpoint
-                    .files
-                    .iter()
-                    .map(|file| file.path.clone())
-                    .collect(),
-            });
-        }
-        summaries.sort_by(|a, b| b.created_at.cmp(&a.created_at).then(b.id.cmp(&a.id)));
-        Ok(summaries)
+        self.blocking(move |store| {
+            let _lock = store.lock()?;
+            let state = store.read_state(session)?;
+            let mut summaries = Vec::new();
+            for id in state.checkpoints {
+                let checkpoint = store.read_checkpoint(session, id)?;
+                summaries.push(CheckpointSummary {
+                    id: checkpoint.id,
+                    created_at: checkpoint.created_at,
+                    files: checkpoint
+                        .files
+                        .iter()
+                        .map(|file| file.path.clone())
+                        .collect(),
+                });
+            }
+            summaries.sort_by(|a, b| b.created_at.cmp(&a.created_at).then(b.id.cmp(&a.id)));
+            Ok(summaries)
+        })
+        .await
     }
 
     pub async fn preview_restore(
@@ -396,18 +675,21 @@ impl FileSessionStore {
         session: SessionId,
         checkpoint: CheckpointId,
     ) -> anyhow::Result<RestorePreview> {
-        let _lock = self.lock()?;
-        let cp = self.read_checkpoint(session, checkpoint)?;
-        let current_files = cp
-            .files
-            .iter()
-            .map(|f| self.capture_file(&f.path))
-            .collect::<anyhow::Result<Vec<_>>>()?;
-        Ok(RestorePreview {
-            checkpoint_id: checkpoint,
-            current_files,
-            restored_files: cp.files,
+        self.blocking(move |store| {
+            let _lock = store.lock()?;
+            let cp = store.read_checkpoint(session, checkpoint)?;
+            let current_files = cp
+                .files
+                .iter()
+                .map(|f| store.capture_file(&f.path))
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            Ok(RestorePreview {
+                checkpoint_id: checkpoint,
+                current_files,
+                restored_files: cp.files,
+            })
         })
+        .await
     }
 
     /// Restore an approved preview. Existing files are moved into a private
@@ -420,30 +702,32 @@ impl FileSessionStore {
         checkpoint: CheckpointId,
         expected_current: &[FileSnapshot],
     ) -> anyhow::Result<SessionState> {
-        let _lock = self.lock()?;
-        let _run_lease = self.lock_run(session)?;
-        let cp = self.read_checkpoint(session, checkpoint)?;
-        let mut current_state = self.read_state(session)?;
+        let expected_current = expected_current.to_vec();
+        self.blocking(move |store| {
+        let _lock = store.lock()?;
+        let _run_lease = store.lock_run(session)?;
+        let cp = store.read_checkpoint(session, checkpoint)?;
+        let mut current_state = store.read_state(session)?;
         if cp.files.len() != expected_current.len() {
             bail!("restore preview does not cover every file");
         }
-        for (desired, expected) in cp.files.iter().zip(expected_current) {
-            if desired.path != expected.path || self.capture_file(&desired.path)? != *expected {
+        for (desired, expected) in cp.files.iter().zip(&expected_current) {
+            if desired.path != expected.path || store.capture_file(&desired.path)? != *expected {
                 bail!(
                     "file changed since restore preview: {}",
                     desired.path.display()
                 );
             }
         }
-        let restores = private_dir(&self.storage_dir()?.join("restores"))?;
+        let restores = private_dir(&store.storage_dir()?.join("restores"))?;
         let archive = private_dir(&restores.join(Uuid::new_v4().to_string()))?;
         write_record(
             &archive.join("journal.json"),
             &serde_json::json!({"checkpoint":checkpoint,"session":session,"before":current_state,"originals":expected_current,"desired":cp.files,"status":"prepared"}),
         )?;
-        for (index, (desired, expected)) in cp.files.iter().zip(expected_current).enumerate() {
-            let target = self.scoped_path(&desired.path)?;
-            if self.capture_file(&desired.path)? != *expected {
+        for (index, (desired, expected)) in cp.files.iter().zip(&expected_current).enumerate() {
+            let target = store.scoped_path(&desired.path)?;
+            if store.capture_file(&desired.path)? != *expected {
                 bail!(
                     "file changed during restore: {}; recovery: {}",
                     desired.path.display(),
@@ -498,12 +782,13 @@ impl FileSessionStore {
         }
         current_state.active = cp.state.active;
         current_state.events.push(SessionEvent::Custom { key:"checkpoint_restored".into(), payload:serde_json::json!({"checkpoint_id":checkpoint,"restored_events":cp.state.effective_events()?,"recovery_directory":archive,"at":Utc::now()}) });
-        self.write_state(&current_state)?;
+        store.write_state(&current_state)?;
         write_record(
             &archive.join("completed.json"),
             &serde_json::json!({"session":session,"checkpoint":checkpoint,"at":Utc::now()}),
         )?;
         Ok(current_state)
+            }).await
     }
 
     fn scoped_path(&self, relative: &Path) -> anyhow::Result<PathBuf> {
@@ -583,35 +868,41 @@ impl FileSessionStore {
     /// Explicitly recover the last committed record. The current record is moved
     /// aside intact, including corrupt bytes; recovery is never silently applied.
     pub async fn recover_previous(&self, id: SessionId) -> anyhow::Result<SessionState> {
-        let _lock = self.lock()?;
-        let _run_lease = self.lock_run(id)?;
-        let path = self.session_path(id)?;
-        let previous = PathBuf::from(format!("{}.previous", path.display()));
-        let mut state: SessionState = read_record(&previous)?;
-        if state.id != id {
-            bail!("previous session identity mismatch");
-        }
-        state.effective_events()?;
-        reject_link(&path)?;
-        let recovery = self
-            .storage_dir()?
-            .join(format!("{}.recovered-{}", id, Uuid::new_v4()));
-        if path.exists() {
-            std::fs::rename(&path, &recovery)?;
-            sync_dir(&self.storage_dir()?)?;
-        }
-        state.events.push(SessionEvent::Custom {
-            key: "record_recovered".into(),
-            payload: serde_json::json!({"preserved_record": recovery, "at": Utc::now()}),
-        });
-        self.write_state(&state)?;
-        Ok(state)
+        self.blocking(move |store| {
+            let _lock = store.lock()?;
+            let _run_lease = store.lock_run(id)?;
+            let path = store.session_path(id)?;
+            let previous = PathBuf::from(format!("{}.previous", path.display()));
+            let mut state: SessionState = read_record(&previous)?;
+            if state.id != id {
+                bail!("previous session identity mismatch");
+            }
+            state.effective_events()?;
+            reject_link(&path)?;
+            let recovery =
+                store
+                    .storage_dir()?
+                    .join(format!("{}.recovered-{}", id, Uuid::new_v4()));
+            if path.exists() {
+                std::fs::rename(&path, &recovery)?;
+                sync_dir(&store.storage_dir()?)?;
+            }
+            state.events.push(SessionEvent::Custom {
+                key: "record_recovered".into(),
+                payload: serde_json::json!({"preserved_record": recovery, "at": Utc::now()}),
+            });
+            store.write_state(&state)?;
+            Ok(state)
+        })
+        .await
     }
 
     /// Privacy-first diagnostics: no conversation text, tool arguments, paths,
     /// labels, or arbitrary custom payloads are exported.
     pub async fn export_redacted(&self, id: SessionId) -> anyhow::Result<serde_json::Value> {
-        let state = self.load(id).await?;
+        self.blocking(move |store| {
+        let _lock = store.lock()?;
+        let state = store.read_state(id)?;
         let events: Vec<_> = state
             .events
             .iter()
@@ -633,72 +924,129 @@ impl FileSessionStore {
         Ok(
             serde_json::json!({"format_version":FORMAT_VERSION,"id":state.id,"created_at":state.meta.created_at,"active":state.active,"checkpoints":state.checkpoints,"events":events}),
         )
+        }).await
     }
 }
 
 #[async_trait::async_trait]
 impl SessionStore for FileSessionStore {
     async fn create(&self, meta: SessionMeta) -> anyhow::Result<SessionId> {
-        // Support a fresh test/workspace directory without following state links.
-        if !self.root.exists() {
-            std::fs::create_dir_all(&self.root)?;
-        }
-        let _lock = self.lock()?;
-        let id = Uuid::new_v4();
-        let state = SessionState {
-            id,
-            meta: meta.clone(),
-            events: vec![SessionEvent::Created { meta }],
-            checkpoints: vec![],
-            active: true,
-        };
-        self.write_state(&state)?;
-        Ok(id)
+        self.blocking(move |store| {
+            // Support a fresh test/workspace directory without following state links.
+            if !store.root.exists() {
+                std::fs::create_dir_all(&store.root)?;
+            }
+            let _lock = store.lock()?;
+            let id = Uuid::new_v4();
+            let state = SessionState {
+                id,
+                meta: meta.clone(),
+                events: vec![SessionEvent::Created { meta }],
+                checkpoints: vec![],
+                active: true,
+            };
+            store.write_state(&state)?;
+            Ok(id)
+        })
+        .await
     }
     async fn append_event(&self, id: SessionId, event: SessionEvent) -> anyhow::Result<()> {
-        self.append_event_sync(id, event)
+        self.blocking(move |store| store.append_event_sync(id, event))
+            .await
     }
     async fn snapshot(&self, id: SessionId) -> anyhow::Result<CheckpointId> {
         self.checkpoint_with_files(id, &[]).await
     }
     async fn fork(&self, id: SessionId) -> anyhow::Result<SessionId> {
-        let _lock = self.lock()?;
-        let mut child = self.read_state(id)?;
-        child.id = Uuid::new_v4();
-        child.active = true;
-        // Parent checkpoints are immutable and bound to their parent identity.
-        child.checkpoints.clear();
-        child.events.push(SessionEvent::Forked {
-            parent_id: id,
-            child_id: child.id,
-        });
-        self.write_state(&child)?;
-        Ok(child.id)
+        self.blocking(move |store| {
+            let _lock = store.lock()?;
+            let mut child = store.read_state(id)?;
+            child.id = Uuid::new_v4();
+            child.active = true;
+            // Parent checkpoints are immutable and bound to their parent identity.
+            child.checkpoints.clear();
+            child.events.push(SessionEvent::Forked {
+                parent_id: id,
+                child_id: child.id,
+            });
+            store.write_state(&child)?;
+            Ok(child.id)
+        })
+        .await
     }
     async fn load(&self, id: SessionId) -> anyhow::Result<SessionState> {
-        let _lock = self.lock()?;
-        self.read_state(id)
+        self.blocking(move |store| {
+            let _lock = store.lock()?;
+            store.read_state(id)
+        })
+        .await
     }
     async fn list(&self) -> anyhow::Result<Vec<SessionId>> {
-        if !self.root.join(".chimera").join("sessions").exists() {
-            return Ok(vec![]);
-        }
-        let _lock = self.lock()?;
-        let mut ids = Vec::new();
-        for entry in std::fs::read_dir(self.storage_dir()?)? {
-            let path = entry?.path();
-            if path.extension().and_then(|s| s.to_str()) == Some("json") {
-                if let Some(id) = path
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .and_then(|s| Uuid::parse_str(s).ok())
-                {
-                    ids.push(id);
+        self.blocking(move |store| {
+            if !store.root.join(".chimera").join("sessions").exists() {
+                return Ok(vec![]);
+            }
+            let _lock = store.lock()?;
+            let mut ids = Vec::new();
+            for entry in std::fs::read_dir(store.storage_dir()?)? {
+                let path = entry?.path();
+                if path.extension().and_then(|s| s.to_str()) == Some("json") {
+                    if let Some(id) = path
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .and_then(|s| Uuid::parse_str(s).ok())
+                    {
+                        ids.push(id);
+                    }
                 }
             }
+            ids.sort();
+            Ok(ids)
+        })
+        .await
+    }
+}
+
+/// Legacy temporary files have random names. Never guess the owner of a
+/// partial write: report the unresolved recovery data before deleting anything.
+fn pending_owner(path: &Path) -> anyhow::Result<SessionId> {
+    let value: serde_json::Value = read_record(path)
+        .with_context(|| format!("cannot identify interrupted write {}; recover it before permanent deletion; no records removed", path.display()))?;
+    let identity = if value.get("session_id").is_some() {
+        value.get("session_id")
+    } else if value.get("session").is_some() {
+        value.get("session")
+    } else if value.get("meta").is_some() && value.get("events").is_some() {
+        value.get("id")
+    } else {
+        None
+    };
+    identity
+        .and_then(|value| value.as_str())
+        .and_then(|value| Uuid::parse_str(value).ok())
+        .context("interrupted write has no identifiable session owner; no records removed")
+}
+
+/// Resume a crash-interrupted archive/restore only when both names identify
+/// the exact same record. A distinct destination is always preserved.
+fn link_record_or_resume(source: &Path, target: &Path) -> anyhow::Result<()> {
+    match std::fs::hard_link(source, target) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            reject_link(source)?;
+            reject_link(target)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                let from = std::fs::metadata(source)?;
+                let to = std::fs::metadata(target)?;
+                if from.dev() == to.dev() && from.ino() == to.ino() {
+                    return Ok(());
+                }
+            }
+            Err(error.into())
         }
-        ids.sort();
-        Ok(ids)
+        Err(error) => Err(error.into()),
     }
 }
 
@@ -886,6 +1234,144 @@ mod file_tests {
             objective: "do the thing".to_string(),
             created_at: Utc::now(),
         }
+    }
+
+    /// WHAT: delete saved history after a checkpoint, restore and archive.
+    /// WHY: deleted private work must disappear from recovery data too.
+    #[tokio::test]
+    async fn issue_05_deleted_conversation_has_no_retained_recovery_data() {
+        let root = unique_root();
+        let store = FileSessionStore::new(&root);
+        let marker = "PRIVATE_CONVERSATION_TO_REMOVE_ISSUE05";
+        let id = store
+            .create(SessionMeta {
+                label: marker.into(),
+                objective: marker.into(),
+                created_at: Utc::now(),
+            })
+            .await
+            .unwrap();
+        std::fs::write(root.join("owned.txt"), marker).unwrap();
+        let cp = store
+            .checkpoint_with_files(id, &["owned.txt".into()])
+            .await
+            .unwrap();
+        let cp_path = store.checkpoint_path(cp).unwrap();
+        std::fs::copy(&cp_path, format!("{}.previous", cp_path.display())).unwrap();
+        std::fs::write(root.join("owned.txt"), "displaced working file").unwrap();
+        let preview = store.preview_restore(id, cp).await.unwrap();
+        store
+            .restore_checkpoint(id, cp, &preview.current_files)
+            .await
+            .unwrap();
+        let other = store.create(sample_meta()).await.unwrap();
+        std::fs::write(root.join("other.txt"), "OTHER_WORK").unwrap();
+        let other_cp = store
+            .checkpoint_with_files(other, &["other.txt".into()])
+            .await
+            .unwrap();
+        let other_preview = store.preview_restore(other, other_cp).await.unwrap();
+        store
+            .restore_checkpoint(other, other_cp, &other_preview.current_files)
+            .await
+            .unwrap();
+        store.archive(id).await.unwrap();
+        assert!(
+            store.load_archived(id).await.is_ok(),
+            "fixture must retain the archived conversation before deletion"
+        );
+        let pending = cp_path
+            .parent()
+            .unwrap()
+            .join(format!(".pending-{}", Uuid::new_v4()));
+        std::fs::copy(&cp_path, &pending).unwrap();
+        let unknown = store
+            .storage_dir()
+            .unwrap()
+            .join(format!(".pending-{}", Uuid::new_v4()));
+        std::fs::write(&unknown, b"interrupted partial record").unwrap();
+        assert!(
+            store.delete(id).await.is_err(),
+            "unknown interrupted data must prevent a false successful deletion"
+        );
+        assert!(
+            store.load_archived(id).await.is_ok() && cp_path.exists(),
+            "ownership must be checked before removing any records"
+        );
+        std::fs::remove_file(unknown).unwrap();
+        store.delete(id).await.unwrap();
+        let mut directories = vec![store.storage_dir().unwrap()];
+        while let Some(directory) = directories.pop() {
+            for entry in std::fs::read_dir(directory).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    directories.push(path);
+                } else {
+                    assert!(
+                        !String::from_utf8_lossy(&std::fs::read(&path).unwrap()).contains(marker),
+                        "FAIL: private deleted conversation remains in {}",
+                        path.display()
+                    );
+                }
+            }
+        }
+        assert!(
+            store.load(id).await.is_err() && store.load_archived(id).await.is_err(),
+            "PASS only when the deleted conversation cannot be reopened"
+        );
+        assert!(
+            !cp_path.exists() && !PathBuf::from(format!("{}.previous", cp_path.display())).exists(),
+            "PASS only when checkpoint recovery copies are removed"
+        );
+        assert_eq!(
+            store.load(other).await.unwrap().id,
+            other,
+            "other conversations must remain usable"
+        );
+        assert!(
+            store.preview_restore(other, other_cp).await.is_ok(),
+            "other recovery data must remain usable"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("owned.txt")).unwrap(),
+            marker,
+            "deleting history must preserve working files"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// WHAT: a UI heartbeat runs while saving waits for a held storage lock.
+    /// WHY: saving must not freeze the developer's single-threaded async interface.
+    #[tokio::test(flavor = "current_thread")]
+    async fn issue_06_workspace_responds_while_a_save_waits_for_the_lock() {
+        let root = unique_root();
+        let store = FileSessionStore::new(&root);
+        let id = store.create(sample_meta()).await.unwrap();
+        let lock = store.lock().unwrap();
+        let (heartbeat, heard) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let responsive = heard.recv_timeout(Duration::from_secs(1)).is_ok();
+            drop(lock);
+            responsive
+        });
+        let writer = store.clone();
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let save = tokio::spawn(async move {
+            started.send(()).unwrap();
+            writer.close(id, "completed").await
+        });
+        ready.await.unwrap();
+        let _ = heartbeat.send(());
+        save.await.unwrap().unwrap();
+        assert!(
+            holder.join().unwrap(),
+            "PASS only when the UI heartbeat ran before the storage lock was released"
+        );
+        assert!(
+            !store.load(id).await.unwrap().active,
+            "saving must complete after lock release"
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]

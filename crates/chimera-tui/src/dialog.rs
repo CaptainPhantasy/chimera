@@ -8,12 +8,15 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
     Frame,
 };
+use std::cell::Cell;
 
 pub struct Choice {
     pub label: String,
     pub detail: String,
     pub action: String,
-    /// Optional destructive secondary action offered by the `d` key.
+    /// Additional searchable content that need not occupy a visible row.
+    pub search_text: String,
+    /// Optional destructive secondary action offered by the Delete key.
     pub alt_action: Option<String>,
 }
 impl Choice {
@@ -27,9 +30,14 @@ impl Choice {
             detail: detail.into(),
             action: action.into(),
             alt_action: None,
+            search_text: String::new(),
         }
     }
-    /// Offer a destructive `d` action for this row (e.g. delete a session).
+    pub fn with_search_text(mut self, text: impl Into<String>) -> Self {
+        self.search_text = text.into();
+        self
+    }
+    /// Offer a destructive Delete action for this row (e.g. archive a session).
     pub fn with_alt_action(mut self, alt_action: impl Into<String>) -> Self {
         self.alt_action = Some(alt_action.into());
         self
@@ -63,12 +71,19 @@ pub enum Body {
         selected: usize,
         action: String,
     },
+    Text {
+        text: String,
+        scroll: usize,
+        actions: Vec<Choice>,
+        selected: usize,
+    },
     Busy,
 }
 pub struct Dialog {
     pub title: String,
     pub note: String,
     pub body: Body,
+    text_view: Cell<(usize, usize)>,
 }
 #[derive(Debug)]
 pub enum Outcome {
@@ -79,6 +94,7 @@ pub enum Outcome {
 impl Dialog {
     pub fn choices(title: &str, note: &str, rows: Vec<Choice>) -> Self {
         Self {
+            text_view: Cell::new((10, 0)),
             title: title.into(),
             note: note.into(),
             body: Body::Choices {
@@ -90,6 +106,7 @@ impl Dialog {
     }
     pub fn form(title: &str, note: &str, fields: Vec<Field>, action: &str) -> Self {
         Self {
+            text_view: Cell::new((10, 0)),
             title: title.into(),
             note: note.into(),
             body: Body::Form {
@@ -101,9 +118,26 @@ impl Dialog {
     }
     pub fn busy(title: &str, note: &str) -> Self {
         Self {
+            text_view: Cell::new((10, 0)),
             title: title.into(),
             note: note.into(),
             body: Body::Busy,
+        }
+    }
+    /// A complete scrollable document with explicit, keyboard-selectable actions.
+    pub fn text(title: &str, note: &str, text: impl Into<String>, actions: Vec<Choice>) -> Self {
+        let text = text.into();
+        let limit = text.lines().count().saturating_sub(1);
+        Self {
+            title: title.into(),
+            note: note.into(),
+            body: Body::Text {
+                text,
+                scroll: 0,
+                actions,
+                selected: 0,
+            },
+            text_view: Cell::new((10, limit)),
         }
     }
     pub fn paste(&mut self, text: &str) {
@@ -123,7 +157,7 @@ impl Dialog {
                 search.extend(text.chars().filter(|c| !c.is_control()).take(256));
                 *selected = 0;
             }
-            Body::Busy => {}
+            Body::Text { .. } | Body::Busy => {}
         }
     }
     pub fn key(&mut self, key: KeyEvent) -> Outcome {
@@ -151,7 +185,7 @@ impl Dialog {
                             return Outcome::Action(row.action.clone(), vec![]);
                         }
                     }
-                    KeyCode::Char('d')
+                    KeyCode::Delete
                         if filtered
                             .get(*selected)
                             .is_some_and(|row| row.alt_action.is_some()) =>
@@ -219,6 +253,35 @@ impl Dialog {
                     }
                 }
             },
+            Body::Text {
+                scroll,
+                actions,
+                selected,
+                ..
+            } => {
+                let (page, limit) = self.text_view.get();
+                *scroll = (*scroll).min(limit);
+                match key.code {
+                    KeyCode::Up => *scroll = scroll.saturating_sub(1),
+                    KeyCode::Down => *scroll = scroll.saturating_add(1).min(limit),
+                    KeyCode::PageUp => *scroll = scroll.saturating_sub(page.max(1)),
+                    KeyCode::PageDown => *scroll = scroll.saturating_add(page.max(1)).min(limit),
+                    KeyCode::Home => *scroll = 0,
+                    KeyCode::End => *scroll = limit,
+                    KeyCode::Tab | KeyCode::Right if !actions.is_empty() => {
+                        *selected = (*selected + 1) % actions.len()
+                    }
+                    KeyCode::BackTab | KeyCode::Left if !actions.is_empty() => {
+                        *selected = (*selected + actions.len() - 1) % actions.len()
+                    }
+                    KeyCode::Enter => {
+                        if let Some(action) = actions.get(*selected) {
+                            return Outcome::Action(action.action.clone(), Vec::new());
+                        }
+                    }
+                    _ => {}
+                }
+            }
             Body::Busy => {}
         }
         Outcome::Stay
@@ -297,7 +360,7 @@ impl Dialog {
                     );
                 }
                 if matches.iter().any(|row| row.alt_action.is_some()) {
-                    "Type to search · ↑↓ choose · Enter select · d delete · Esc back"
+                    "Type to search · ↑↓ choose · Enter select · Delete archive · Esc back"
                 } else {
                     "Type to search · ↑↓ choose · Enter select · Esc back"
                 }
@@ -337,6 +400,52 @@ impl Dialog {
                 }
                 "Tab/↑↓ fields · Ctrl+U clear · Enter next/save · Esc cancel"
             }
+            Body::Text {
+                text,
+                scroll,
+                actions,
+                selected,
+            } => {
+                let action_rows = if actions.is_empty() {
+                    0
+                } else {
+                    parts[1].height.min(2)
+                };
+                let regions =
+                    Layout::vertical([Constraint::Min(0), Constraint::Length(action_rows)])
+                        .split(parts[1]);
+                let lines = wrapped_text(text, regions[0].width as usize);
+                let limit = lines.len().saturating_sub(regions[0].height as usize);
+                self.text_view
+                    .set((regions[0].height.saturating_sub(1) as usize, limit));
+                let offset = (*scroll).min(limit);
+                let visible = lines
+                    .into_iter()
+                    .skip(offset)
+                    .take(regions[0].height as usize)
+                    .map(|line| {
+                        let color = if line.starts_with('+') {
+                            p.success
+                        } else if line.starts_with('-') {
+                            p.error
+                        } else {
+                            p.fg
+                        };
+                        Line::styled(line, Style::default().fg(color))
+                    })
+                    .collect::<Vec<_>>();
+                frame.render_widget(Paragraph::new(visible), regions[0]);
+                if let Some(action) = actions.get(*selected) {
+                    let label = format!("› {}  ({}/{})", action.label, selected + 1, actions.len());
+                    frame.render_widget(
+                        Paragraph::new(label)
+                            .wrap(Wrap { trim: false })
+                            .style(Style::default().fg(p.teal).add_modifier(Modifier::BOLD)),
+                        regions[1],
+                    );
+                }
+                "↑↓/PgUp/PgDn scroll · Home/End · Tab action · Enter select · Esc back"
+            }
             Body::Busy => {
                 frame.render_widget(Paragraph::new("Working…"), parts[1]);
                 "Esc cancel and return to chat"
@@ -349,6 +458,30 @@ impl Dialog {
             parts[2],
         );
     }
+}
+fn wrapped_text(text: &str, width: usize) -> Vec<String> {
+    use unicode_width::UnicodeWidthChar;
+    let width = width.max(1);
+    let mut lines = Vec::new();
+    for raw in text.split('\n') {
+        let mut line = String::new();
+        let mut used = 0;
+        for character in raw
+            .replace('\t', "    ")
+            .chars()
+            .filter(|c| !c.is_control())
+        {
+            let cells = character.width().unwrap_or(0);
+            if used + cells > width && !line.is_empty() {
+                lines.push(std::mem::take(&mut line));
+                used = 0;
+            }
+            line.push(character);
+            used += cells;
+        }
+        lines.push(line);
+    }
+    lines
 }
 fn field_view(field: &Field, width: usize) -> (String, usize) {
     use unicode_width::UnicodeWidthChar;
@@ -380,7 +513,7 @@ fn matching<'a>(rows: &'a [Choice], search: &str) -> Vec<&'a Choice> {
     let search = search.to_lowercase();
     rows.iter()
         .filter(|r| {
-            format!("{} {}", r.label, r.detail)
+            format!("{} {} {}", r.label, r.detail, r.search_text)
                 .to_lowercase()
                 .contains(&search)
         })

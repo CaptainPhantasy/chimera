@@ -1,5 +1,23 @@
 # CHIMERA terminal refresh blueprint
 
+## 2026-10-29: Primary developer workspace — twenty UX corrections
+
+Authorized outcome: fix all twenty findings from the current-source UX review for a personal macOS development platform. Preserve existing files, history, exact-action permissions, saved model settings, and Ratatui 0.29.0 / Crossterm 0.28.1. This section supersedes earlier keyboard rules where they conflict with the requested corrections. No Android, licensing, distribution formalities, dependency upgrades, or paid model requests.
+
+Implementation contract and checkpoints:
+
+1. **Safe composition and conversation management (issues 12–18):** session recency/full-text search, recoverable deletion with Keep selected, Delete-key secondary actions that never steal search text; preserved unsent drafts, vertical multiline editing and normal Ctrl+A/E/K/U/W editing. External editor moves to Ctrl+G. Own independent input and sessions/dialog write surfaces.
+2. **Execution and review (issues 1–6, 11):** persistent explicit PLAN/RUN mode, Ctrl+C cancellation without exit, explicit quit, bounded visible FIFO follow-ups, usable background-job controls while chat runs, dedicated approval patch preview and aggregate read-only Git review, true /new conversation. Root owns runner integration; review module has its own writer. Exact permissions and read-only launch profile remain enforced.
+3. **Inspection and workspace context (issues 7–10, 19–20):** selected historical tool cards, full scrollable patches, transcript search and paged saved history, project/branch identity, honest estimated context usage with configurable known capacity and unknown capacity labelled explicitly. Preserve bounded memory; do not invent a model's context window.
+
+Screen: project and branch header; conversation with focused tool and search indicators; truthful mode/working/queue/context status; multiline composer; contextual keyboard hints. Overlay: scrollable patch/review text with explicit approve/deny choices, safe Escape, responsive narrow layout. Keys: Ctrl+C stops current work; /quit exits; /plan and /run select a persistent mode (optional text submits); /new starts fresh context; Ctrl+F or /search finds transcript text; /diff reviews current Git changes; Ctrl+G opens the external editor.
+
+Verification contract from the owner: one simple direct acceptance test per reviewed issue, each stating WHAT is tested, WHY it matters and the single observable PASS/FAIL result from a developer's perspective. Do not run unrelated test suites, coverage sweeps, or duplicate checks. Acceptance tests must drive the real input/rendering or actual program path, not mirror private calculations. Build, formatting, strict static diagnostics and staged secret/file review are separate compilation/publication checks. Keep a twenty-row evidence mapping in IMPLEMENTATION-NOTES.md. Record genuine failures and fix them before each checkpoint. Use temporary local build storage and two workers to avoid external-drive contention. CI runs these same direct acceptance tests and build/static checks on macOS; check the exact pushed revision and repair remote failures.
+
+Parallelism: parent-owned bounded workers only, with exclusive input.rs, sessions.rs/dialog.rs, and review.rs/rewind.rs ownership. Root owns runner.rs, chat.rs, status.rs, message.rs, module wiring, acceptance integration, CI and Git publication. Workers neither commit/push nor change branches. All integration and full static gates are serialized. The checkout started clean at b3d74c1; no coordinated board is enabled.
+
+History below remains unchanged.
+
 Written before implementation, 2026-10-11. Authorization: Floyd answered **Both** to improving the current terminal screen and saving the supplied guide as a reusable skill.
 
 ## Outcome and boundaries

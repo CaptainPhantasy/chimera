@@ -7,7 +7,7 @@ use chimera_sandbox::WorldManager;
 use std::path::Path;
 
 pub(crate) async fn approve(call: chimera_tools::ToolCall, format: OutputFormat) -> Result<()> {
-    use chimera_core::approval::{ApprovalStore, Decision};
+    use chimera_core::approval::ApprovalStore;
     let store = ApprovalStore::new(workspace_root());
     let pending = store.request(
         call.requested_by,

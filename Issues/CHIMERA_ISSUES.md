@@ -114,3 +114,28 @@ D) Completeness matrix (item -> done/blocked -> evidence)
 
 ## Hard gate
 If any requested item has no evidence row, final status MUST be INCOMPLETE.
+
+
+## 2026-11-03: GitHub review issues #5–#8
+
+Implemented on `fix/session-and-connection-lifecycle`, based on the existing developer workspace branch. The four direct acceptance cases below each define WHAT, WHY and an observable PASS/FAIL. No broad test suite was executed locally. GitHub CI also retains the twenty existing direct UX acceptance cases. Merge and issue closure are separate from implementation verification.
+
+| Issue | Correction | Direct evidence | Local result |
+| --- | --- | --- | --- |
+| [#5](https://github.com/CaptainPhantasy/chimera/issues/5) | `FileSessionStore::delete` permanently removes the session's checkpoint records/backups, owned restore directories, active/archived/recovered records and identifiable pending writes. Reversible UI removal calls `archive` explicitly. | `chimera-session` case `issue_05_deleted_conversation_has_no_retained_recovery_data` creates real checkpoints/restores/archive, checks that session bytes disappear, verifies another session's recovery and working files survive, and checks fail-closed behavior for an unidentified partial write. | PASS |
+| [#6](https://github.com/CaptainPhantasy/chimera/issues/6) | Async store entry points move lock acquisition, reads/writes and fsync into blocking workers. The live callback uses an ordered bounded progress queue, drains before final saves, and keeps the run lease in every in-flight transaction. | `chimera-session` case `issue_06_workspace_responds_while_a_save_waits_for_the_lock` demonstrates a UI heartbeat executing on a single-threaded async runtime before the external storage lock is released; the save subsequently completes. Callback ordering/cancellation lease retention were independently source-reviewed. | PASS |
+| [#7](https://github.com/CaptainPhantasy/chimera/issues/7) | Connection checks always await shutdown after ping, preserving both the protocol error and any cleanup error. | `chimera-tui` case `issue_07_failed_connection_checks_stop_the_actual_server_and_show_the_error` uses real invalid-response and timed-out servers, verifies the error menu and observes the recorded child PID has gone. | PASS |
+| [#8](https://github.com/CaptainPhantasy/chimera/issues/8) | Detach displays stopped status, removes attached tools, and preserves cleanup ownership for retry if stopping fails. | `chimera-tui` case `issue_08_detach_shows_stopped_connection_in_the_actual_menu` attaches/detaches a real server, renders the returned menu and verifies stopped status, unavailable tools and process exit. Cleanup-error retry behavior was source-reviewed. | PASS |
+
+Permanent deletion here covers the session store, its checkpoints and restore recovery records. It does not erase working files, independent TUI scrollback, external backups or physical disk sectors. Unidentifiable partial legacy writes cause an explicit error before any records are removed; recovery/ownership resolution is required before retrying. No actual user sessions were deleted during implementation or verification; fixtures are disposable local workspaces.
+
+Verification commands:
+
+```sh
+cargo test --locked --offline -p chimera-session -p chimera-tui --lib issue_ -j 2 -- --test-threads=1
+cargo fmt --package chimera-session --package chimera-tui -- --check
+cargo clippy --workspace --all-targets --locked --offline -j 2 -- -D warnings
+cargo build --locked --offline -p chimera-cli -j 2
+```
+
+The integrated run passed all four cases. After strengthening interrupted-write ownership handling, the same two session cases passed again. Publication requires Git Steward approval and successful macOS CI on the exact pushed revision. CI's test commands are limited to the four issue cases plus the existing twenty direct developer UX cases, each documented with its user-facing purpose; unrelated suites are not executed.

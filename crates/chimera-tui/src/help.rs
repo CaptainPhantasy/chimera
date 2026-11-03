@@ -33,11 +33,29 @@ const CONTROLS: &[(&str, &str)] = &[
     ("/skills [NAME]", "list, capture or run saved procedures"),
     ("/mcp", "external tool connections for chat"),
     ("/jobs", "list, inspect and control background work"),
-    ("Ctrl+E / /editor", "compose the draft in your editor"),
-    ("/approve /deny", "decide the displayed action once"),
+    ("Ctrl+G / /editor", "compose the draft in your editor"),
+    (
+        "/approve /deny",
+        "reopen the exact review / deny the action",
+    ),
     ("/clear", "clear screen; retain saved context"),
-    ("/cancel", "stop current work"),
-    ("/quit /exit Ctrl+C", "stop work and leave"),
+    ("/cancel Ctrl+C", "stop current work; keep queued drafts"),
+    ("/new", "fresh conversation; preserve saved work"),
+    ("/plan /run", "select persistent mode; optional task text"),
+    ("/diff", "review staged, unstaged and untracked work"),
+    ("Ctrl+F /search TEXT", "search current and archived output"),
+    ("/tools-view", "select any tool result in the current page"),
+    (
+        "/load-older /latest",
+        "older transcript pages or live output",
+    ),
+    ("/context N", "set known model capacity for this chat"),
+    ("/queue", "inspect, edit or resume queued follow-ups"),
+    (
+        "Ctrl+A/E/K/U/W",
+        "line start/end, kill end/start, delete word",
+    ),
+    ("/quit /exit Ctrl+Q", "stop work and leave"),
 ];
 
 pub fn render(f: &mut Frame, styles: &Styles) {

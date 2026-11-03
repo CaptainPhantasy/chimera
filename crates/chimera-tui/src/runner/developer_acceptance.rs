@@ -71,11 +71,16 @@ fn ux_01_planning_remains_selected_for_follow_up_requests() {
 fn ux_02_interrupt_keeps_the_developer_in_the_workspace() {
     let mut tui = screen();
     tui.status.running = true;
+    tui.dialog = Some(crate::dialog::Dialog::busy(
+        "Opening conversation",
+        "starting",
+    ));
     tui.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
     assert!(
         !tui.should_quit
+            && tui.dialog.is_none()
             && matches!(tui.rx.try_recv(),Ok(TuiEvent::Submit(command)) if command=="/cancel"),
-        "PASS only when Ctrl+C requests task cancellation without quitting the screen"
+        "PASS only when Ctrl+C immediately clears dialogs, requests cancellation, and keeps the workspace open"
     );
 }
 
